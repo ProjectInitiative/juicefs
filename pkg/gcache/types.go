@@ -62,9 +62,9 @@ var (
 //	klen   uint16: block key length (0 in responses)
 //	plen   uint64: payload length; MsgError: ^uint64(0) then klen+err string
 const (
-	magic0   = 'G'
-	magic1   = 'C'
-	protoVer = 1
+	magic0    = 'G'
+	magic1    = 'C'
+	protoVer  = 1
 	headerLen = 20
 )
 
@@ -87,9 +87,9 @@ const (
 
 // Default tuning (enterprise parity where applicable).
 const (
-	DefaultHeartbeat     = 10 * time.Second  // membership heartbeat interval
-	DefaultStaleMultiplier = 3               // TTL/staleness = 3x heartbeat
-	DefaultRemoteTimeout = 65 * time.Second  // --remote-timeout (enterprise default)
-	DefaultMaxFailures   = 31                // consecutive failures before eviction
-	DefaultWeight        = 1
+	DefaultHeartbeat       = 10 * time.Second // membership heartbeat interval
+	DefaultStaleMultiplier = 3                // TTL/staleness = 3x heartbeat
+	DefaultRemoteTimeout   = 65 * time.Second // --remote-timeout (enterprise default)
+	DefaultMaxFailures     = 31               // consecutive failures before eviction
+	DefaultWeight          = 1
 )
