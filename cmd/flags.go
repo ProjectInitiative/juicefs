@@ -21,6 +21,7 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/urfave/cli/v2"
@@ -278,6 +279,45 @@ func dataCacheFlags() []cli.Flag {
 			Name:  "cache-expire",
 			Value: "0s",
 			Usage: "cached blocks not accessed for longer than this option will be automatically evicted (0 means never)",
+		},
+
+		// gcache (community fork): distributed cache group — see
+		// pkg/gcache/CONTRACT.md and rfcs/distributed-cache.md. Flag names
+		// mirror the JuiceFS Enterprise command reference.
+		&cli.StringSliceFlag{
+			Name:  "cache-group",
+			Usage: "join the given distributed cache group(s), repeatable; members share cached blocks over the network",
+		},
+		&cli.IntFlag{
+			Name:  "group-weight",
+			Value: 1,
+			Usage: "relative cache capacity of this node within the cache group",
+		},
+		&cli.StringFlag{
+			Name:  "group-listen",
+			Usage: "listen address for serving cache group peers, e.g. 10.6.0.1:0 (default: all interfaces, ephemeral port)",
+		},
+		&cli.StringFlag{
+			Name:  "group-advertise",
+			Usage: "address advertised to cache group peers (default: derived from the listener)",
+		},
+		&cli.DurationFlag{
+			Name:  "group-heartbeat",
+			Value: 10 * time.Second,
+			Usage: "interval between cache group membership heartbeats",
+		},
+		&cli.DurationFlag{
+			Name:  "remote-timeout",
+			Value: 65 * time.Second,
+			Usage: "timeout for a single request towards a cache group peer",
+		},
+		&cli.BoolFlag{
+			Name:  "no-sharing",
+			Usage: "consume from the cache group without serving cache to other members",
+		},
+		&cli.BoolFlag{
+			Name:  "fill-group-cache",
+			Usage: "send uploaded blocks to their cache group owners (best-effort, no guarantee)",
 		},
 	})
 }

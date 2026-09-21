@@ -287,3 +287,62 @@ sudo juicefs mount --cache-dir ~/jfscache:/mnt/jfscache:/dev/shm/jfscache redis:
 When multiple cache directories are set, or multiple devices are used as cache disks, the `--cache-size` option represents the total size of data in all cache directories. The client will use the hash strategy to evenly write data to each cache path, and cannot perform special tuning for multiple cache disks with different capacities or performances.
 
 Therefore, it is recommended that the available space of different cache directories/cache disks be consistent, otherwise it may cause the situation that the space of a certain cache directory cannot be fully utilized. For example, `--cache-dir` is `/data1:/data2`, where `/data1` has a free space of 1GiB, `/data2` has a free space of 2GiB, `--cache-size` is 3GiB, `--free-space-ratio` is 0.1. Because the cache write strategy is to write evenly, the maximum space allocated to each cache directory is `3GiB / 2 = 1.5GiB`, resulting in a maximum of 1.5GiB cache space in the `/data2` directory instead of `2GiB * 0.9 = 1.8GiB`.
+
+## Distributed cache (community fork)
+
+> This feature is a ProjectInitiative fork addition, not part of JuiceFS Community Edition.
+> Design and implementation notes: `rfcs/distributed-cache.md` and `pkg/gcache/CONTRACT.md`.
+
+When multiple clients mount the same volume and repeatedly access the same dataset, each
+client normally fills its own local cache independently. Distributed cache pools the cache
+disks of all members: mounts that specify the same `--cache-group` form a ring (rendezvous
+hashing over the member list). When a member reads a block owned by another member, it
+fetches the block from that peer over the network instead of downloading it from object
+storage again. The object storage is hit only once per block across the whole group.
+
+Membership is registered in the same metadata engine used by the filesystem (Redis in v1),
+so the cache group inherits the metadata engine's high availability. Blocks are placed per
+4 MiB block (not per file), so hot files spread read bandwidth across all members.
+
+```shell
+# On each node (same volume, same group). Use the highest-bandwidth NIC for
+# peer traffic via --group-listen (a prefix selects the interface):
+juicefs mount redis://127.0.0.1:6379/1 /mnt/jfs \
+    --cache-group=sparks \
+    --cache-dir=/mnt/nvme/cache --cache-size=1024000 \
+    --group-listen=10.6.0.0 --group-weight=1
+
+# Verify: the client log records membership and the peer listener
+grep -i "cache group" /var/log/juicefs.log
+
+# Warm the group from any member (fills every member's ring-owned blocks):
+juicefs warmup /mnt/jfs/train-data -c 80
+```
+
+Useful flags:
+
+| Flag | Default | Description |
+| :-- | :-- | :-- |
+| `--cache-group` | (empty) | join the given distributed cache group(s), repeatable |
+| `--group-weight` | `1` | relative cache capacity of this node within the group |
+| `--group-listen` | all interfaces, ephemeral port | listen address for serving peers |
+| `--group-advertise` | derived from listener | address advertised to peers |
+| `--group-heartbeat` | `10s` | membership heartbeat interval |
+| `--remote-timeout` | `65s` | timeout for a single request towards a peer |
+| `--no-sharing` | off | consume from the group without serving peers |
+| `--fill-group-cache` | off | push uploaded blocks to their group owners (best-effort) |
+
+Failure behavior follows JuiceFS Enterprise semantics: a peer read failure falls through to
+object storage (the client always stays serviceable), transient failures are retried once,
+and a peer with 31 consecutive failures is removed from the local view (and re-added on a
+later success), logged as `remove peer ... after 31 failures in a row`.
+
+Notes and limitations (v1):
+
+* Redis-family metadata engines only; tkv/SQL registries are follow-up work. Mounts on
+  other engines log `cache group disabled` and run with local cache only.
+* Volumes using compression (`--compress lz4|zstd`) pay a server-side re-compression on
+  peer serves; uncompressed volumes (`--compress none`) have no such cost. Prefer
+  uncompressed volumes for cache-heavy training workloads.
+* Like Enterprise, peers serve without authentication — run cache groups only on private,
+  ACL'd networks.

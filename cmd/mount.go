@@ -40,6 +40,7 @@ import (
 	"github.com/urfave/cli/v2"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
+	"github.com/juicedata/juicefs/pkg/gcache"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/metric"
 	"github.com/juicedata/juicefs/pkg/usage"
@@ -673,12 +674,64 @@ func mount(c *cli.Context) error {
 	// Wrap the default registry, all prometheus.MustRegister() calls should be afterwards
 	registerer, registry := wrapRegister(c, mp, format.Name)
 
+	// gcache (community fork): distributed cache group wiring.
+	// Order matters, see pkg/gcache/CONTRACT.md §10:
+	//   mgr (member view) → wrap blob → NewCachedStore → SetSource → Start.
+	var gmgr *gcache.Manager
+	if groups := c.StringSlice("cache-group"); len(groups) > 0 {
+		if len(groups) > 1 {
+			logger.Warnf("multiple cache groups given; using first group %q for placement (v1 limitation)", groups[0])
+		}
+		gcfg := gcache.Config{
+			Groups:        groups,
+			ListenAddr:    c.String("group-listen"),
+			AdvertiseAddr: c.String("group-advertise"),
+			Weight:        c.Int("group-weight"),
+			Heartbeat:     c.Duration("group-heartbeat"),
+			RPCTimeout:    c.Duration("remote-timeout"),
+			NoSharing:     c.Bool("no-sharing"),
+			FillOnUpload:  c.Bool("fill-group-cache"),
+		}
+		greg, err := meta.NewGcacheRegistryFromMeta(metaCli)
+		if err != nil {
+			// Resilience: a cache group is a performance feature — mount
+			// without it rather than failing the mount.
+			logger.Warnf("cache group disabled: %s", err)
+		} else {
+			gmgr = gcache.NewManager(gcfg, greg, nil)
+			rc := gcache.NewRingClient(gcfg.RPCTimeout, gcache.DefaultMaxFailures)
+			group := groups[0]
+			blob = gcache.NewRingStorage(blob, rc, func(string) []gcache.Member { return gmgr.Members(group) }, gmgr.UUID())
+		}
+	}
+
 	store := chunk.NewCachedStore(blob, *chunkConf, registerer)
+
+	// gcache (community fork): attach the peer-serving source now that the
+	// store exists, so this mount serves cached blocks to group members.
+	if gmgr != nil && !c.Bool("no-sharing") {
+		if bridge, err := chunk.NewGcacheBridge(store); err == nil {
+			gmgr.SetSource(bridge)
+		} else {
+			logger.Warnf("cache group serving disabled: %s", err)
+		}
+	}
 	registerMetaMsg(metaCli, store, chunkConf)
 
 	err = metaCli.NewSession(true)
 	if err != nil {
 		logger.Fatalf("new session: %s", err)
+	}
+
+	// gcache (community fork): start membership + peer listener after the
+	// meta session exists (the registry writes into the meta engine).
+	if gmgr != nil {
+		if err := gmgr.Start(context.Background()); err != nil {
+			logger.Warnf("cache group start failed: %s", err)
+		} else {
+			logger.Infof("cache group %v joined, serving on %s", c.StringSlice("cache-group"), gmgr.Addr())
+			defer gmgr.Stop()
+		}
 	}
 
 	metaCli.OnReload(func(fmt *meta.Format) {
