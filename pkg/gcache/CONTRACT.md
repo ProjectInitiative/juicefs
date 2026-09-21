@@ -66,14 +66,22 @@ the rest. NOTE: `ReadCloser` here is `chunk.ReadCloser` (pkg/chunk/cache_manager
 
 * Registration happens after `metaCli.NewSession(true)` in `cmd/mount.go`
   (requires an open meta connection).
-* Member uuid = JuiceFS session uuid (fresh per mount process).
+* Member uuid = gcache.NewUUID() (fresh per mount process, independent of
+  meta session ids).
 * Redis impl: per-group HASH `<prefix>gcache/<group>`, field = uuid, value =
   JSON `{uuid,addr,weight,version,ts}`; `EXPIRE` refreshed per heartbeat
   (10s interval, 90s TTL); `HGETALL` to list; ts-staleness backstop.
 * tkv impl: keys `<prefix>gcache/<group>/<uuid>`; range scan to list;
   ts-based pruning.
-* SQL impl: `gcache_members(group, uuid, addr, weight, ts)`; heartbeat
-  upsert; DELETE stale at list time.
+* SQL impl (dbMeta: pgx / mysql / sqlite3): table `<tablePrefix>gcache_members`
+  (default `jfs_gcache_members`), columns `group_name`/`uuid`/`addr`/`weight`/
+  `version`/`ts`, PK (group_name, uuid). Created lazily via Sync2 on first
+  Register/List (sync.Once per registry). Heartbeat upsert — `ON CONFLICT
+  (group_name, uuid) DO UPDATE` for pgx/sqlite3, `ON DUPLICATE KEY UPDATE` for
+  mysql. List = SELECT WHERE group_name AND ts fresh, ORDER BY uuid, plus a
+  best-effort DELETE of stale rows (any group). Column is `group_name` (not
+  `group` — reserved word in postgres/mysql). Redis impl unchanged; tkv is
+  follow-up work.
 
 ## 6. Wire protocol (v1)
 

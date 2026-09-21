@@ -300,8 +300,10 @@ hashing over the member list). When a member reads a block owned by another memb
 fetches the block from that peer over the network instead of downloading it from object
 storage again. The object storage is hit only once per block across the whole group.
 
-Membership is registered in the same metadata engine used by the filesystem (Redis in v1),
-so the cache group inherits the metadata engine's high availability. Blocks are placed per
+Membership is registered in the same metadata engine used by the filesystem — a Redis HASH
+on Redis-family engines, or a `jfs_gcache_members` table on SQL engines (postgres, mysql,
+sqlite3) — so the cache group inherits the metadata engine's high availability. Blocks are
+placed per
 4 MiB block (not per file), so hot files spread read bandwidth across all members.
 
 ```shell
@@ -339,8 +341,9 @@ later success), logged as `remove peer ... after 31 failures in a row`.
 
 Notes and limitations (v1):
 
-* Redis-family metadata engines only; tkv/SQL registries are follow-up work. Mounts on
-  other engines log `cache group disabled` and run with local cache only.
+* tkv metadata engines only; Redis-family and SQL-family (postgres, mysql, sqlite3)
+  registries are supported. Mounts on other engines log `cache group disabled` and run
+  with local cache only.
 * Volumes using compression (`--compress lz4|zstd`) pay a server-side re-compression on
   peer serves; uncompressed volumes (`--compress none`) have no such cost. Prefer
   uncompressed volumes for cache-heavy training workloads.
