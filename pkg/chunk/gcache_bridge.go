@@ -121,14 +121,23 @@ func (cs *cachedStore) compressPayload(dst, src []byte) (int, error) {
 type ReadAtReader struct {
 	r   ReadCloser
 	off int64
+	eof int64 // file length once known (-1: unknown); disk cache's ReadAt
+	// panics when called at/past EOF (NewOffPage(0)), so after the
+	// first short read we answer EOF ourselves without calling it.
 }
 
 // NewReadAtReader wraps a chunk ReadCloser for sequential reading.
-func NewReadAtReader(r ReadCloser) *ReadAtReader { return &ReadAtReader{r: r} }
+func NewReadAtReader(r ReadCloser) *ReadAtReader { return &ReadAtReader{r: r, eof: -1} }
 
 func (a *ReadAtReader) Read(p []byte) (int, error) {
+	if a.eof >= 0 && a.off >= a.eof {
+		return 0, io.EOF
+	}
 	n, err := a.r.ReadAt(p, a.off)
 	a.off += int64(n)
+	if n < len(p) && a.eof < 0 {
+		a.eof = a.off // first short read pins the file length
+	}
 	if err == io.EOF && n > 0 {
 		// ReadAt may return n>0 with io.EOF; io.Readers may report EOF on the
 		// following call — surface data first, EOF later.

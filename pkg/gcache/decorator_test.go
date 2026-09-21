@@ -137,7 +137,7 @@ func TestDecoratorInterceptsFullBlock(t *testing.T) {
 	block := bytes.Repeat([]byte{0x5A}, 512<<10)
 	peer.blocks[key] = block
 	inner := &trackingInner{ObjectStorage: newFakeInner()}
-	rc := NewRingClient(time.Second, 31)
+	rc := NewRingClient(time.Second, 31, "self-test")
 	decorated := NewRingStorage(inner, rc, func(string) []Member { return members }, "self-uuid")
 
 	got := readAll(t, mustGet(t, decorated, key))
@@ -152,7 +152,7 @@ func TestDecoratorInterceptsFullBlock(t *testing.T) {
 // Self-owned key falls through to inner.
 func TestDecoratorFallsThroughSelfOwned(t *testing.T) {
 	inner := &trackingInner{ObjectStorage: newFakeInner()}
-	rc := NewRingClient(time.Second, 31)
+	rc := NewRingClient(time.Second, 31, "self-test")
 	members := []Member{
 		{UUID: "self-uuid", Addr: "127.0.0.1:1"},
 		{UUID: "peer-uuid", Addr: "127.0.0.1:2"}, // nobody listening
@@ -172,7 +172,7 @@ func TestDecoratorFallsThroughSelfOwned(t *testing.T) {
 // No members at all: pure passthrough.
 func TestDecoratorFallsThroughNoMembers(t *testing.T) {
 	inner := &trackingInner{ObjectStorage: newFakeInner()}
-	rc := NewRingClient(time.Second, 31)
+	rc := NewRingClient(time.Second, 31, "self-test")
 	decorated := NewRingStorage(inner, rc, func(string) []Member { return nil }, "self-uuid")
 
 	got := readAll(t, mustGet(t, decorated, "any-key"))
@@ -187,7 +187,7 @@ func TestDecoratorFallsThroughNoMembers(t *testing.T) {
 // Partial reads (off>0 or limit>-1) always fall through.
 func TestDecoratorFallsThroughPartialReads(t *testing.T) {
 	inner := &trackingInner{ObjectStorage: newFakeInner()}
-	rc := NewRingClient(time.Second, 31)
+	rc := NewRingClient(time.Second, 31, "self-test")
 	members := []Member{{UUID: "peer-uuid", Addr: "127.0.0.1:2"}}
 	decorated := NewRingStorage(inner, rc, func(string) []Member { return members }, "self-uuid")
 
@@ -212,7 +212,7 @@ func TestDecoratorFallsThroughOnPeerError(t *testing.T) {
 	defer stop()
 
 	inner := &trackingInner{ObjectStorage: newFakeInner()}
-	rc := NewRingClient(time.Second, 31)
+	rc := NewRingClient(time.Second, 31, "self-test")
 	members := []Member{{UUID: "peer-uuid", Addr: peerAddr}}
 	decorated := NewRingStorage(inner, rc, func(string) []Member { return members }, "self-uuid")
 
@@ -228,7 +228,7 @@ func TestDecoratorFallsThroughOnPeerError(t *testing.T) {
 // reached inner.
 func TestDecoratorForwardsGetters(t *testing.T) {
 	inner := &trackingInner{ObjectStorage: newFakeInner()}
-	rc := NewRingClient(time.Second, 31)
+	rc := NewRingClient(time.Second, 31, "self-test")
 	decorated := NewRingStorage(inner, rc, func(string) []Member { return nil }, "self-uuid")
 
 	reqID := ""
@@ -263,7 +263,7 @@ func TestManagerEndToEnd(t *testing.T) {
 	// Consumer side: decorator over inner, member view = the peer
 	// (normally populated by the heartbeat loop from the shared registry).
 	selfMgr := NewManager(Config{Groups: []string{"g"}}, newFakeRegistry(), nil)
-	rc := NewRingClient(time.Second, 31)
+	rc := NewRingClient(time.Second, 31, "self-test")
 	inner := &trackingInner{ObjectStorage: newFakeInner()}
 	selfMembers := []Member{{UUID: peerMgr.UUID(), Addr: peerMgr.Addr()}}
 	decorated := NewRingStorage(inner, rc, func(string) []Member { return selfMembers }, selfMgr.UUID())

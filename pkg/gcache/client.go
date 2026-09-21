@@ -27,6 +27,10 @@ import (
 	"time"
 )
 
+// clientKick lets the client request a membership refresh (wired by the
+// decorator when a Manager is available).
+type kickFunc func()
+
 // RingClient fetches blocks from cache-group peers over the CONTRACT.md §6
 // wire protocol. Concurrency-safe. Failure handling is enterprise-parity
 // (CONTRACT.md §7): one retry per request, maxFailures consecutive failures
@@ -34,6 +38,8 @@ import (
 type RingClient struct {
 	timeout     time.Duration
 	maxFailures int
+	selfUUID    string
+	kick        kickFunc // optional: requests membership refresh
 
 	mu      sync.Mutex
 	failCnt map[string]int // peer addr -> consecutive failures
@@ -41,8 +47,10 @@ type RingClient struct {
 }
 
 // NewRingClient creates a client with per-request timeout and eviction
-// threshold (enterprise default: 65s, 31).
-func NewRingClient(timeout time.Duration, maxFailures int) *RingClient {
+// threshold (enterprise default: 65s, 31). selfUUID identifies this node
+// in the ring; kick, when set, requests an immediate membership refresh
+// (used when the member view is empty at fetch time).
+func NewRingClient(timeout time.Duration, maxFailures int, selfUUID string) *RingClient {
 	if timeout <= 0 {
 		timeout = DefaultRemoteTimeout
 	}
@@ -52,6 +60,7 @@ func NewRingClient(timeout time.Duration, maxFailures int) *RingClient {
 	return &RingClient{
 		timeout:     timeout,
 		maxFailures: maxFailures,
+		selfUUID:    selfUUID,
 		failCnt:     make(map[string]int),
 		evicted:     make(map[string]time.Time),
 	}
@@ -84,6 +93,9 @@ func (c *RingClient) MarkFailure(peer string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.failCnt[peer]++
+	if metricFailures != nil {
+		metricFailures.WithLabelValues(peer).Inc()
+	}
 	if c.failCnt[peer] >= c.maxFailures && c.failCnt[peer]%c.maxFailures == 0 {
 		if _, ok := c.evicted[peer]; !ok {
 			c.evicted[peer] = time.Now()
@@ -100,10 +112,21 @@ func (e *errFrame) Error() string { return e.msg }
 // errNoOwners: every candidate peer was evicted.
 var errNoOwners = errors.New("no available peer for key")
 
-// candidate returns the best non-evicted member for key, or nil.
-func (c *RingClient) candidate(key string, members []Member) *Member {
+// SetKick wires the membership-refresh hook (called when the member view
+// is empty or yields no owner for a key).
+func (c *RingClient) SetKick(k func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.kick = k
+}
+
+// candidate returns the best non-evicted, non-self member for key, or nil.
+func (c *RingClient) candidate(key string, members []Member, selfUUID string) *Member {
 	owners := Owners(key, members, len(members))
 	for i := range owners {
+		if owners[i].UUID == selfUUID {
+			continue // self-owned: caller serves locally, never fetch
+		}
 		if !c.isEvicted(owners[i].Addr) {
 			m := owners[i]
 			return &m
@@ -120,11 +143,23 @@ func (c *RingClient) candidate(key string, members []Member) *Member {
 // is the live member list for the group.
 func (c *RingClient) Fetch(ctx context.Context, group, key string, members []Member) (io.ReadCloser, error) {
 	if len(members) == 0 {
+		if c.kick != nil {
+			c.kick() // refresh membership before giving up
+		}
 		return nil, ErrNoMembers
 	}
 	r, err := c.fetchOnce(ctx, key, members)
 	if err == nil {
 		return r, nil
+	}
+	if err == errNoOwners && c.kick != nil {
+		// member view may be stale (or predated a peer joining): refresh
+		// and give the fetch one more chance via the retry below.
+		c.kick()
+	}
+	// Caller cancelation: not a peer failure, not an error metric.
+	if ctx.Err() != nil {
+		return nil, err
 	}
 	// one retry on any transient error
 	r, err2 := c.fetchOnce(ctx, key, members)
@@ -136,42 +171,65 @@ func (c *RingClient) Fetch(ctx context.Context, group, key string, members []Mem
 
 // fetchOnce performs one request against the best candidate peer.
 func (c *RingClient) fetchOnce(ctx context.Context, key string, members []Member) (io.ReadCloser, error) {
-	m := c.candidate(key, members)
+	m := c.candidate(key, members, c.selfUUID)
 	if m == nil {
 		return nil, errNoOwners
 	}
 	peer := m.Addr
-
-	d := net.Dialer{Timeout: c.timeout}
-	conn, err := d.DialContext(ctx, "tcp", peer)
+	start := time.Now()
+	var fetched int64
+	var reader io.ReadCloser
+	var err error
+	func() {
+		var conn net.Conn
+		d := net.Dialer{Timeout: c.timeout}
+		conn, err = d.DialContext(ctx, "tcp", peer)
+		if err != nil {
+			err = fmt.Errorf("dial peer %s: %w", peer, err)
+			return
+		}
+		if err = c.sendReq(ctx, conn, key); err != nil {
+			_ = conn.Close()
+			err = fmt.Errorf("send to peer %s: %w", peer, err)
+			return
+		}
+		var algo uint8
+		var xid uint32
+		var plen uint64
+		var isErr bool
+		algo, xid, plen, isErr, err = c.readRespHeader(ctx, conn)
+		if err != nil {
+			_ = conn.Close()
+			err = fmt.Errorf("read from peer %s: %w", peer, err)
+			return
+		}
+		if isErr {
+			_ = conn.Close()
+			c.MarkSuccess(peer) // peer answered; fetch-level failure, not peer failure
+			return              // err already holds the *errFrame
+		}
+		c.MarkSuccess(peer) // header OK; payload streams below
+		fetched = int64(plen)
+		reader = &payloadReader{
+			conn:      conn,
+			remaining: int64(plen),
+			algo:      algo,
+			xid:       xid,
+			timeout:   c.timeout,
+		}
+	}()
+	observeFetch(peer, fetched, err, time.Since(start).Seconds())
 	if err != nil {
-		c.MarkFailure(peer)
-		return nil, fmt.Errorf("dial peer %s: %w", peer, err)
+		// Caller cancelation (speculative readahead torn down) is not a peer
+		// health signal. net.Dialer maps context.Canceled to its own
+		// "operation was canceled" sentinel which does NOT match
+		// errors.Is(err, context.Canceled) — so check ctx directly.
+		if ctx.Err() == nil {
+			c.MarkFailure(peer)
+		}
+		return nil, err
 	}
-	if err := c.sendReq(ctx, conn, key); err != nil {
-		_ = conn.Close()
-		c.MarkFailure(peer)
-		return nil, fmt.Errorf("send to peer %s: %w", peer, err)
-	}
-	algo, xid, plen, isErr, rerr := c.readRespHeader(ctx, conn)
-	if rerr != nil {
-		_ = conn.Close()
-		c.MarkFailure(peer)
-		return nil, fmt.Errorf("read from peer %s: %w", peer, rerr)
-	}
-	if isErr {
-		_ = conn.Close()
-		c.MarkSuccess(peer) // peer answered; fetch-level failure, not peer failure
-		return nil, rerr    // *errFrame from readRespHeader
-	}
-	c.MarkSuccess(peer) // header OK; payload streams below
-	return &payloadReader{
-		conn:      conn,
-		remaining: int64(plen),
-		algo:      algo,
-		xid:       xid,
-		timeout:   c.timeout,
-	}, nil
+	return reader, nil
 }
 
 // sendReq writes one MsgBlockReq frame for key.

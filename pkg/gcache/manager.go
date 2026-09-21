@@ -79,8 +79,9 @@ type Manager struct {
 	uuid     string
 
 	mu      sync.Mutex
-	members map[string][]Member // group -> live members
+	members map[string][]Member // group -> live members (self included)
 	addr    string              // advertised listener addr ("" when NoSharing)
+	kick    chan struct{}
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -100,6 +101,7 @@ func NewManager(cfg Config, reg Registry, src ServerSource) *Manager {
 		src:      src,
 		uuid:     NewUUID(),
 		members:  make(map[string][]Member),
+		kick:     make(chan struct{}, 1),
 	}
 }
 
@@ -194,16 +196,70 @@ func (m *Manager) Members(group string) []Member {
 	return out
 }
 
+// AllMembers returns the cached live member list INCLUDING self. Placement
+// (ring ownership) MUST be computed over this full universe: every node
+// deriving owners from the same set is what makes ownership globally
+// consistent — exactly one owner per key. A node whose owner is itself
+// serves locally; everyone else fetches from the owner.
+func (m *Manager) AllMembers(group string) []Member {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ms := m.members[group]
+	out := make([]Member, len(ms))
+	copy(out, ms)
+	return out
+}
+
+// Kick requests an immediate membership refresh (non-blocking). Called by
+// the client when it observes an empty/stale member view, so cold-start
+// converges at first use instead of waiting for the next heartbeat.
+func (m *Manager) Kick() {
+	select {
+	case m.kick <- struct{}{}:
+	default:
+	}
+}
+
 func (m *Manager) heartbeatLoop(ctx context.Context) {
 	defer m.wg.Done()
+	m.beat(ctx) // register immediately
+	// Convergence beats: other members may have registered just after our
+	// initial list ran (simultaneous startup is the common case), so poll
+	// briefly at heartbeat/3 until the member view is populated (max two
+	// empty beats), then settle into the regular heartbeat cadence.
+	// Membership is the only input to placement, so fast convergence
+	// directly shortens cold-start.
+	interval := m.cfg.Heartbeat / 3
+	if interval <= 0 {
+		interval = time.Second
+	}
+	settle := time.NewTicker(interval)
+	defer settle.Stop()
+	for settled := 0; settled < 3; {
+		select {
+		case <-ctx.Done():
+			return
+		case <-settle.C:
+			m.beat(ctx)
+			m.mu.Lock()
+			n := len(m.members[m.cfg.Groups[0]])
+			m.mu.Unlock()
+			if n > 0 {
+				settled = 3 // view populated: converge now
+			} else {
+				settled++
+			}
+		}
+	}
 	tick := time.NewTicker(m.cfg.Heartbeat)
 	defer tick.Stop()
-	m.beat(ctx) // register immediately
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
+			m.beat(ctx)
+		case <-m.kick:
 			m.beat(ctx)
 		}
 	}

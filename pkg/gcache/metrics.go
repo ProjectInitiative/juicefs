@@ -17,12 +17,20 @@
 package gcache
 
 import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// Prometheus metrics, enterprise-parity names (CONTRACT.md §8). Package
-// counters are registered here once; JuiceFS serves them from the mount's
-// metrics endpoint alongside the other juicefs_* series.
+// Distributed-cache metrics (enterprise-parity names; CONTRACT.md §8).
+// Internal names are UNPREFIXED: mounts register them through JuiceFS's
+// wrapped registerer (cmd/mount.go wrapRegister), which adds the "juicefs_"
+// prefix and mp/vol labels at the metrics endpoint. When no registerer is
+// provided (unit tests, standalone tools) they fall back to the default
+// registry under the bare names below.
 var (
 	metricGets      prometheus.Counter
 	metricBytes     prometheus.Counter
@@ -31,36 +39,54 @@ var (
 	metricFailures  *prometheus.GaugeVec
 )
 
-func init() {
-	metricGets = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "juicefs_remotecache_gets",
-		Help: "Count of distributed cache peer fetches",
+var metricsOnce sync.Once
+
+// CollectMetrics registers the gcache metrics with reg (or the default
+// registry if reg is nil). Safe to call multiple times; only the first call
+// registers. Mounts should call it with their wrapped registerer so the
+// series appear on the mount's metrics endpoint as juicefs_remotecache_*.
+func CollectMetrics(reg prometheus.Registerer) {
+	metricsOnce.Do(func() {
+		metricGets = prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "remotecache_gets",
+			Help: "Count of distributed cache peer fetches",
+		})
+		metricBytes = prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "remotecache_bytes",
+			Help: "Bytes fetched from cache-group peers",
+		})
+		metricErrors = prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "remotecache_errors",
+			Help: "Count of failed distributed cache peer operations",
+		})
+		metricDurations = prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "remotecache_durations",
+			Help:    "Distributed cache peer fetch latency in seconds",
+			Buckets: prometheus.ExponentialBuckets(0.0001, 2, 22),
+		})
+		metricFailures = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "peer_failures",
+			Help: "Consecutive failures per cache-group peer",
+		}, []string{"peer"})
+		if reg == nil {
+			reg = prometheus.DefaultRegisterer
+		}
+		reg.MustRegister(metricGets, metricBytes, metricErrors, metricDurations, metricFailures)
 	})
-	metricBytes = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "juicefs_remotecache_bytes",
-		Help: "Bytes fetched from cache-group peers",
-	})
-	metricErrors = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "juicefs_remotecache_errors",
-		Help: "Count of failed distributed cache peer operations",
-	})
-	metricDurations = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:    "juicefs_remotecache_durations",
-		Help:    "Distributed cache peer fetch latency in seconds",
-		Buckets: prometheus.ExponentialBuckets(0.0001, 2, 22),
-	})
-	metricFailures = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "juicefs_peer_failures",
-		Help: "Consecutive failures per cache-group peer",
-	}, []string{"peer"})
-	prometheus.MustRegister(metricGets, metricBytes, metricErrors, metricDurations, metricFailures)
 }
 
-// observeFetch records one peer fetch outcome.
+// observeFetch records one peer fetch outcome. Caller cancelation
+// (speculative readahead torn down mid-flight) is not a peer health signal
+// and is not counted.
 func observeFetch(peer string, n int64, err error, seconds float64) {
+	if metricGets == nil { // metrics not registered (pure-library use)
+		return
+	}
 	if err != nil {
+		if errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "operation was canceled") {
+			return
+		}
 		metricErrors.Inc()
-		metricFailures.WithLabelValues(peer).Inc()
 		return
 	}
 	metricGets.Inc()

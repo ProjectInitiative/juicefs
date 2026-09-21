@@ -152,7 +152,7 @@ func TestServerClientRoundTripRaw(t *testing.T) {
 	addr, stop := listenerWithSrc(t, src, 5*time.Second)
 	defer stop()
 
-	rc := NewRingClient(time.Second, 31)
+	rc := NewRingClient(time.Second, 31, "self-test")
 	members := []Member{{UUID: "peer-1", Addr: addr}}
 	got := fetchAll(t, mustFetch(t, rc, "g", "1_7_4194304", members))
 	if !bytes.Equal(got, block) {
@@ -171,7 +171,7 @@ func TestServerClientFillFromStorage(t *testing.T) {
 	addr, stop := listenerWithSrc(t, src, 5*time.Second)
 	defer stop()
 
-	rc := NewRingClient(time.Second, 31)
+	rc := NewRingClient(time.Second, 31, "self-test")
 	members := []Member{{UUID: "peer-1", Addr: addr}}
 	got := fetchAll(t, mustFetch(t, rc, "g", "1_9_1048576", members))
 	if !bytes.Equal(got, block) {
@@ -188,7 +188,7 @@ func TestServerClientCompressed(t *testing.T) {
 	addr, stop := listenerWithSrc(t, src, 5*time.Second)
 	defer stop()
 
-	rc := NewRingClient(time.Second, 31)
+	rc := NewRingClient(time.Second, 31, "self-test")
 	members := []Member{{UUID: "peer-1", Addr: addr}}
 	got := fetchAll(t, mustFetch(t, rc, "g", "1_3_1000000", members))
 	if !bytes.Equal(decompressFake(got), raw) {
@@ -203,7 +203,7 @@ func TestServerClientErrorFrame(t *testing.T) {
 	addr, stop := listenerWithSrc(t, src, 5*time.Second)
 	defer stop()
 
-	rc := NewRingClient(time.Second, 31)
+	rc := NewRingClient(time.Second, 31, "self-test")
 	members := []Member{{UUID: "peer-1", Addr: addr}}
 	_, err := rc.Fetch(context.Background(), "g", "missing_key", members)
 	if err == nil {
@@ -226,7 +226,7 @@ func TestServerClientConcurrent(t *testing.T) {
 	addr, stop := listenerWithSrc(t, src, 5*time.Second)
 	defer stop()
 
-	rc := NewRingClient(time.Second, 31)
+	rc := NewRingClient(time.Second, 31, "self-test")
 	members := []Member{{UUID: "peer-1", Addr: addr}}
 	var wg sync.WaitGroup
 	errs := make(chan error, 2)
@@ -268,7 +268,7 @@ func TestEvictionAndReAdd(t *testing.T) {
 	liveAddr, liveStop := listenerWithSrc(t, live, 5*time.Second)
 	defer liveStop()
 
-	rc := NewRingClient(200*time.Millisecond, 3)
+	rc := NewRingClient(200*time.Millisecond, 3, "")
 	members := []Member{
 		{UUID: "dead", Addr: dead},
 		{UUID: "live", Addr: liveAddr},
@@ -286,14 +286,14 @@ func TestEvictionAndReAdd(t *testing.T) {
 	}
 
 	// Forced path: mark failures directly for deterministic assertions.
-	rc2 := NewRingClient(200*time.Millisecond, 3)
+	rc2 := NewRingClient(200*time.Millisecond, 3, "")
 	for i := 0; i < 3; i++ {
 		rc2.MarkFailure("h:1")
 	}
 	if !rc2.isEvicted("h:1") {
 		t.Fatal("peer not evicted at maxFailures")
 	}
-	if got := rc2.candidate("k", []Member{{UUID: "x", Addr: "h:1"}}); got != nil {
+	if got := rc2.candidate("k", []Member{{UUID: "x", Addr: "h:1"}}, ""); got != nil {
 		t.Fatal("evicted peer must not be a candidate")
 	}
 	rc2.MarkSuccess("h:1")
@@ -304,7 +304,7 @@ func TestEvictionAndReAdd(t *testing.T) {
 
 // Success marks clear failure counters.
 func TestMarkSuccessClearsFailures(t *testing.T) {
-	rc := NewRingClient(time.Second, 2)
+	rc := NewRingClient(time.Second, 2, "self-test")
 	rc.MarkFailure("p")
 	rc.MarkFailure("p") // evicted at 2
 	if !rc.isEvicted("p") {

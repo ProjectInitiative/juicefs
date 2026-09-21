@@ -30,6 +30,22 @@ import (
 	"github.com/juicedata/juicefs/pkg/object"
 )
 
+// serverFillKey marks a Get issued by the peer server's own fill path
+// (serveBlock → FillFromStorage → load → Get). The decorator MUST pass
+// these straight to the inner storage: otherwise the owner's fill itself
+// triggers a peer fetch, and two nodes can deadlock fetching the same
+// block from each other.
+type serverFillKey struct{}
+
+func withServerFill(ctx context.Context) context.Context {
+	return context.WithValue(ctx, serverFillKey{}, true)
+}
+
+func isServerFill(ctx context.Context) bool {
+	v, _ := ctx.Value(serverFillKey{}).(bool)
+	return v
+}
+
 // ServeConn handles one peer connection (CONTRACT.md §6 frames). It loops
 // over MsgBlockReq frames until EOF or ctx cancellation, serving each from
 // src: LoadCached first; on os.ErrNotExist, FillFromStorage. Payloads are
@@ -85,7 +101,7 @@ const maxBlockPayload = 64 << 20
 func serveBlock(ctx context.Context, conn net.Conn, src ServerSource, key string) error {
 	r, err := src.LoadCached(key)
 	if errors.Is(err, os.ErrNotExist) {
-		r, err = src.FillFromStorage(ctx, key)
+		r, err = src.FillFromStorage(withServerFill(ctx), key)
 	}
 	if err != nil {
 		return sendError(ctx, conn, err)
@@ -238,17 +254,20 @@ func NewRingStorage(inner object.ObjectStorage, rc *RingClient, members func(gro
 }
 
 func (s *ringStorage) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
-	if off != 0 || limit != -1 {
+	if off != 0 || limit != -1 || isServerFill(ctx) {
 		return s.inner.Get(ctx, key, off, limit, getters...)
 	}
 	members := s.members(s.group)
 	if len(members) == 0 {
+		logger.Debugf("gcache no members for group %q, reading from storage", s.group)
 		return s.inner.Get(ctx, key, off, limit, getters...)
 	}
 	owner := Owners(key, members, 1)
 	if len(owner) == 0 || owner[0].UUID == s.selfUUID {
+		logger.Debugf("gcache %s self-owned by %s, reading from storage", key, s.selfUUID)
 		return s.inner.Get(ctx, key, off, limit, getters...)
 	}
+	logger.Debugf("gcache peer fetch %s from %s", key, owner[0].Addr)
 	r, err := s.rc.Fetch(ctx, s.group, key, members)
 	if err != nil {
 		// Peer fetch failed (error frame, timeout, or eviction): the client

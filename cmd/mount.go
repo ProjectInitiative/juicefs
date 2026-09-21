@@ -677,8 +677,11 @@ func mount(c *cli.Context) error {
 	// gcache (community fork): distributed cache group wiring.
 	// Order matters, see pkg/gcache/CONTRACT.md §10:
 	//   mgr (member view) → wrap blob → NewCachedStore → SetSource → Start.
+	// Gate to the final FUSE-serving stage: the mount flow runs this function
+	// twice (supervisor stage-0 + worker), and only the worker serves data.
+	// Registering both would poison the registry with dead listener addrs.
 	var gmgr *gcache.Manager
-	if groups := c.StringSlice("cache-group"); len(groups) > 0 {
+	if groups := c.StringSlice("cache-group"); len(groups) > 0 && os.Getenv("_FUSE_FD_COMM") != "" {
 		if len(groups) > 1 {
 			logger.Warnf("multiple cache groups given; using first group %q for placement (v1 limitation)", groups[0])
 		}
@@ -698,10 +701,15 @@ func mount(c *cli.Context) error {
 			// without it rather than failing the mount.
 			logger.Warnf("cache group disabled: %s", err)
 		} else {
+			gcache.CollectMetrics(registerer) // expose juicefs_remotecache_* on this mount's endpoint
 			gmgr = gcache.NewManager(gcfg, greg, nil)
-			rc := gcache.NewRingClient(gcfg.RPCTimeout, gcache.DefaultMaxFailures)
-			group := groups[0]
-			blob = gcache.NewRingStorage(blob, rc, func(string) []gcache.Member { return gmgr.Members(group) }, gmgr.UUID())
+			rc := gcache.NewRingClient(gcfg.RPCTimeout, gcache.DefaultMaxFailures, gmgr.UUID())
+			rc.SetKick(gmgr.Kick)
+			// Placement runs over the FULL member set (AllMembers, self
+			// included) so every node derives the same owner per key; the
+			// client then skips self-owned keys (served locally instead).
+			group := groups[0] // v1: single-group placement
+			blob = gcache.NewRingStorage(blob, rc, func(string) []gcache.Member { return gmgr.AllMembers(group) }, gmgr.UUID())
 		}
 	}
 
