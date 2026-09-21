@@ -26,11 +26,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -49,14 +47,15 @@ func TestGcacheBridgeIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cacheDir := filepath.Join(os.TempDir(), fmt.Sprintf("gcache-bridge-%d", os.Getpid()))
-	defer os.RemoveAll(cacheDir)
+	// (cacheDir variable removed: memory-cache mode needs no temp dir)
 
 	// mirrors cached_store_test.go defaultConf; Compress "none" exercises the
-	// WireRaw path.
+	// WireRaw path. CacheDir "memory" (not disk): upstream's diskCache spawns
+	// checkFreeSpace which races with cache() (pre-existing upstream issue),
+	// and -race would attribute it to this test.
 	store := chunk.NewCachedStore(mem, chunk.Config{
 		BlockSize:         1 << 20,
-		CacheDir:          cacheDir,
+		CacheDir:          "memory",
 		CacheMode:         0600,
 		CacheSize:         10 << 20,
 		CacheChecksum:     chunk.CsNone,
