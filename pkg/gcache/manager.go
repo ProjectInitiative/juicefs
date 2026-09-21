@@ -103,6 +103,14 @@ func NewManager(cfg Config, reg Registry, src ServerSource) *Manager {
 	}
 }
 
+// SetSource attaches the ServerSource after construction (two-phase init:
+// the decorator wrapping blob needs Manager.Members before the store that
+// provides the ServerSource exists). Must be called before Start unless
+// NoSharing. Not concurrency-safe with Start; call once.
+func (m *Manager) SetSource(src ServerSource) {
+	m.src = src
+}
+
 // Start launches the listener (unless NoSharing) and the membership loop.
 // It blocks briefly to bind the listener, then runs in the background.
 func (m *Manager) Start(ctx context.Context) error {

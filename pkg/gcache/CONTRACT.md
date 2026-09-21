@@ -109,7 +109,60 @@ Client may pipeline requests per connection; responses carry matching xid.
 `--group-advertise`, `--group-heartbeat`, `--remote-timeout`, `--no-sharing`,
 `--fill-group-cache`. Names mirror the enterprise command reference.
 
-## 10. Contract tests
+## 10. Committed Go signatures (both workers code against these EXACTLY)
+
+```go
+// pkg/gcache/manager.go (committed, compiling):
+func NewUUID() string
+func NewManager(cfg Config, reg Registry, src ServerSource) *Manager   // src may be nil
+func (m *Manager) SetSource(src ServerSource)                          // two-phase init
+func (m *Manager) Start(ctx context.Context) error
+func (m *Manager) Stop()
+func (m *Manager) Addr() string
+func (m *Manager) UUID() string
+func (m *Manager) Members(group string) []Member                       // excludes self
+// Config: Groups []string, ListenAddr, AdvertiseAddr string, Weight int,
+//         Heartbeat, RPCTimeout time.Duration, NoSharing, FillOnUpload bool
+
+// pkg/gcache/server.go (stubs to REPLACE, signatures are locked):
+func ServeConn(ctx context.Context, conn net.Conn, src ServerSource, timeout time.Duration)
+func NewRingStorage(inner object.ObjectStorage, rc *RingClient, members func(group string) []Member, selfUUID string) object.ObjectStorage
+```
+
+```go
+// pkg/gcache/client.go (worker 1 creates; RingClient type must be:
+type RingClient struct { /* fields free */ }
+func NewRingClient(timeout time.Duration, maxFailures int) *RingClient
+// Fetch(ctx context.Context, group, key string, members []Member) (io.ReadCloser, error)
+// MarkSuccess(peer string)  // clears failure counter, logs add-back
+// MarkFailure(peer string)  // increments; at maxFailures evicts + logs removal
+```
+
+Wiring shape for cmd/mount.go (worker 2, do not deviate):
+
+```go
+if groups := c.StringSlice("cache-group"); len(groups) > 0 {
+    gcfg := gcache.Config{Groups: groups, ...}
+    var src gcache.ServerSource
+    bridge := chunk.NewGcacheBridge(store)   // store is chunk.ChunkStore; asserts internally
+    src = bridge
+    mgr := gcache.NewManager(gcfg, registry, nil)
+    mgr.SetSource(src)
+    rc := gcache.NewRingClient(gcfg.RPCTimeout, gcache.DefaultMaxFailures)
+    blob = gcache.NewRingStorage(blob, rc, mgr.Members, mgr.UUID())
+    // NOTE: blob wrap must happen BEFORE chunk.NewCachedStore(blob, ...)
+    // but bridge needs store -> use SetSource AFTER NewCachedStore:
+    //   1. mgr := gcache.NewManager(gcfg, registry, nil)
+    //   2. blob = gcache.NewRingStorage(blob, rc, mgr.Members, mgr.UUID())
+    //   3. store := chunk.NewCachedStore(blob, ...)
+    //   4. mgr.SetSource(chunk.NewGcacheBridge(store))
+    //   5. mgr.Start(ctx); defer mgr.Stop()
+}
+```
+
+Build env: cgo deps require CC — run builds inside `nix-shell -p stdenv.cc`.
+
+## 11. Contract tests
 
 `pkg/gcache/contract_test.go` verifies: ObjectStorage interface shape (§2),
 key format sample hash round-trip (§1), compressor string selection (§3),
