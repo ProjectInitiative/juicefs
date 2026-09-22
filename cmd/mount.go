@@ -710,6 +710,7 @@ func mount(c *cli.Context) error {
 			// client then skips self-owned keys (served locally instead).
 			group := groups[0] // v1: single-group placement
 			blob = gcache.NewRingStorage(blob, rc, func(string) []gcache.Member { return gmgr.AllMembers(group) }, gmgr.UUID())
+			gcache.SetFillOnStorage(blob, c.Bool("fill-group-cache"))
 		}
 	}
 

@@ -72,8 +72,14 @@ func ServeConn(ctx context.Context, conn net.Conn, src ServerSource, timeout tim
 		if _, err := io.ReadFull(conn, hdr); err != nil {
 			return // EOF / timeout: normal connection end
 		}
-		if hdr[0] != magic0 || hdr[1] != magic1 || hdr[2] != protoVer || hdr[3] != MsgBlockReq {
+		if hdr[0] != magic0 || hdr[1] != magic1 || hdr[2] != protoVer {
 			_ = sendError(ctx, conn, errors.New("bad request header"))
+			return
+		}
+		switch hdr[3] {
+		case MsgBlockReq, MsgBlockPush, MsgBlockDrop:
+		default:
+			_ = sendError(ctx, conn, fmt.Errorf("bad request type 0x%x", hdr[3]))
 			return
 		}
 		klen := int(binary.LittleEndian.Uint16(hdr[9:11]))
@@ -85,10 +91,19 @@ func ServeConn(ctx context.Context, conn net.Conn, src ServerSource, timeout tim
 		if _, err := io.ReadFull(conn, key); err != nil {
 			return
 		}
-		// Reset deadline for the (potentially large) block transfer.
-		_ = conn.SetDeadline(time.Now().Add(timeout))
-		if err := serveBlock(ctx, conn, src, string(key)); err != nil {
-			logger.Debugf("gcache serve %s: %v", key, err)
+		switch hdr[3] {
+		case MsgBlockReq:
+			servData(ctx, conn, src, string(key), timeout)
+		case MsgBlockPush:
+			servPush(ctx, conn, src, string(key), hdr, timeout)
+		case MsgBlockDrop:
+			if err := src.DropCached(string(key)); err != nil {
+				_ = sendError(ctx, conn, err)
+				continue
+			}
+			_ = writeResp(ctx, conn, WireRaw, bytes.NewReader(nil))
+		default:
+			_ = sendError(ctx, conn, fmt.Errorf("bad request type 0x%x", hdr[3]))
 		}
 	}
 }
@@ -97,7 +112,34 @@ func ServeConn(ctx context.Context, conn net.Conn, src ServerSource, timeout tim
 // reporting a bogus size (blocks are ≤ 16MiB even at the largest setting).
 const maxBlockPayload = 64 << 20
 
+// servPush stores a pushed block (--fill-group-cache) and replies.
+func servPush(ctx context.Context, conn net.Conn, src ServerSource, key string, hdr []byte, timeout time.Duration) {
+	plen := binary.LittleEndian.Uint64(hdr[12:20])
+	if plen > maxBlockPayload {
+		_ = sendError(ctx, conn, fmt.Errorf("payload too large: %d", plen))
+		return
+	}
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	data := make([]byte, plen)
+	if _, err := io.ReadFull(conn, data); err != nil {
+		_ = sendError(ctx, conn, fmt.Errorf("read payload: %w", err))
+		return
+	}
+	if err := src.StorePushed(ctx, key, data); err != nil {
+		_ = sendError(ctx, conn, err)
+		return
+	}
+	_ = writeResp(ctx, conn, WireRaw, bytes.NewReader(nil))
+}
+
 // serveBlock resolves one key and writes the response frame.
+func servData(ctx context.Context, conn net.Conn, src ServerSource, key string, timeout time.Duration) {
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	if err := serveBlock(ctx, conn, src, key); err != nil {
+		logger.Debugf("gcache serve %s: %v", key, err)
+	}
+}
+
 func serveBlock(ctx context.Context, conn net.Conn, src ServerSource, key string) error {
 	r, err := src.LoadCached(key)
 	if errors.Is(err, os.ErrNotExist) {
@@ -233,10 +275,62 @@ func (p *passthroughStorage) Restore(ctx context.Context, key string, days int32
 // falls through to the wrapped ObjectStorage untouched.
 type ringStorage struct {
 	passthroughStorage
-	rc       *RingClient
-	group    string // registry group whose members() closure is wired
-	members  func(group string) []Member
-	selfUUID string
+	rc           *RingClient
+	group        string // registry group whose members() closure is wired
+	members      func(group string) []Member
+	selfUUID     string
+	fillOnUpload bool // --fill-group-cache: push uploaded blocks to owners
+}
+
+// SetFillOnUpload enables --fill-group-cache push-on-upload semantics on a
+// ringStorage returned by NewRingStorage (no-op for any other storage).
+func SetFillOnStorage(os object.ObjectStorage, v bool) {
+	if rs, ok := os.(*ringStorage); ok {
+		rs.fillOnUpload = v
+	}
+}
+
+// Put uploads a block, then (when fillOnUpload) fire-and-forget pushes the
+// bytes to the block's ring owner. The upload path is never blocked or
+// failed by the push (best-effort, enterprise parity).
+func (s *ringStorage) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
+	if !s.fillOnUpload {
+		return s.inner.Put(ctx, key, in, getters...)
+	}
+	// Buffer so we can both hand inner.Put a reader and push the same bytes.
+	// Blocks are bounded (maxBlockPayload); larger streams pass through
+	// unbuffered and un-pushed.
+	data, rerr := io.ReadAll(io.LimitReader(in, maxBlockPayload+1))
+	if rerr != nil {
+		return rerr
+	}
+	var pushable []byte
+	if len(data) <= maxBlockPayload {
+		pushable = data
+	}
+	if err := s.inner.Put(ctx, key, bytes.NewReader(data), getters...); err != nil {
+		return err
+	}
+	if pushable != nil {
+		members := s.members(s.group)
+		if len(members) > 0 {
+			go s.rc.Push(context.Background(), s.group, key, pushable, members)
+		}
+	}
+	return nil
+}
+
+// Delete removes the object, then fire-and-forget broadcasts a drop so ring
+// copies are evicted (enterprise 5.0 parity).
+func (s *ringStorage) Delete(ctx context.Context, key string, getters ...object.AttrGetter) error {
+	if err := s.inner.Delete(ctx, key, getters...); err != nil {
+		return err
+	}
+	members := s.members(s.group)
+	if len(members) > 0 {
+		go s.rc.Drop(context.Background(), s.group, key, members)
+	}
+	return nil
 }
 
 // NewRingStorage wraps inner with ring-aware Get interception. members must

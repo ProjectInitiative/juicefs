@@ -56,7 +56,7 @@ var (
 // Frame layout (little-endian), fixed 20-byte header:
 //
 //	magic  3 bytes: 'G','C', protoVer
-//	type   uint8:  MsgBlockReq / MsgBlockResp / MsgError
+//	type   uint8:  MsgBlockReq / MsgBlockResp / MsgError / MsgBlockPush / MsgBlockDrop
 //	algo   uint8:  WireRaw / WireCompressed (0 in requests)
 //	xid    uint32: pipelining id, echoed in responses
 //	klen   uint16: block key length (0 in responses)
@@ -73,6 +73,8 @@ const (
 	MsgBlockReq  uint8 = 0x01
 	MsgBlockResp uint8 = 0x02
 	MsgError     uint8 = 0x03
+	MsgBlockPush uint8 = 0x04 // client→server: store block bytes (--fill-group-cache)
+	MsgBlockDrop uint8 = 0x05 // client→server: drop cached copy of key (delete-broadcast)
 )
 
 // Payload format flags carried in the response header 'algo' byte.

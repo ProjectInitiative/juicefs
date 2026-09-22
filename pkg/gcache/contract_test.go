@@ -41,6 +41,10 @@ func (testSource) CompressBound(n int) int { return n }
 func (testSource) CompressPayload(dst, src []byte) (int, error) {
 	return copy(dst, src), nil
 }
+func (testSource) StorePushed(_ context.Context, _ string, _ []byte) error {
+	return nil
+}
+func (testSource) DropCached(_ string) error { return nil }
 
 func TestContractServerSource(t *testing.T) {
 	var _ ServerSource = testSource{}

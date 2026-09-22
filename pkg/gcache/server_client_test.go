@@ -37,6 +37,8 @@ type fakeSource struct {
 	algo     string
 	fillCnt  map[string]int
 	loadCnt  map[string]int
+	pushCnt  map[string]int
+	dropCnt  map[string]int
 	fillHook func(key string) error
 }
 
@@ -46,6 +48,8 @@ func newFakeSource(algo string) *fakeSource {
 		algo:    algo,
 		fillCnt: make(map[string]int),
 		loadCnt: make(map[string]int),
+		pushCnt: make(map[string]int),
+		dropCnt: make(map[string]int),
 	}
 }
 
@@ -91,6 +95,24 @@ func (f *fakeSource) CompressPayload(dst, src []byte) (int, error) {
 
 // decompressFake inverts CompressPayload for assertions.
 func decompressFake(b []byte) []byte { return b[16:] }
+
+// StorePushed caches pushed bytes verbatim (test volumes are uncompressed).
+func (f *fakeSource) StorePushed(_ context.Context, key string, data []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pushCnt[key]++
+	f.blocks[key] = append([]byte(nil), data...)
+	return nil
+}
+
+// DropCached evicts the key and records the drop.
+func (f *fakeSource) DropCached(key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dropCnt[key]++
+	delete(f.blocks, key)
+	return nil
+}
 
 var fmtErrNotExist = os.ErrNotExist
 

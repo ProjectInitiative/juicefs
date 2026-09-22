@@ -38,6 +38,13 @@ type ServerSource interface {
 	CompressBound(n int) int
 	// CompressPayload compresses src (decompressed block) into dst, returns length.
 	CompressPayload(dst, src []byte) (int, error)
+	// StorePushed caches a pushed block (--fill-group-cache). data is
+	// volume-format (exactly what storage.Get would return); decompress
+	// before caching when the volume compresses.
+	StorePushed(ctx context.Context, key string, data []byte) error
+	// DropCached evicts any locally cached copy of key (delete-broadcast);
+	// not-found is success.
+	DropCached(key string) error
 }
 
 // Registry maintains cache-group membership in the meta engine.

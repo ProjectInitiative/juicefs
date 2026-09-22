@@ -39,6 +39,8 @@ type GcacheBridge struct {
 	CompressAlgoFn    func() string
 	CompressBoundFn   func(n int) int
 	CompressPayloadFn func(dst, src []byte) (int, error)
+	StorePushedFn     func(ctx context.Context, key string, data []byte) error
+	DropCachedFn      func(key string) error
 }
 
 // NewGcacheBridge builds a GcacheBridge over a *cachedStore. It returns an
@@ -55,6 +57,8 @@ func NewGcacheBridge(store ChunkStore) (*GcacheBridge, error) {
 		CompressAlgoFn:    cs.compressAlgo,
 		CompressBoundFn:   cs.compressBound,
 		CompressPayloadFn: cs.compressPayload,
+		StorePushedFn:     cs.storePushed,
+		DropCachedFn:      cs.dropCached,
 	}, nil
 }
 
@@ -76,6 +80,12 @@ func (b *GcacheBridge) CompressBound(n int) int { return b.CompressBoundFn(n) }
 func (b *GcacheBridge) CompressPayload(dst, src []byte) (int, error) {
 	return b.CompressPayloadFn(dst, src)
 }
+
+func (b *GcacheBridge) StorePushed(ctx context.Context, key string, data []byte) error {
+	return b.StorePushedFn(ctx, key, data)
+}
+
+func (b *GcacheBridge) DropCached(key string) error { return b.DropCachedFn(key) }
 
 // loadCached returns a streaming reader over the locally cached (decompressed)
 // block. chunk.ReadCloser is ReaderAt+Closer (no Read), so wrap it for
@@ -115,6 +125,35 @@ func (cs *cachedStore) compressBound(n int) int { return cs.compressor.CompressB
 
 func (cs *cachedStore) compressPayload(dst, src []byte) (int, error) {
 	return cs.compressor.Compress(dst, src)
+}
+
+// storePushed caches a pushed block (--fill-group-cache). Pushed bytes are
+// volume-format (what storage.Get returns); bcache stores decompressed.
+func (cs *cachedStore) storePushed(ctx context.Context, key string, data []byte) error {
+	if cs.conf.Compress == "none" {
+		cs.bcache.cache(key, NewPage(data), true, !cs.conf.OSCache)
+		return nil
+	}
+	size := parseObjOrigSize(key)
+	if size <= 0 || size > cs.conf.BlockSize {
+		return fmt.Errorf("invalid pushed block size for %s: %d", key, size)
+	}
+	p := NewOffPage(size)
+	defer p.Release()
+	n, err := cs.compressor.Decompress(p.Data, data)
+	if err != nil {
+		return fmt.Errorf("decompress pushed block %s: %w", key, err)
+	}
+	if n != size {
+		return fmt.Errorf("decompress pushed block %s: got %d bytes, want %d", key, n, size)
+	}
+	cs.bcache.cache(key, p, true, !cs.conf.OSCache)
+	return nil
+}
+
+func (cs *cachedStore) dropCached(key string) error {
+	cs.bcache.remove(key, false)
+	return nil
 }
 
 // ReadAtReader adapts chunk.ReadCloser (ReaderAt+Closer) to io.ReadCloser.
