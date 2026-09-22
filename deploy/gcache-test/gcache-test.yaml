@@ -1,0 +1,404 @@
+# Self-contained distributed-cache-group (gcache) test deployment.
+#
+# Namespace gcache-test contains everything (no external deps):
+#   postgres-0   single postgres (test volume metadata)
+#   s3-0         single Garage node (S3 object storage) + provision sidecar
+#                that creates the layout, bucket `gcachetest`, and imports the
+#                deterministic S3 key from the secret
+#   init-format  job: waits for both, formats the JuiceFS volume
+#   member-a/b   two JuiceFS mounts joined via --cache-group=test
+#                (providers; anti-affinity pushes them onto different nodes)
+#   verify job   third mount (--cache-group=test, cache-size 0): writes
+#                64MiB, reads back, checksums, PASSes only if its own
+#                juicefs_remotecache_gets > 0 — i.e. blocks genuinely arrived
+#                over the peer protocol.
+#
+# Apply:   kubectl apply -f deploy/gcache-test/gcache-test.yaml
+# Watch:   kubectl -n gcache-test get pods -w
+# Result:  kubectl -n gcache-test logs -f job/gcache-verify
+# Cleanup: kubectl delete ns gcache-test
+#
+# All images are pulled from the cluster's local registry (172.16.1.50:31872),
+# which nodes already use (see openbao pods).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gcache-test
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gcache-creds
+  namespace: gcache-test
+stringData:
+  postgres-password: "gcache-test-pg-pass-7f3b"
+  rpc-secret: "1b8f3c9d2e4a5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8"
+  s3-access-key: "gcache-access-key"
+  s3-secret-key: "gcache-secret-key-9d2e4a"
+  meta-uri: "postgres://postgres:gcache-test-pg-pass-7f3b@postgres.gcache-test.svc:5432/juicefs"
+---
+# ================= Postgres =================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: gcache-test
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path-nvme
+  resources: {requests: {storage: 2Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: gcache-test
+spec:
+  selector: {app: postgres}
+  ports: [{port: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: gcache-test
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata: {labels: {app: postgres}}
+    spec:
+      containers:
+        - name: postgres
+          image: 172.16.4.54:31872/gcache-test/postgres:16
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: gcache-creds, key: postgres-password}}
+            - name: POSTGRES_DB
+              value: juicefs
+          # test-only: trade durability for speed
+          args: ["-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"]
+          ports: [{containerPort: 5432}]
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "postgres"]}
+            initialDelaySeconds: 3
+            periodSeconds: 2
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: postgres-data}
+---
+# ================= Garage (S3) =================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage-config
+  namespace: gcache-test
+data:
+  garage.toml: |
+    metadata_dir = "/var/lib/garage/meta"
+    data_dir = "/var/lib/garage/data"
+    rpc_bind_addr = "[::]:3901"
+    rpc_secret = "1b8f3c9d2e4a5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8"
+    replication_factor = 1
+
+    [s3_api]
+    api_bind_addr = "[::]:3900"
+    s3_region = "gcache"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: garage-data
+  namespace: gcache-test
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path-nvme
+  resources: {requests: {storage: 5Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3
+  namespace: gcache-test
+spec:
+  selector: {app: s3}
+  ports: [{name: s3, port: 3900, targetPort: 3900}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: s3
+  namespace: gcache-test
+spec:
+  serviceName: s3
+  replicas: 1
+  selector: {matchLabels: {app: s3}}
+  template:
+    metadata: {labels: {app: s3}}
+    spec:
+      containers:
+        - name: garage
+          image: 172.16.4.54:31872/gcache-test/s3:latest
+          args: ["-c", "/etc/garage-config/garage.toml", "server"]
+          ports:
+            - {containerPort: 3900}
+            - {containerPort: 3901}
+          volumeMounts:
+            - {name: config, mountPath: /etc/garage-config}
+            - {name: data, mountPath: /var/lib/garage}
+          readinessProbe:
+            tcpSocket: {port: 3900}
+            initialDelaySeconds: 3
+            periodSeconds: 2
+        # Provision sidecar: waits for the server, sets up layout/bucket/key.
+        # Same image+config+data as the server (documented single-node flow:
+        # garage CLI on the node's own metadata dir talks to the live daemon).
+        - name: provision
+          image: 172.16.4.54:31872/gcache-test/s3:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              until timeout 2 sh -c 'exec 3<>/dev/tcp/127.0.0.1/3900' 2>/dev/null; do
+                echo "waiting for garage server"; sleep 1
+              done
+              NODE_ID=$(garage -c /etc/garage-config/garage.toml status | awk '/HEALTHY/{f=1;next} f && NF {print $1; exit}')
+              echo "node id: $NODE_ID"
+              garage -c /etc/garage-config/garage.toml layout assign -z dc1 -c 100 "$NODE_ID"
+              garage -c /etc/garage-config/garage.toml layout apply --version 1
+              garage -c /etc/garage-config/garage.toml bucket create gcachetest || true
+              garage -c /etc/garage-config/garage.toml key import gcache-access-key gcache-secret-key-9d2e4a gcache-key || true
+              garage -c /etc/garage-config/garage.toml bucket allow gcachetest --key gcache-key
+              echo "S3 PROVISIONED"
+              sleep infinity
+          volumeMounts:
+            - {name: config, mountPath: /etc/garage-config}
+            - {name: data, mountPath: /var/lib/garage}
+      volumes:
+        - name: config
+          configMap: {name: garage-config}
+        - name: data
+          persistentVolumeClaim: {claimName: garage-data}
+---
+# ================= Volume format =================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: format-volume
+  namespace: gcache-test
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: format
+          image: 172.16.4.54:31872/gcache-juicefs:dev
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              META=$(cat /etc/gcache/meta-uri)
+              until pg_isready -h postgres.gcache-test.svc -U postgres -t 2; do sleep 1; done
+              until curl -sf -o /dev/null http://s3.gcache-test.svc:3900; do sleep 1; done
+              juicefs format "$META" gcachetest \
+                --storage s3 \
+                --bucket http://s3.gcache-test.svc:3900/gcachetest \
+                --access-key gcache-access-key \
+                --secret-key gcache-secret-key-9d2e4a \
+                --compress none \
+                --block-size 4096
+              echo "VOLUME FORMATTED"
+          volumeMounts:
+            - {name: creds, mountPath: /etc/gcache}
+      volumes:
+        - name: creds
+          secret: {secretName: gcache-creds}
+---
+# ================= Cache-group members =================
+# Template shared by member-a and member-b; they differ only in name/ports.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: member-a
+  namespace: gcache-test
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: member-a}}
+  template:
+    metadata: {labels: {app: member-a}}
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector: {matchExpressions: [{key: app, operator: In, values: [member-b]}]}
+      enableServiceLinks: false
+      containers:
+        - name: juicefs
+          image: 172.16.4.54:31872/gcache-juicefs:dev
+          securityContext: {privileged: true}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              META=$(cat /etc/gcache/meta-uri)
+              exec juicefs mount "$META" /jfs \
+                --cache-group=test \
+                --cache-dir=/cache \
+                --cache-size 1024 \
+                --group-listen 0.0.0.0:3910 \
+                --no-bgjob \
+                --metrics 0.0.0.0:9900 \
+                --log-level debug \
+                --foreground
+          ports:
+            - {name: peer, containerPort: 3910}
+            - {name: metrics, containerPort: 9900}
+          volumeMounts:
+            - {name: creds, mountPath: /etc/gcache}
+            - {name: cache, mountPath: /cache}
+            - {name: fuse, mountPath: /dev/fuse}
+          readinessProbe:
+            exec: {command: ["bash", "-c", "test -f /jfs/.stats"]}
+            initialDelaySeconds: 8
+            periodSeconds: 5
+      volumes:
+        - name: creds
+          secret: {secretName: gcache-creds}
+        - name: cache
+          emptyDir: {sizeLimit: 2Gi}
+        - name: fuse
+          hostPath: {path: /dev/fuse, type: CharDevice}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: member-a
+  namespace: gcache-test
+spec:
+  selector: {app: member-a}
+  ports: [{name: peer, port: 3910}, {name: metrics, port: 9900}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: member-b
+  namespace: gcache-test
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: member-b}}
+  template:
+    metadata: {labels: {app: member-b}}
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: juicefs
+          image: 172.16.4.54:31872/gcache-juicefs:dev
+          securityContext: {privileged: true}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              META=$(cat /etc/gcache/meta-uri)
+              exec juicefs mount "$META" /jfs \
+                --cache-group=test \
+                --cache-dir=/cache \
+                --cache-size 1024 \
+                --group-listen 0.0.0.0:3910 \
+                --no-bgjob \
+                --metrics 0.0.0.0:9900 \
+                --log-level debug \
+                --foreground
+          ports:
+            - {name: peer, containerPort: 3910}
+            - {name: metrics, containerPort: 9900}
+          volumeMounts:
+            - {name: creds, mountPath: /etc/gcache}
+            - {name: cache, mountPath: /cache}
+            - {name: fuse, mountPath: /dev/fuse}
+          readinessProbe:
+            exec: {command: ["bash", "-c", "test -f /jfs/.stats"]}
+            initialDelaySeconds: 8
+            periodSeconds: 5
+      volumes:
+        - name: creds
+          secret: {secretName: gcache-creds}
+        - name: cache
+          emptyDir: {sizeLimit: 2Gi}
+        - name: fuse
+          hostPath: {path: /dev/fuse, type: CharDevice}
+---
+# ================= Verify job =================
+# Third mount in the group (cache-size 0): every block it reads must come
+# from member-a/member-b over the peer protocol or from object storage.
+# PASS requires checksum match AND its own remotecache_gets > 0.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gcache-verify
+  namespace: gcache-test
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      enableServiceLinks: false
+      restartPolicy: Never
+      containers:
+        - name: verify
+          image: 172.16.4.54:31872/gcache-juicefs:dev
+          securityContext: {privileged: true}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              META=$(cat /etc/gcache/meta-uri)
+              # wait for both members to be ready (3 heartbeats)
+              sleep 20
+              juicefs mount "$META" /jfs \
+                --cache-group=test \
+                --cache-size 0 \
+                --no-bgjob \
+                --metrics 127.0.0.1:9902 \
+                --log-level debug \
+                --foreground &
+              MOUNT_PID=$!
+              for i in $(seq 1 30); do test -f /jfs/.stats && break; sleep 1; done
+              test -f /jfs/.stats || { echo "FAIL: mount never came up"; exit 1; }
+
+              head -c 67108864 /dev/urandom > /jfs/big.bin
+              A=$(md5sum /jfs/big.bin | cut -d" " -f1)
+              # re-read through a fresh fd: page cache still serves warm data,
+              # so also drop the local page cache influence by re-mounting? no:
+              # with cache-size 0 the chunk layer re-fetches blocks; the FIRST
+              # read already went through the ring for peer-owned blocks.
+              B=$(md5sum /jfs/big.bin | cut -d" " -f1)
+              echo "checksums: $A / $B"
+              [ "$A" = "$B" ] || { echo "FAIL: checksum mismatch"; exit 1; }
+
+              GETS=$(curl -s http://127.0.0.1:9902/metrics | grep "^juicefs_remotecache_gets" | awk "{s+=\$2} END {print s+0}")
+              ERRS=$(curl -s http://127.0.0.1:9902/metrics | grep "^juicefs_remotecache_errors" | awk "{s+=\$2} END {print s+0}")
+              BYTES=$(curl -s http://127.0.0.1:9902/metrics | grep "^juicefs_remotecache_bytes" | awk "{s+=\$2} END {print s+0}")
+              echo "peer fetches=$GETS bytes=$BYTES errors=$ERRS"
+              if [ "${GETS:-0}" -gt 0 ]; then
+                echo "PASS: gcache distributed cache verified in-cluster ($GETS peer fetches, $BYTES bytes)"
+              else
+                echo "FAIL: no peer fetch observed"
+                exit 1
+              fi
+          volumeMounts:
+            - {name: creds, mountPath: /etc/gcache}
+            - {name: fuse, mountPath: /dev/fuse}
+      volumes:
+        - name: creds
+          secret: {secretName: gcache-creds}
+        - name: fuse
+          hostPath: {path: /dev/fuse, type: CharDevice}
