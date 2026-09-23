@@ -176,3 +176,19 @@ Build env: cgo deps require CC — run builds inside `nix-shell -p stdenv.cc`.
 key format sample hash round-trip (§1), compressor string selection (§3),
 ServerSource satisfiable by a test adapter (§4). Run before/after upstream
 sync: `go test ./pkg/gcache/ -run TestContract`.
+
+## 11. RDMA transport (enterprise 5.3 parity)
+
+* Client: `Transport` interface (transport.go): `Dial(ctx, addr) (net.Conn, error)`
+  + `Name() string`. TCP default; rsockets backend is build-tag gated
+  (rdma.go; `ErrRdmaUnsupported` without it).
+* Failover state machine (`dialFailover`): prefer `Member.RdmaAddr` unless in
+  backoff; RDMA failure → TCP + 5m backoff (`rdmaRetryInterval` =
+  IORPC_RDMA_RETRY_DURATION parity); success clears backoff (failback);
+  TCP-only members never touch RDMA.
+* Server: Manager dual-listens when `Config.RdmaNics` is set (TCP always +
+  RDMA listener); startup RDMA failure is fatal (enterprise semantics, no
+  silent fallback). Advertised via `Member.RdmaAddr` in the registry.
+* Flag: `--rdma-network eth1:eth2` (NIC list; parseRdmaNics in cmd/).
+* Wire protocol, frame loop, and ServeConn are transport-agnostic — a verbs
+  (RC QP) transport later only implements Transport + a listener.
