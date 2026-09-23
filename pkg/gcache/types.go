@@ -28,11 +28,12 @@ import (
 // Member describes one cache-group member (a mount process serving cache).
 // JSON-serialized into the registry (see CONTRACT.md §5).
 type Member struct {
-	UUID    string `json:"uuid"`    // member session uuid (registry key)
-	Addr    string `json:"addr"`    // host:port for the peer RPC listener
-	Weight  int    `json:"weight"`  // relative cache capacity (default 1)
-	Version string `json:"version"` // juicefs version, informational
-	TS      int64  `json:"ts"`      // unix seconds of last heartbeat
+	UUID     string `json:"uuid"`               // member session uuid (registry key)
+	Addr     string `json:"addr"`               // host:port for the peer RPC listener (TCP)
+	RdmaAddr string `json:"rdmaAddr,omitempty"` // host:port for the RDMA listener ("" = TCP-only member)
+	Weight   int    `json:"weight"`             // relative cache capacity (default 1)
+	Version  string `json:"version"`            // juicefs version, informational
+	TS       int64  `json:"ts"`                 // unix seconds of last heartbeat
 }
 
 // Stale returns true when the member's heartbeat is older than maxAge.

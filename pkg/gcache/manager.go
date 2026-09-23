@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -60,6 +61,8 @@ type Config struct {
 	RPCTimeout    time.Duration // per-request peer timeout
 	NoSharing     bool          // consumer-only: no listener, no registration
 	FillOnUpload  bool          // push uploaded blocks to owners (best-effort)
+	RdmaNics      []string      // --rdma-network: NICs to advertise for RDMA ("" or empty => TCP-only)
+	RdmaAdvertise string        // advertised RDMA host:port ("" : rdmaTransport picks)
 }
 
 func (m *Manager) self(addr string) Member {
@@ -78,10 +81,11 @@ type Manager struct {
 	src      ServerSource // nil => consumer-only even if NoSharing is false
 	uuid     string
 
-	mu      sync.Mutex
-	members map[string][]Member // group -> live members (self included)
-	addr    string              // advertised listener addr ("" when NoSharing)
-	kick    chan struct{}
+	mu       sync.Mutex
+	members  map[string][]Member // group -> live members (self included)
+	addr     string              // advertised listener addr ("" when NoSharing)
+	rdmaAddr string              // advertised RDMA addr ("" when disabled)
+	kick     chan struct{}
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -137,31 +141,78 @@ func (m *Manager) Start(ctx context.Context) error {
 			_ = ln.Close()
 		}()
 		m.wg.Add(1)
-		go func() {
-			defer m.wg.Done()
-			for {
-				conn, err := ln.Accept()
-				if err != nil {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-					}
-					logger.Debugf("gcache accept: %v", err)
-					continue
-				}
-				m.wg.Add(1)
-				go func() {
-					defer m.wg.Done()
-					defer conn.Close()
-					ServeConn(ctx, conn, m.src, m.cfg.RPCTimeout)
-				}()
+		go m.acceptLoop(ctx, ln)
+
+		// RDMA dual-listener (enterprise parity): when RDMA NICs are
+		// configured, also listen on RDMA and advertise the RDMA endpoint.
+		// Initialization failure is FATAL for the RDMA config (no silent
+		// TCP fallback at startup — matches enterprise 5.3 semantics).
+		if len(m.cfg.RdmaNics) > 0 {
+			rt, rerr := ListenRDMA(m.cfg.RdmaNics, m.cfg.RdmaAdvertise)
+			if rerr != nil {
+				m.cancel()
+				return fmt.Errorf("rdma listen on %v: %w", m.cfg.RdmaNics, rerr)
 			}
-		}()
+			m.mu.Lock()
+			m.rdmaAddr = rt.Addr()
+			m.mu.Unlock()
+			m.wg.Add(1)
+			go func() {
+				defer m.wg.Done()
+				<-ctx.Done()
+				rt.Close()
+			}()
+			m.wg.Add(1)
+			go func() {
+				defer m.wg.Done()
+				for {
+					conn, err := rt.Accept()
+					if err != nil {
+						select {
+						case <-ctx.Done():
+							return
+						default:
+						}
+						logger.Debugf("gcache rdma accept: %v", err)
+						continue
+					}
+					m.wg.Add(1)
+					go func() {
+						defer m.wg.Done()
+						defer conn.Close()
+						ServeConn(ctx, conn, m.src, m.cfg.RPCTimeout)
+					}()
+				}
+			}()
+			logger.Infof("gcache rdma listener ready on %s (%s)", rt.Addr(), rt.Name())
+		}
 	}
 	m.wg.Add(1)
 	go m.heartbeatLoop(ctx)
 	return nil
+}
+
+// acceptLoop serves one listener; shared by TCP and RDMA.
+func (m *Manager) acceptLoop(ctx context.Context, ln net.Listener) {
+	defer m.wg.Done()
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			logger.Debugf("gcache accept: %v", err)
+			continue
+		}
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			defer conn.Close()
+			ServeConn(ctx, conn, m.src, m.cfg.RPCTimeout)
+		}()
+	}
 }
 
 // Stop cancels all background work and waits for goroutines to exit.
@@ -271,6 +322,9 @@ func (m *Manager) beat(ctx context.Context) {
 	}
 	addr := m.Addr()
 	self := m.self(addr)
+	if m.rdmaAddr != "" {
+		self.RdmaAddr = m.rdmaAddr
+	}
 	stale := m.cfg.Heartbeat * DefaultStaleMultiplier
 	cctx, cancel := context.WithTimeout(ctx, m.cfg.Heartbeat)
 	defer cancel()

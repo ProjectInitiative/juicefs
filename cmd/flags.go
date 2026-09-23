@@ -315,6 +315,10 @@ func dataCacheFlags() []cli.Flag {
 			Name:  "no-sharing",
 			Usage: "consume from the cache group without serving cache to other members",
 		},
+		&cli.StringFlag{
+			Name:  "rdma-network",
+			Usage: "RDMA NIC(s) for cache data path, e.g. eth1:eth2 or ib0 (enterprise parity; requires RDMA NICs + rdma-core on every group node; falls back to TCP on connection failure and retries RDMA after 5m)",
+		},
 		&cli.BoolFlag{
 			Name:  "fill-group-cache",
 			Usage: "send uploaded blocks to their cache group owners (best-effort, no guarantee)",

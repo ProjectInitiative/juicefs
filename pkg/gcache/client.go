@@ -40,6 +40,9 @@ type RingClient struct {
 	maxFailures int
 	selfUUID    string
 	kick        kickFunc // optional: requests membership refresh
+	tcp         Transport
+	rdma        Transport // nil => TCP-only
+	epState     map[string]endpointState
 
 	mu      sync.Mutex
 	failCnt map[string]int // peer addr -> consecutive failures
@@ -61,6 +64,9 @@ func NewRingClient(timeout time.Duration, maxFailures int, selfUUID string) *Rin
 		timeout:     timeout,
 		maxFailures: maxFailures,
 		selfUUID:    selfUUID,
+		tcp:         &TCPTransport{Timeout: timeout},
+		rdma:        nil,
+		epState:     make(map[string]endpointState),
 		failCnt:     make(map[string]int),
 		evicted:     make(map[string]time.Time),
 	}
@@ -118,6 +124,15 @@ func (c *RingClient) SetKick(k func()) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.kick = k
+}
+
+// SetRDMA attaches the RDMA transport (nil disables). When set, dials
+// prefer the member's RdmaAddr with automatic TCP failover and periodic
+// RDMA retry (enterprise 5.3.9 parity).
+func (c *RingClient) SetRDMA(t Transport) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rdma = t
 }
 
 // candidate returns the best non-evicted, non-self member for key, or nil.
@@ -182,8 +197,12 @@ func (c *RingClient) fetchOnce(ctx context.Context, key string, members []Member
 	var err error
 	func() {
 		var conn net.Conn
-		d := net.Dialer{Timeout: c.timeout}
-		conn, err = d.DialContext(ctx, "tcp", peer)
+		var tr Transport
+		conn, tr, err = c.dialFailover(ctx, *m)
+		if err == nil {
+			_ = conn.SetDeadline(time.Now().Add(c.timeout))
+			_ = tr // transport used (logging/metrics follow-up)
+		}
 		if err != nil {
 			err = fmt.Errorf("dial peer %s: %w", peer, err)
 			return

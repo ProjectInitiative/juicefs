@@ -57,13 +57,16 @@ func (c *RingClient) Push(ctx context.Context, group, key string, data []byte, m
 	if len(owners) == 0 || owners[0].UUID == c.selfUUID {
 		return // self-owned: nothing to push
 	}
-	peer := owners[0].Addr
+	owner := owners[0]
+	peer := owner.Addr
 	start := time.Now()
-	d := net.Dialer{Timeout: c.timeout}
-	conn, err := d.DialContext(ctx, "tcp", peer)
-	if err == nil {
+	conn, _, derr := c.dialFailover(ctx, owner)
+	var err error
+	if derr == nil {
 		err = c.sendWrite(ctx, conn, MsgBlockPush, key, data)
 		_ = conn.Close()
+	} else {
+		err = derr
 	}
 	used := time.Since(start)
 	if err != nil {
@@ -86,13 +89,16 @@ func (c *RingClient) Drop(ctx context.Context, group, key string, members []Memb
 		if members[i].UUID == c.selfUUID {
 			continue
 		}
-		peer := members[i].Addr
+		m := members[i]
+		peer := m.Addr
 		start := time.Now()
-		d := net.Dialer{Timeout: dropTimeout}
-		conn, err := d.DialContext(ctx, "tcp", peer)
-		if err == nil {
+		conn, _, derr := c.dialFailover(ctx, m)
+		var err error
+		if derr == nil {
 			err = c.sendWrite(ctx, conn, MsgBlockDrop, key, nil)
 			_ = conn.Close()
+		} else {
+			err = derr
 		}
 		if err != nil {
 			logger.Debugf("gcache drop %s to %s: %v", key, peer, err)
