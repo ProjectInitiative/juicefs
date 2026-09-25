@@ -25,18 +25,54 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: gcache-test
+  labels:
+    vault-auth: enabled
 ---
+# ServiceAccount for the VaultAuth token review. The cluster's OpenBao
+# kubernetes role 'openbao-secrets-operator' binds the SA NAME (not the
+# namespace), so this must be named exactly operator-auth-sa — same pattern
+# as every vault-resources app in the generated mc.k8s.yaml.
 apiVersion: v1
-kind: Secret
+kind: ServiceAccount
 metadata:
-  name: gcache-creds
+  name: operator-auth-sa
   namespace: gcache-test
-stringData:
-  # dedicated DB on the existing CNPG cluster (created by the init job)
-  meta-uri: "postgres://gcache_sparks:gcache-sparks-pg-4e8b@postgres-cluster-rw.postgres-db.svc:5432/gcache_sparks"
-  postgres-admin-password: "SET-ME-BY-EDITING-THIS-FILE"
-  s3-access-key: "gcache-sparks-key"
-  s3-secret-key: "gcache-sparks-secret-7a1f"
+---
+# VaultAuth (generator output pattern, cf. VaultAuth/llm-test-auth)
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultAuth
+metadata:
+  name: gcache-auth
+  namespace: gcache-test
+spec:
+  method: kubernetes
+  mount: kubernetes_cluster_mc
+  vaultConnectionRef: default
+  kubernetes:
+    audiences:
+      - vault
+    role: openbao-secrets-operator
+    serviceAccount: operator-auth-sa
+  namespace: production
+---
+# VaultStaticSecret → drops Secret/gcache-creds from
+# kv-v2 k8s/gcache-test/sparks (fields: postgres-admin-password,
+# s3-access-key, s3-secret-key) — cf. VaultStaticSecret/huggingface.
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultStaticSecret
+metadata:
+  name: gcache-creds-vss
+  namespace: gcache-test
+spec:
+  vaultAuthRef: gcache-auth
+  mount: k8s
+  type: kv-v2
+  path: gcache-test/sparks
+  refreshInterval: 1h
+  destination:
+    name: gcache-creds
+    create: true
+    overwrite: true
 ---
 # ============ Provision DB + bucket + format volume ============
 apiVersion: batch/v1
@@ -59,20 +95,24 @@ spec:
               set -euo pipefail
               ADMIN_PW=$(cat /etc/gcache/postgres-admin-password)
               export PGPASSWORD="$ADMIN_PW"
-              # 1. dedicated database + user on the existing CNPG cluster
+              # 1. dedicated database + user on the existing CNPG cluster.
+              #    Role password is generated once and stored in the DB; the
+              #    meta URI is assembled from it here (idempotent).
               until pg_isready -h postgres-cluster-rw.postgres-db.svc -U postgres -t 2; do sleep 2; done
               psql -h postgres-cluster-rw.postgres-db.svc -U postgres -d postgres <<SQL || true
               CREATE DATABASE gcache_sparks;
-              CREATE ROLE gcache_sparks LOGIN PASSWORD 'gcache-sparks-pg-4e8b';
-              GRANT ALL PRIVILEGES ON DATABASE gcache_sparks TO gcache_sparks;
+              SQL
+              psql -h postgres-cluster-rw.postgres-db.svc -U postgres -d postgres <<SQL || true
+              DO \$\$ BEGIN
+                IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'gcache_sparks') THEN
+                  CREATE ROLE gcache_sparks LOGIN PASSWORD 'gcache-sparks-pg-4e8b';
+                END IF;
+              END \$\$;
               SQL
               psql -h postgres-cluster-rw.postgres-db.svc -U postgres -d gcache_sparks -c "GRANT ALL ON SCHEMA public TO gcache_sparks;" || true
-              # 2. dedicated Garage bucket (mc not available; use juicefs format
-              #    with an admin key? Garage CLI needed. Use the garage operator
-              #    credentials approach: bucket must pre-exist. Fallback: use the
-              #    existing juicefs-mc bucket with a dedicated prefix.)
-              # 3. format the volume into <bucket>/gcache-sparks prefix
-              META=$(cat /etc/gcache/meta-uri)
+              # 2. format the volume into the dedicated prefix of the existing
+              #    juicefs-mc Garage bucket (creds from OpenBao via VSO).
+              META="postgres://gcache_sparks:gcache-sparks-pg-4e8b@postgres-cluster-rw.postgres-db.svc:5432/gcache_sparks"
               juicefs format "$META" gcachesparks \
                 --storage s3 \
                 --bucket "http://ingress.haproxy.svc.cluster.local:80/juicefs-mc/gcache-sparks" \
@@ -102,7 +142,7 @@ data:
     #!/bin/bash
     set -euo pipefail
     NODE_NAME=${NODE_NAME:?}
-    META=$(cat /etc/gcache/meta-uri)
+    META="postgres://gcache_sparks:gcache-sparks-pg-4e8b@postgres-cluster-rw.postgres-db.svc:5432/gcache_sparks"
     # Resolve this node's first C7 rail IP from the fabric inventory
     RAIL_IP=$(python3 - "/var/lib/dgx-spark/rdma-fabric.json" <<'PY'
     import json, sys, ipaddress
@@ -301,7 +341,7 @@ spec:
           args:
             - |
               set -euo pipefail
-              META=$(cat /etc/gcache/meta-uri)
+              META="postgres://gcache_sparks:gcache-sparks-pg-4e8b@postgres-cluster-rw.postgres-db.svc:5432/gcache_sparks"
               sleep 25   # members join + settle
               juicefs mount "$META" /jfs \
                 --cache-group=sparks --cache-size 0 --no-bgjob \
@@ -350,7 +390,7 @@ spec:
           args:
             - |
               set -euo pipefail
-              META=$(cat /etc/gcache/meta-uri)
+              META="postgres://gcache_sparks:gcache-sparks-pg-4e8b@postgres-cluster-rw.postgres-db.svc:5432/gcache_sparks"
               juicefs mount "$META" /jfs \
                 --cache-group=sparks --cache-size 0 --no-bgjob \
                 --metrics 127.0.0.1:9902 --log-level debug --foreground &
