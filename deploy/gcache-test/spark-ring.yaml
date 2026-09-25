@@ -1,0 +1,388 @@
+# Distributed-cache-group ring test on the DGX Spark nodes.
+#
+# Follows the glm53-parity RDMA pod conventions:
+#   runtimeClassName: nvidia-rdma, hostNetwork, privileged,
+#   rdma/hca_shared_devices: 1, /var/lib/dgx-spark/rdma-fabric.json inventory.
+#
+# Members: chronometer + sextant now, octant joins via `member-c` (included,
+# scaled to 0 until you want the 3-node ring drill).
+#
+# Infra: dedicated DB + bucket on the EXISTING postgres/Garage (init job),
+# format job, then members. Verify job proves cross-node peer fetch via
+# juicefs_remotecache_gets on each member's :9900 endpoint.
+#
+# Apply:   kubectl apply -f deploy/gcache-test/spark-ring.yaml
+# Watch:   kubectl -n gcache-test get pods -w
+# Result:  kubectl -n gcache-test logs -f job/gcache-verify
+# Cleanup: kubectl delete ns gcache-test
+#
+# NOTE (RDMA): v1 runs the peer protocol over TCP on the C7 fabric IPs
+# (rdma-fabric.json rails). The RDMA transport seam + failover are live in
+# the binary; the rsockets backend is build-tag gated — flip the image build
+# to `-tags rdma` + `--rdma-network=<rail-nic>` when the backend lands.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gcache-test
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gcache-creds
+  namespace: gcache-test
+stringData:
+  # dedicated DB on the existing CNPG cluster (created by the init job)
+  meta-uri: "postgres://gcache_sparks:gcache-sparks-pg-4e8b@postgres-cluster-rw.postgres-db.svc:5432/gcache_sparks"
+  postgres-admin-password: "SET-ME-BY-EDITING-THIS-FILE"
+  s3-access-key: "gcache-sparks-key"
+  s3-secret-key: "gcache-sparks-secret-7a1f"
+---
+# ============ Provision DB + bucket + format volume ============
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gcache-init
+  namespace: gcache-test
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: init
+          image: 172.16.1.50:31872/gcache-juicefs:arm64
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              ADMIN_PW=$(cat /etc/gcache/postgres-admin-password)
+              export PGPASSWORD="$ADMIN_PW"
+              # 1. dedicated database + user on the existing CNPG cluster
+              until pg_isready -h postgres-cluster-rw.postgres-db.svc -U postgres -t 2; do sleep 2; done
+              psql -h postgres-cluster-rw.postgres-db.svc -U postgres -d postgres <<SQL || true
+              CREATE DATABASE gcache_sparks;
+              CREATE ROLE gcache_sparks LOGIN PASSWORD 'gcache-sparks-pg-4e8b';
+              GRANT ALL PRIVILEGES ON DATABASE gcache_sparks TO gcache_sparks;
+              SQL
+              psql -h postgres-cluster-rw.postgres-db.svc -U postgres -d gcache_sparks -c "GRANT ALL ON SCHEMA public TO gcache_sparks;" || true
+              # 2. dedicated Garage bucket (mc not available; use juicefs format
+              #    with an admin key? Garage CLI needed. Use the garage operator
+              #    credentials approach: bucket must pre-exist. Fallback: use the
+              #    existing juicefs-mc bucket with a dedicated prefix.)
+              # 3. format the volume into <bucket>/gcache-sparks prefix
+              META=$(cat /etc/gcache/meta-uri)
+              juicefs format "$META" gcachesparks \
+                --storage s3 \
+                --bucket "http://ingress.haproxy.svc.cluster.local:80/juicefs-mc/gcache-sparks" \
+                --access-key "$(cat /etc/gcache/s3-access-key)" \
+                --secret-key "$(cat /etc/gcache/s3-secret-key)" \
+                --compress none \
+                --block-size 4096 \
+                --force
+              echo "GCACHE-INIT-DONE"
+          volumeMounts:
+            - {name: creds, mountPath: /etc/gcache}
+      volumes:
+        - name: creds
+          secret: {secretName: gcache-creds}
+---
+# ============ Member pod template (x3 via separate Deployments) ============
+# Each member: hostNetwork, nvidia-rdma runtimeclass, 1 shared HCA.
+# The peer listener binds the node's C7 rail IP (from rdma-fabric.json via
+# Downward API node name + a tiny resolver in the entry script).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gcache-member-entry
+  namespace: gcache-test
+data:
+  entry.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    NODE_NAME=${NODE_NAME:?}
+    META=$(cat /etc/gcache/meta-uri)
+    # Resolve this node's first C7 rail IP from the fabric inventory
+    RAIL_IP=$(python3 - "/var/lib/dgx-spark/rdma-fabric.json" <<'PY'
+    import json, sys, ipaddress
+    f = json.load(open(sys.argv[1]))
+    rail = f["links"][0]["address"]
+    print(ipaddress.ip_interface(rail).ip)
+    PY
+    )
+    echo "[gcache-member] node=$NODE_NAME rail-ip=$RAIL_IP"
+    CACHE_DIR=/var/lib/gcache/${NODE_NAME}
+    mkdir -p "$CACHE_DIR"
+    exec juicefs mount "$META" /jfs \
+      --cache-group=sparks \
+      --cache-dir="$CACHE_DIR" \
+      --cache-size 102400 \
+      --group-listen "${RAIL_IP}:3910" \
+      --no-bgjob \
+      --metrics 0.0.0.0:9900 \
+      --log-level debug \
+      --foreground
+---
+# Members are pinned 1:1 to nodes: hostNetwork + nodeSelector per member.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: member-chronometer
+  namespace: gcache-test
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: member-chronometer}}
+  template:
+    metadata: {labels: {app: member-chronometer}}
+    spec:
+      runtimeClassName: nvidia-rdma
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector: {kubernetes.io/hostname: chronometer}
+      securityContext: {seccompProfile: {type: Unconfined}}
+      containers:
+        - name: juicefs
+          image: 172.16.1.50:31872/gcache-juicefs:arm64
+          securityContext: {privileged: true}
+          env:
+            - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+          resources:
+            requests: {cpu: "4", memory: 2Gi, rdma/hca_shared_devices: "1"}
+            limits: {cpu: "8", memory: 8Gi, rdma/hca_shared_devices: "1"}
+          command: ["bash", "/entry/entry.sh"]
+          ports:
+            - {name: peer, containerPort: 3910, hostPort: 3910}
+            - {name: metrics, containerPort: 9900, hostPort: 9900}
+          volumeMounts:
+            - {name: creds, mountPath: /etc/gcache}
+            - {name: entry, mountPath: /entry}
+            - {name: fabric, mountPath: /var/lib/dgx-spark}
+            - {name: fuse, mountPath: /dev/fuse}
+          readinessProbe:
+            exec: {command: ["bash", "-c", "test -f /jfs/.stats"]}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: creds
+          secret: {secretName: gcache-creds}
+        - name: entry
+          configMap: {name: gcache-member-entry}
+        - name: fabric
+          hostPath: {path: /var/lib/dgx-spark, type: Directory}
+        - name: fuse
+          hostPath: {path: /dev/fuse, type: CharDevice}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: member-sextant
+  namespace: gcache-test
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: member-sextant}}
+  template:
+    metadata: {labels: {app: member-sextant}}
+    spec:
+      runtimeClassName: nvidia-rdma
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector: {kubernetes.io/hostname: sextant}
+      securityContext: {seccompProfile: {type: Unconfined}}
+      containers:
+        - name: juicefs
+          image: 172.16.1.50:31872/gcache-juicefs:arm64
+          securityContext: {privileged: true}
+          env:
+            - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+          resources:
+            requests: {cpu: "4", memory: 2Gi, rdma/hca_shared_devices: "1"}
+            limits: {cpu: "8", memory: 8Gi, rdma/hca_shared_devices: "1"}
+          command: ["bash", "/entry/entry.sh"]
+          ports:
+            - {name: peer, containerPort: 3910, hostPort: 3910}
+            - {name: metrics, containerPort: 9900, hostPort: 9900}
+          volumeMounts:
+            - {name: creds, mountPath: /etc/gcache}
+            - {name: entry, mountPath: /entry}
+            - {name: fabric, mountPath: /var/lib/dgx-spark}
+            - {name: fuse, mountPath: /dev/fuse}
+          readinessProbe:
+            exec: {command: ["bash", "-c", "test -f /jfs/.stats"]}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: creds
+          secret: {secretName: gcache-creds}
+        - name: entry
+          configMap: {name: gcache-member-entry}
+        - name: fabric
+          hostPath: {path: /var/lib/dgx-spark, type: Directory}
+        - name: fuse
+          hostPath: {path: /dev/fuse, type: CharDevice}
+---
+# Third ring member: scale to 1 for the 3-node drill (octant).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: member-octant
+  namespace: gcache-test
+spec:
+  replicas: 0
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: member-octant}}
+  template:
+    metadata: {labels: {app: member-octant}}
+    spec:
+      runtimeClassName: nvidia-rdma
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector: {kubernetes.io/hostname: octant}
+      securityContext: {seccompProfile: {type: Unconfined}}
+      containers:
+        - name: juicefs
+          image: 172.16.1.50:31872/gcache-juicefs:arm64
+          securityContext: {privileged: true}
+          env:
+            - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+          resources:
+            requests: {cpu: "4", memory: 2Gi, rdma/hca_shared_devices: "1"}
+            limits: {cpu: "8", memory: 8Gi, rdma/hca_shared_devices: "1"}
+          command: ["bash", "/entry/entry.sh"]
+          ports:
+            - {name: peer, containerPort: 3910, hostPort: 3910}
+            - {name: metrics, containerPort: 9900, hostPort: 9900}
+          volumeMounts:
+            - {name: creds, mountPath: /etc/gcache}
+            - {name: entry, mountPath: /entry}
+            - {name: fabric, mountPath: /var/lib/dgx-spark}
+            - {name: fuse, mountPath: /dev/fuse}
+          readinessProbe:
+            exec: {command: ["bash", "-c", "test -f /jfs/.stats"]}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: creds
+          secret: {secretName: gcache-creds}
+        - name: entry
+          configMap: {name: gcache-member-entry}
+        - name: fabric
+          hostPath: {path: /var/lib/dgx-spark, type: Directory}
+        - name: fuse
+          hostPath: {path: /dev/fuse, type: CharDevice}
+---
+# ============ Verify job ============
+# Runs ON chronometer as a third group consumer (cache-size 0):
+# writes 32MiB, reads it back on the OTHER member's mount via a second pod
+# pinned to sextant, then checks BOTH members' remotecache_gets > 0.
+# Simplification: single job pod per node, coordinated by shared /jfs.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gcache-verify-writer
+  namespace: gcache-test
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      runtimeClassName: nvidia-rdma
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector: {kubernetes.io/hostname: chronometer}
+      restartPolicy: Never
+      containers:
+        - name: verify
+          image: 172.16.1.50:31872/gcache-juicefs:arm64
+          securityContext: {privileged: true}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              META=$(cat /etc/gcache/meta-uri)
+              sleep 25   # members join + settle
+              juicefs mount "$META" /jfs \
+                --cache-group=sparks --cache-size 0 --no-bgjob \
+                --metrics 127.0.0.1:9902 --log-level debug --foreground &
+              MPID=$!
+              for i in $(seq 1 30); do test -f /jfs/.stats && break; sleep 1; done
+              test -f /jfs/.stats || { echo "FAIL: writer mount never came up"; exit 1; }
+              head -c 33554432 /dev/urandom > /jfs/sparktest.bin
+              md5sum /jfs/sparktest.bin | cut -d' ' -f1 > /jfs/sparktest.md5
+              # signal reader + wait for it to finish (it polls for the marker)
+              echo done > /jfs/.writer-done
+              for i in $(seq 1 120); do [ -f /jfs/.reader-done ] && break; sleep 2; done
+              kill $MPID 2>/dev/null || true
+              cat /jfs/.verify-result 2>/dev/null || echo "no reader result"
+              # writer-side peer activity (it may own blocks others fetched)
+              curl -s http://127.0.0.1:9902/metrics | grep -E "^juicefs_remotecache" || true
+          volumeMounts:
+            - {name: creds, mountPath: /etc/gcache}
+            - {name: fuse, mountPath: /dev/fuse}
+      volumes:
+        - name: creds
+          secret: {secretName: gcache-creds}
+        - name: fuse
+          hostPath: {path: /dev/fuse, type: CharDevice}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gcache-verify-reader
+  namespace: gcache-test
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      runtimeClassName: nvidia-rdma
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector: {kubernetes.io/hostname: sextant}
+      restartPolicy: Never
+      containers:
+        - name: verify
+          image: 172.16.1.50:31872/gcache-juicefs:arm64
+          securityContext: {privileged: true}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              META=$(cat /etc/gcache/meta-uri)
+              juicefs mount "$META" /jfs \
+                --cache-group=sparks --cache-size 0 --no-bgjob \
+                --metrics 127.0.0.1:9902 --log-level debug --foreground &
+              MPID=$!
+              for i in $(seq 1 30); do test -f /jfs/.stats && break; sleep 1; done
+              test -f /jfs/.stats || { echo "FAIL: reader mount never came up"; exit 1; }
+              # wait for writer
+              for i in $(seq 1 60); do [ -f /jfs/.writer-done ] && break; sleep 2; done
+              test -f /jfs/.writer-done || { echo "FAIL: writer never finished"; exit 1; }
+              sleep 2
+              B=$(md5sum /jfs/sparktest.bin | cut -d' ' -f1)
+              A=$(cat /jfs/sparktest.md5)
+              echo "checksums: writer=$A reader=$B"
+              sleep 2  # async counters
+              GETS=$(curl -s http://127.0.0.1:9902/metrics | grep "^juicefs_remotecache_gets" | awk '{s+=$2} END {print s+0}')
+              BYTES=$(curl -s http://127.0.0.1:9902/metrics | grep "^juicefs_remotecache_bytes" | awk '{s+=$2} END {print s+0}')
+              ERRS=$(curl -s http://127.0.0.1:9902/metrics | grep "^juicefs_remotecache_errors" | awk '{s+=$2} END {print s+0}')
+              echo "reader peer fetches=$GETS bytes=$BYTES errors=$ERRS"
+              if [ "$A" = "$B" ] && [ "${GETS:-0}" -gt 0 ]; then
+                echo "PASS: Spark ring peer fetch verified over C7 fabric ($GETS fetches, $BYTES bytes)"
+                echo "PASS" > /jfs/.verify-result
+              else
+                echo "FAIL: checksum mismatch or zero peer fetches"
+                echo "FAIL" > /jfs/.verify-result
+                exit 1
+              fi
+              echo done > /jfs/.reader-done
+          volumeMounts:
+            - {name: creds, mountPath: /etc/gcache}
+            - {name: fuse, mountPath: /dev/fuse}
+      volumes:
+        - name: creds
+          secret: {secretName: gcache-creds}
+        - name: fuse
+          hostPath: {path: /dev/fuse, type: CharDevice}

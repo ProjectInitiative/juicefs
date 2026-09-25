@@ -1,9 +1,17 @@
 # gcache-on-Sparks test design
 
-Status: design (apply-only step left to user; agent kubectl is read-only)
-Targets: chronometer (172.16.4.55) + sextant (172.16.4.56) — both arm64
-DGX Sparks (label `gpu: dgx-spark`), k3s 1.35, containerd 2.2.3, NixOS.
-Third Spark arriving → ring grows to 3; design accounts for it.
+Status: VERIFIED live (2026-09-25). Apply-only step left to user (agent
+kubectl is read-only). Nodes: chronometer (172.16.4.55), sextant
+(172.16.4.56), octant (172.16.4.57) — full 3-node ring EXISTS:
+  chronometer<->sextant rails 172.16.5.x/6.x (enp1s0f1np1 + enP2p1s0f1np1)
+  chronometer<->octant  rails 172.16.7.x/8.x (enp1s0f0np0 + enP2p1s0f0np0)
+  sextant<->octant      rails 172.16.9.x/10.x
+3x mlx5 HCAs per node ACTIVE; rping RDMA_READ_ADV green chrono<->sextant.
+rdma-shared-device-plugin v1.5.3 advertises rdma/hca_shared_devices=1/node
+(vendors 15b3, mlx5_core, ether). runtimeclass nvidia-rdma exists.
+arm64 image: 172.16.1.50:31872/gcache-juicefs:arm64 (built natively on
+chronometer; cross-built Nix binaries have /nix interpreter paths and are
+unusable on Debian/Alpine bases).
 
 ## What we learned from llm-test live configs
 
