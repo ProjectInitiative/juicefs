@@ -428,7 +428,9 @@ spec:
               META="postgres://${PGUSER}:${PGPASSWORD}@postgres-cluster-rw.postgres-db.svc:5432/gcache_sparks"
               sleep 25   # members join + settle
               juicefs mount "$META" /jfs \
-                --cache-group=sparks --cache-dir=/tmp/wcache --cache-size 4096 --fill-group-cache --no-bgjob \
+                --cache-group=sparks --cache-dir=/tmp/wcache --cache-size 4096 \
+                --group-listen "$(hostname -I | awk '{print $1}'):3912" \
+                --fill-group-cache --no-bgjob \
                 --metrics 127.0.0.1:9902 --log-level debug --foreground &
               MPID=$!
               for i in $(seq 1 30); do test -f /jfs/.stats && break; sleep 1; done
@@ -478,7 +480,8 @@ spec:
               PGPASSWORD=$(cat /etc/gcache/password)
               META="postgres://${PGUSER}:${PGPASSWORD}@postgres-cluster-rw.postgres-db.svc:5432/gcache_sparks"
               juicefs mount "$META" /jfs \
-                --cache-group=sparks --cache-size 0 --no-bgjob \
+                --cache-group=sparks --cache-dir=/tmp/rcache --cache-size 1024 \
+                --group-listen "$(hostname -I | awk '{print $1}'):3913" --no-bgjob \
                 --metrics 127.0.0.1:9902 --log-level debug --foreground &
               MPID=$!
               for i in $(seq 1 30); do test -f /jfs/.stats && break; sleep 1; done
