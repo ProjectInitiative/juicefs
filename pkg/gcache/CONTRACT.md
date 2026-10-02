@@ -136,6 +136,7 @@ func (m *Manager) Members(group string) []Member                       // exclud
 func ServeConn(ctx context.Context, conn net.Conn, src ServerSource, timeout time.Duration)
 func NewRingStorage(inner object.ObjectStorage, rc *RingClient, members func(group string) []Member, selfUUID string) object.ObjectStorage
 func SetBlockSizeOnStorage(os object.ObjectStorage, n int64) // Get also engages on off==0 && limit==blockSize
+// Member.Addrs: multi-rail endpoints; --group-advertise "ip1:p,ip2:p" + ListenAddr ":p" (wildcard). dialFailover tries each.
 ```
 
 ```go

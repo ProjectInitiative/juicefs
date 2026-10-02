@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,7 +71,10 @@ func (m *Manager) self(addr string) Member {
 	if w <= 0 {
 		w = DefaultWeight
 	}
-	return Member{UUID: m.uuid, Addr: addr, Weight: w, Version: "1.0", TS: time.Now().Unix()}
+	m.mu.Lock()
+	addrs := append([]string(nil), m.addrs...)
+	m.mu.Unlock()
+	return Member{UUID: m.uuid, Addr: addr, Addrs: addrs, Weight: w, Version: "1.0", TS: time.Now().Unix()}
 }
 
 // Manager runs the cache-group membership loop, the peer listener, and hands
@@ -84,6 +88,7 @@ type Manager struct {
 	mu       sync.Mutex
 	members  map[string][]Member // group -> live members (self included)
 	addr     string              // advertised listener addr ("" when NoSharing)
+	addrs    []string            // all advertised endpoints (multi-rail; addr is element 0)
 	rdmaAddr string              // advertised RDMA addr ("" when disabled)
 	kick     chan struct{}
 
@@ -133,6 +138,13 @@ func (m *Manager) Start(ctx context.Context) error {
 		}
 		m.mu.Lock()
 		m.addr = addr
+		// Multi-endpoint advertise: "ip1:p,ip2:p,..." (direct-ring fabrics
+		// expose one subnet per peer pair). The listener should be bound
+		// wildcard (ListenAddr ":p") so every endpoint is reachable.
+		if strings.Contains(addr, ",") {
+			m.addrs = strings.Split(addr, ",")
+			m.addr = m.addrs[0]
+		}
 		m.mu.Unlock()
 		m.wg.Add(1)
 		go func() {

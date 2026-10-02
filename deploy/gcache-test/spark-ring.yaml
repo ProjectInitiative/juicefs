@@ -229,21 +229,22 @@ data:
     PGUSER=$(cat /etc/gcache/username)
     PGPASSWORD=$(cat /etc/gcache/password)
     META="postgres://${PGUSER}:${PGPASSWORD}@postgres-cluster-rw.postgres-db.svc:5432/gcache_sparks"
-    # Resolve this node's first C7 rail IP from the fabric inventory
-    # (strip controlPlane block first — its "address" is the mgmt IP;
-    # pure shell, no python3 in image)
-    RAIL_IP=$(sed 's/.*"links"//' /var/lib/dgx-spark/rdma-fabric.json \
+    # Resolve ALL of this node's C7 rail IPs from the fabric inventory
+    # (strip controlPlane block first; direct-ring = one subnet per peer pair,
+    # so the member must advertise every rail to be reachable by all peers)
+    RAIL_IPS=$(sed 's/.*"links"//' /var/lib/dgx-spark/rdma-fabric.json \
       | grep -oE '"address"[[:space:]]*:[[:space:]]*"[0-9.]+' \
-      | head -1 | grep -oE '[0-9.]+$')
-    [ -n "$RAIL_IP" ] || { echo "[gcache-member] FATAL: no rail IP in fabric json"; exit 1; }
-    echo "[gcache-member] node=$NODE_NAME rail-ip=$RAIL_IP"
+      | grep -oE '[0-9.]+$' | sed 's/$/:3910/' | paste -sd, -)
+    [ -n "$RAIL_IPS" ] || { echo "[gcache-member] FATAL: no rail IPs in fabric json"; exit 1; }
+    echo "[gcache-member] node=$NODE_NAME rail-ips=$RAIL_IPS"
     CACHE_DIR=/var/lib/gcache/${NODE_NAME}
     mkdir -p "$CACHE_DIR"
     exec juicefs mount "$META" /jfs \
       --cache-group=sparks \
       --cache-dir="$CACHE_DIR" \
       --cache-size 102400 \
-      --group-listen "${RAIL_IP}:3910" \
+      --group-listen ":3910" \
+      --group-advertise "$RAIL_IPS" \
       --no-bgjob \
       --metrics 0.0.0.0:9900 \
       --log-level debug \

@@ -180,3 +180,40 @@ func TestDialFailoverTCPOnlyMember(t *testing.T) {
 		t.Fatalf("rdma dials = %d, want 0", rt.dials)
 	}
 }
+
+// Multi-endpoint members (direct-ring fabrics): dialFailover tries every
+// advertised address in order and succeeds on the first live one.
+func TestDialFailoverMultiEndpoint(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	rc := NewRingClient(time.Second, 31, "self") // real TCP dialer: endpoints are real addrs
+	// dead primary + two more endpoints, last one live
+	m := Member{UUID: "p", Addr: "127.0.0.1:1", Addrs: []string{"127.0.0.1:1", "127.0.0.1:2", ln.Addr().String()}}
+	conn, tr, err := rc.dialFailover(context.Background(), m)
+	if err != nil {
+		t.Fatalf("multi-endpoint dial: %v", err)
+	}
+	conn.Close()
+	if tr.Name() != "tcp" {
+		t.Fatalf("want tcp, got %s", tr.Name())
+	}
+
+	// all endpoints dead: error surfaces (and MarkFailure keys on Addr upstream)
+	m.Addrs = []string{"127.0.0.1:1", "127.0.0.1:2"}
+	if _, _, err := rc.dialFailover(context.Background(), m); err == nil {
+		t.Fatal("want error when every endpoint is dead")
+	}
+}

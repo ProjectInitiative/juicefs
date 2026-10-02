@@ -53,11 +53,22 @@ func (c *RingClient) dialFailover(ctx context.Context, m Member) (net.Conn, Tran
 		logger.Warnf("gcache rdma dial %s (%s) failed, falling back to tcp: %v", m.RdmaAddr, c.rdma.Name(), err)
 		c.markRdmaDown(m.Addr)
 	}
-	conn, err := c.tcp.Dial(ctx, m.Addr)
-	if err != nil {
-		return nil, nil, err
+	// Multi-endpoint members (direct-ring fabrics expose one subnet per
+	// peer pair): try every advertised address in order. Addrs falls back
+	// to the single Addr for registries predating the field.
+	addrs := m.Addrs
+	if len(addrs) == 0 {
+		addrs = []string{m.Addr}
 	}
-	return conn, c.tcp, nil
+	var err error
+	for _, a := range addrs {
+		var conn net.Conn
+		conn, err = c.tcp.Dial(ctx, a)
+		if err == nil {
+			return conn, c.tcp, nil
+		}
+	}
+	return nil, nil, err
 }
 
 func (c *RingClient) markRdmaDown(addr string) {

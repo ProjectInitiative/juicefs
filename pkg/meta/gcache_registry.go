@@ -133,6 +133,7 @@ type gcacheMembers struct {
 	GroupName string `xorm:"pk 'group_name' varchar(255) notnull"`
 	UUID      string `xorm:"pk 'uuid' varchar(64) notnull"`
 	Addr      string `xorm:"'addr' varchar(255) notnull"`
+	Addrs     string `xorm:"'addrs' varchar(1023) notnull default ''"` // comma-joined multi-rail endpoints
 	Weight    int    `xorm:"'weight' notnull"`
 	Version   string `xorm:"'version' varchar(64) notnull"`
 	TS        int64  `xorm:"'ts' notnull"` // unix seconds of last heartbeat
@@ -146,8 +147,8 @@ type upsertStmt struct {
 }
 
 var gcacheUpsert = upsertStmt{
-	pg:    "INSERT INTO %sgcache_members (group_name, uuid, addr, weight, version, ts) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (group_name, uuid) DO UPDATE SET addr = ?, weight = ?, version = ?, ts = ?",
-	mysql: "INSERT INTO %sgcache_members (group_name, uuid, addr, weight, version, ts) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE addr = ?, weight = ?, version = ?, ts = ?",
+	pg:    "INSERT INTO %sgcache_members (group_name, uuid, addr, addrs, weight, version, ts) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (group_name, uuid) DO UPDATE SET addr = ?, addrs = ?, weight = ?, version = ?, ts = ?",
+	mysql: "INSERT INTO %sgcache_members (group_name, uuid, addr, addrs, weight, version, ts) VALUES (?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE addr = ?, addrs = ?, weight = ?, version = ?, ts = ?",
 }
 
 // GcacheSQLRegistry implements gcache.Registry over a dbMeta engine
@@ -209,8 +210,8 @@ func (r *GcacheSQLRegistry) upsert(ctx context.Context, group string, self gcach
 	stmt = fmt.Sprintf(stmt, r.tablePrefix)
 	_, err := r.db.Context(ctx).
 		Exec(stmt,
-			group, self.UUID, self.Addr, self.Weight, self.Version, self.TS,
-			self.Addr, self.Weight, self.Version, self.TS)
+			group, self.UUID, self.Addr, strings.Join(self.Addrs, ","), self.Weight, self.Version, self.TS,
+			self.Addr, strings.Join(self.Addrs, ","), self.Weight, self.Version, self.TS)
 	return err
 }
 
@@ -246,13 +247,17 @@ func (r *GcacheSQLRegistry) List(ctx context.Context, group string) ([]gcache.Me
 		Delete(new(gcacheMembers))
 	members := make([]gcache.Member, 0, len(rows))
 	for _, row := range rows {
-		members = append(members, gcache.Member{
+		m := gcache.Member{
 			UUID:    row.UUID,
 			Addr:    row.Addr,
 			Weight:  row.Weight,
 			Version: row.Version,
 			TS:      row.TS,
-		})
+		}
+		if row.Addrs != "" {
+			m.Addrs = strings.Split(row.Addrs, ",")
+		}
+		members = append(members, m)
 	}
 	return members, nil
 }
