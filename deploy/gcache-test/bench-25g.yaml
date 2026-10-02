@@ -65,6 +65,15 @@ spec:
               drop_cache() { sync; echo 3 > /proc/sys/vm/drop_caches; }
               elapsed() { awk "BEGIN{printf \"%.1f\", ($2-$1)/1e9}"; }
               peerbytes() { curl -s localhost:9904/metrics | grep '^juicefs_remotecache_bytes' | awk '{s+=$2} END {print s+0}'; }
+              # API canary via kube-vip: timestamped evidence of control-plane
+              # health ON THE SAME LOG TIMELINE as the IO (401 = alive).
+              ( while true; do
+                  C=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 4 https://172.16.1.50:6443/healthz 2>/dev/null || echo timeout)
+                  echo "API-CANARY $(date +%T) $C"
+                  sleep 15
+                done ) &
+              CANARY=$!
+              trap 'kill $CANARY 2>/dev/null' EXIT
 
               echo "=== PHASE-A: prime (ring write 25GiB, fill ON)"
               juicefs mount "$META" /jfs \
@@ -82,6 +91,7 @@ spec:
               T0=$(date +%s%N)
               for b in $(seq 1 160); do
                 dd if=/dev/urandom of=/jfs/bench25g.bin bs=4M count=40 oflag=append conv=notrunc status=none
+                [ $((b % 20)) -eq 0 ] && echo "PHASE-A: batch $b/160 $(date +%T)"
                 sleep 6
               done
               T1=$(date +%s%N)
