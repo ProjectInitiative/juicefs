@@ -74,11 +74,17 @@ spec:
               MPID=$!
               for i in $(seq 1 40); do test -f /jfs/.stats && break; sleep 1; done
               test -f /jfs/.stats || { echo "FAIL: ring mount"; exit 1; }
+              # Paced write (run-2 lesson): 64 batches of 400MiB + 2s gaps
+              # keep Garage PUT latency sane while the shared storage also
+              # serves the LLM PVC (volume now points at garage svc direct).
               T0=$(date +%s%N)
-              dd if=/dev/urandom of=/jfs/bench25g.bin bs=4M count=6400 status=none
+              for b in $(seq 1 64); do
+                dd if=/dev/urandom of=/jfs/bench25g.bin bs=4M count=100 oflag=append status=none
+                sleep 2
+              done
               T1=$(date +%s%N)
               echo "PHASE-A: write $(elapsed $T0 $T1)s"
-              MD5=$(md5sum /jfs/bench25g.bin | cut -d' ' -f1)
+              MD5=$( { md5sum /jfs/bench25g.bin 2>/dev/null || { sleep 5; md5sum /jfs/bench25g.bin; } ; } | cut -d' ' -f1)
               echo "PHASE-A: md5=$MD5"
               echo "$MD5" > /jfs/bench25g.md5
               echo "PHASE-A: settling owner pushes (90s)..."
@@ -103,9 +109,23 @@ spec:
               else
                 RDIF=""; echo "BENCH: O_DIRECT unavailable; buffered reads (6Gi pod cap)"
               fi
+              # One read with a single transparent retry (transient EOFs were
+              # observed through the shared ingress; direct svc should not
+              # need it, but the checksum verdict must not hinge on one flake).
+              timed_read() {
+                local T0 T1 rc
+                T0=$(date +%s%N); dd if=$1 of=/dev/null bs=4M $RDIF status=none; rc=$?; T1=$(date +%s%N)
+                if [ $rc -ne 0 ]; then
+                  echo "  (read rc=$rc; drop_cache + retry)"
+                  drop_cache
+                  T0=$(date +%s%N); dd if=$1 of=/dev/null bs=4M $RDIF status=none; rc=$?; T1=$(date +%s%N)
+                fi
+                ELAPSED=$(elapsed $T0 $T1)
+                return $rc
+              }
               G0=$(peerbytes)
-              T0=$(date +%s%N); dd if=/jfs/bench25g.bin of=/dev/null bs=4M $RDIF status=none; T1=$(date +%s%N)
-              echo "PHASE-B: cold ring read $(elapsed $T0 $T1)s"
+              timed_read /jfs/bench25g.bin || { echo "PHASE-B: read failed twice"; exit 1; }
+              echo "PHASE-B: cold ring read $ELAPSED$s"
               sleep 3
               G1=$(peerbytes)
               echo "PHASE-B: peer bytes served=$((G1-G0)) ($(( (G1-G0)/1048576 ))MiB)"
@@ -115,8 +135,8 @@ spec:
               echo "=== PHASE-B2: warm-peer ring read (peers cached on serve)"
               drop_cache
               G0=$G1
-              T0=$(date +%s%N); dd if=/jfs/bench25g.bin of=/dev/null bs=4M $RDIF status=none; T1=$(date +%s%N)
-              echo "PHASE-B2: warm-peer read $(elapsed $T0 $T1)s"
+              timed_read /jfs/bench25g.bin || { echo "PHASE-B2: read failed twice"; exit 1; }
+              echo "PHASE-B2: warm-peer read $ELAPSED$s"
               sleep 3
               G1=$(peerbytes)
               echo "PHASE-B2: peer bytes served=$((G1-G0)) ($(( (G1-G0)/1048576 ))MiB)"
@@ -133,11 +153,11 @@ spec:
               for i in $(seq 1 40); do test -f /jfs-base/.stats && break; sleep 1; done
               test -f /jfs-base/.stats || { echo "FAIL: base mount"; exit 1; }
               drop_cache
-              T0=$(date +%s%N); dd if=/jfs-base/bench25g.bin of=/dev/null bs=4M $RDIF status=none; T1=$(date +%s%N)
-              echo "PHASE-C: garage baseline $(elapsed $T0 $T1)s"
+              timed_read /jfs-base/bench25g.bin || { echo "PHASE-C: read failed twice"; exit 1; }
+              echo "PHASE-C: garage baseline $ELAPSED$s"
               drop_cache
-              T0=$(date +%s%N); dd if=/jfs-base/bench25g.bin of=/dev/null bs=4M $RDIF status=none; T1=$(date +%s%N)
-              echo "PHASE-D: garage baseline 2 $(elapsed $T0 $T1)s"
+              timed_read /jfs-base/bench25g.bin || { echo "PHASE-D: read failed twice"; exit 1; }
+              echo "PHASE-D: garage baseline 2 $ELAPSED$s"
               MD=$(md5sum /jfs-base/bench25g.bin | cut -d' ' -f1)
               [ "$MD" = "$MD5" ] && echo "PHASE-D: md5 OK" || { echo "PHASE-D: MD5 MISMATCH"; exit 1; }
               echo "BENCH-PERF-DONE"
