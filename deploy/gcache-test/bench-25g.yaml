@@ -62,7 +62,7 @@ spec:
               PGUSER=$(cat /etc/gcache/username); PGPASSWORD=$(cat /etc/gcache/password)
               META="postgres://${PGUSER}:${PGPASSWORD}@postgres-cluster-rw.postgres-db.svc:5432/gcache_sparks"
               NODE_IP=$(hostname -I | awk '{print $1}')
-              drop_cache() { sync; echo 3 > /proc/sys/drop_caches; }
+              drop_cache() { sync; echo 3 > /proc/sys/vm/drop_caches; }
               elapsed() { awk "BEGIN{printf \"%.1f\", ($2-$1)/1e9}"; }
               peerbytes() { curl -s localhost:9904/metrics | grep '^juicefs_remotecache_bytes' | awk '{s+=$2} END {print s+0}'; }
 
@@ -74,13 +74,15 @@ spec:
               MPID=$!
               for i in $(seq 1 40); do test -f /jfs/.stats && break; sleep 1; done
               test -f /jfs/.stats || { echo "FAIL: ring mount"; exit 1; }
-              # Paced write (run-2 lesson): 64 batches of 400MiB + 2s gaps
-              # keep Garage PUT latency sane while the shared storage also
-              # serves the LLM PVC (volume now points at garage svc direct).
+              # Paced write v5: Garage runs on the master nodes and shares
+              # the root LV with etcd — the 400MiB-burst prime starved etcd
+              # fsyncs and took the API down (RISK-0018 pattern again). Small
+              # continuous batches (~26MB/s, no bursts): 160 x 160MiB / 6s.
+              rm -f /jfs/bench25g.bin /jfs/bench25g.md5   # fresh file (idempotent re-runs)
               T0=$(date +%s%N)
-              for b in $(seq 1 64); do
-                dd if=/dev/urandom of=/jfs/bench25g.bin bs=4M count=100 oflag=append status=none
-                sleep 2
+              for b in $(seq 1 160); do
+                dd if=/dev/urandom of=/jfs/bench25g.bin bs=4M count=40 oflag=append conv=notrunc status=none
+                sleep 6
               done
               T1=$(date +%s%N)
               echo "PHASE-A: write $(elapsed $T0 $T1)s"
@@ -201,7 +203,7 @@ spec:
               PGUSER=$(cat /etc/gcache/username); PGPASSWORD=$(cat /etc/gcache/password)
               META="postgres://${PGUSER}:${PGPASSWORD}@postgres-cluster-rw.postgres-db.svc:5432/gcache_sparks"
               NODE_IP=$(hostname -I | awk '{print $1}')
-              drop_cache() { sync; echo 3 > /proc/sys/drop_caches; }
+              drop_cache() { sync; echo 3 > /proc/sys/vm/drop_caches; }
               elapsed() { awk "BEGIN{printf \"%.1f\", ($2-$1)/1e9}"; }
               stats() { curl -s localhost:9904/metrics | grep "^juicefs_remotecache_$1" | awk '{s+=$2} END {print s+0}'; }
               SEX_ADDRS="172.16.5.56 172.16.6.56 172.16.9.56 172.16.10.56"
