@@ -428,7 +428,7 @@ spec:
               META="postgres://${PGUSER}:${PGPASSWORD}@postgres-cluster-rw.postgres-db.svc:5432/gcache_sparks"
               sleep 25   # members join + settle
               juicefs mount "$META" /jfs \
-                --cache-group=sparks --cache-size 0 --no-bgjob \
+                --cache-group=sparks --cache-dir=/tmp/wcache --cache-size 4096 --fill-group-cache --no-bgjob \
                 --metrics 127.0.0.1:9902 --log-level debug --foreground &
               MPID=$!
               for i in $(seq 1 30); do test -f /jfs/.stats && break; sleep 1; done
@@ -484,7 +484,7 @@ spec:
               test -f /jfs/.stats || { echo "FAIL: reader mount never came up"; exit 1; }
               for i in $(seq 1 60); do [ -f /jfs/.writer-done ] && break; sleep 2; done
               test -f /jfs/.writer-done || { echo "FAIL: writer never finished"; exit 1; }
-              sleep 2
+              sleep 8   # let --fill-group-cache pushes settle on owners
               B=$(md5sum /jfs/sparktest.bin | cut -d' ' -f1)
               A=$(cat /jfs/sparktest.md5)
               echo "checksums: writer=$A reader=$B"
