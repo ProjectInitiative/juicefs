@@ -433,6 +433,7 @@ spec:
               MPID=$!
               for i in $(seq 1 30); do test -f /jfs/.stats && break; sleep 1; done
               test -f /jfs/.stats || { echo "FAIL: writer mount never came up"; exit 1; }
+              rm -f /jfs/.writer-done /jfs/.reader-done /jfs/.verify-result /jfs/sparktest.bin /jfs/sparktest.md5
               head -c 33554432 /dev/urandom > /jfs/sparktest.bin
               md5sum /jfs/sparktest.bin | cut -d' ' -f1 > /jfs/sparktest.md5
               echo done > /jfs/.writer-done
@@ -482,7 +483,8 @@ spec:
               MPID=$!
               for i in $(seq 1 30); do test -f /jfs/.stats && break; sleep 1; done
               test -f /jfs/.stats || { echo "FAIL: reader mount never came up"; exit 1; }
-              for i in $(seq 1 60); do [ -f /jfs/.writer-done ] && break; sleep 2; done
+              for i in $(seq 1 60); do [ ! -f /jfs/.writer-done ] && break; sleep 2; done  # stale marker from prev run
+              for i in $(seq 1 120); do [ -f /jfs/.writer-done ] && break; sleep 2; done
               test -f /jfs/.writer-done || { echo "FAIL: writer never finished"; exit 1; }
               sleep 8   # let --fill-group-cache pushes settle on owners
               B=$(md5sum /jfs/sparktest.bin | cut -d' ' -f1)
