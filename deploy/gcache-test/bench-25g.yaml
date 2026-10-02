@@ -1,27 +1,32 @@
-# 25GiB ring performance bench + failover drill (octant; tensorfold worker
-# untouched — bench requests fit in the ~0.8-core scheduling headroom and
-# burst freely).
+# 25GiB ring performance bench + failover drill.
 #
-# bench-perf phases:
-#   A  ring mount (32GiB local cache, fill ON) writes 25GiB; every 4MiB
+# SAFETY (RISK-0018 / DEC-0024, keel):
+#   The first run (unbounded, on octant) grew host page cache until the
+#   node OOM'd and evicted the TensorFold worker. Rules now:
+#     - bench only on the model-free spark (TP2 pair: head=octant,
+#       worker=sextant => bench=chronometer), priority 0 (preemptible).
+#     - HARD memory limits: cgroup v2 charges page cache to the pod, so a
+#       6Gi cap protects the host AND keeps reads honest (delivery path is
+#       NVMe/fabric, not RAM). drop_caches between every phase.
+#     - O_DIRECT reads when FUSE permits (probe + fallback).
+#
+# bench-perf phases (single pod on chronometer, itself a ring member):
+#   A  ring mount (8GiB local cache, fill ON) writes 25GiB; every 4MiB
 #      block is uploaded to Garage AND pushed to its HRW owner across the
 #      3 spark members. 90s settle, then the bench cache is wiped.
-#   B  drop host page cache -> cold read via a FRESH ring mount: ~75% of
-#      blocks served by peers over the C7 rails (remotecache delta proves it).
-#   B2 drop caches -> read again: peers now hold every block in their NVMe
-#      caches (LoadCached on serve) => full-fabric read. This is the number
-#      that matters for "cache ring instead of Garage".
+#   B  drop caches -> cold read via a FRESH ring mount: ~75% of blocks
+#      served by peers over the C7 rails (remotecache delta proves it).
+#   B2 drop caches -> read again: peers hold every block in their NVMe
+#      caches (LoadCached on serve) => full-fabric read.
 #   C  drop caches -> read via a plain --cache-size 0 mount: pure Garage.
 #   D  repeat C for variance.
 # All reads md5-checked against the write-time digest.
 #
-# bench-failover (apply while bench-perf is finished; it self-coordinates):
-#   waits until ALL of sextant's rail addrs refuse (operator kills the
-#   member pod), then reads the file: checksum must hold, errors>0,
-#   peer bytes only from surviving members. Then waits for sextant to
-#   rejoin and re-reads with a fresh mount: peer fetches resume.
-#
-# The bench pod itself is a ring member (3914 listener) during phases A/B.
+# bench-failover (apply alongside; it self-coordinates):
+#   waits until ALL of sextant's rail addrs refuse (operator deletes the
+#   member pod — deployment recreates it automatically), reads the file
+#   during the outage: checksum must hold (fallback paths), then waits
+#   for sextant to rejoin and re-reads with a fresh mount.
 ---
 apiVersion: batch/v1
 kind: Job
@@ -36,14 +41,20 @@ spec:
       runtimeClassName: nvidia-rdma
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
-      nodeSelector: {kubernetes.io/hostname: octant}
+      # RISK-0018 / DEC-0024: TP2 pair is head=octant + worker=sextant;
+      # the bench runs on the model-free spark, priority 0 (preemptible).
+      nodeSelector: {kubernetes.io/hostname: chronometer}
       restartPolicy: Never
       containers:
         - name: bench
           image: 172.16.1.50:31872/gcache-juicefs:arm64
           securityContext: {privileged: true}
           resources:
-            requests: {cpu: "500m", memory: 1Gi}
+            # HARD limits (RISK-0018): the unbounded run OOM'd a node via
+            # page-cache growth. The 6Gi cap protects the host AND keeps
+            # the benchmark honest (reads must come from NVMe/fabric).
+            requests: {cpu: "1", memory: 2Gi}
+            limits: {cpu: "4", memory: 6Gi}
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -57,7 +68,7 @@ spec:
 
               echo "=== PHASE-A: prime (ring write 25GiB, fill ON)"
               juicefs mount "$META" /jfs \
-                --cache-group=sparks --cache-dir=/tmp/bcache --cache-size 32768 \
+                --cache-group=sparks --cache-dir=/tmp/bcache --cache-size 8192 \
                 --group-listen "${NODE_IP}:3914" --fill-group-cache --no-bgjob \
                 --metrics 127.0.0.1:9904 --log-level info --foreground &
               MPID=$!
@@ -84,9 +95,17 @@ spec:
                 --metrics 127.0.0.1:9904 --log-level info --foreground &
               MPID=$!
               for i in $(seq 1 40); do test -f /jfs/.stats && break; sleep 1; done
+              test -f /jfs/.stats || { echo "FAIL: ring mount"; exit 1; }
+              # Prefer O_DIRECT (NVMe-over-fabric, not page cache); fall back
+              # to buffered reads (bounded by the 6Gi pod cap + drop_cache).
+              if dd if=/jfs/bench25g.bin of=/dev/null bs=4M count=1 iflag=direct status=none 2>/dev/null; then
+                RDIF="iflag=direct"; echo "BENCH: O_DIRECT reads enabled"
+              else
+                RDIF=""; echo "BENCH: O_DIRECT unavailable; buffered reads (6Gi pod cap)"
+              fi
               G0=$(peerbytes)
-              T0=$(date +%s%N); dd if=/jfs/bench25g.bin of=/dev/null bs=4M status=none; T1=$(date +%s%N)
-              echo "PHASE-B: cold ring read $(elapsed $T0 $T1)s  ($((26843545600/1048576))MiB)"
+              T0=$(date +%s%N); dd if=/jfs/bench25g.bin of=/dev/null bs=4M $RDIF status=none; T1=$(date +%s%N)
+              echo "PHASE-B: cold ring read $(elapsed $T0 $T1)s"
               sleep 3
               G1=$(peerbytes)
               echo "PHASE-B: peer bytes served=$((G1-G0)) ($(( (G1-G0)/1048576 ))MiB)"
@@ -96,7 +115,7 @@ spec:
               echo "=== PHASE-B2: warm-peer ring read (peers cached on serve)"
               drop_cache
               G0=$G1
-              T0=$(date +%s%N); dd if=/jfs/bench25g.bin of=/dev/null bs=4M status=none; T1=$(date +%s%N)
+              T0=$(date +%s%N); dd if=/jfs/bench25g.bin of=/dev/null bs=4M $RDIF status=none; T1=$(date +%s%N)
               echo "PHASE-B2: warm-peer read $(elapsed $T0 $T1)s"
               sleep 3
               G1=$(peerbytes)
@@ -114,10 +133,10 @@ spec:
               for i in $(seq 1 40); do test -f /jfs-base/.stats && break; sleep 1; done
               test -f /jfs-base/.stats || { echo "FAIL: base mount"; exit 1; }
               drop_cache
-              T0=$(date +%s%N); dd if=/jfs-base/bench25g.bin of=/dev/null bs=4M status=none; T1=$(date +%s%N)
+              T0=$(date +%s%N); dd if=/jfs-base/bench25g.bin of=/dev/null bs=4M $RDIF status=none; T1=$(date +%s%N)
               echo "PHASE-C: garage baseline $(elapsed $T0 $T1)s"
               drop_cache
-              T0=$(date +%s%N); dd if=/jfs-base/bench25g.bin of=/dev/null bs=4M status=none; T1=$(date +%s%N)
+              T0=$(date +%s%N); dd if=/jfs-base/bench25g.bin of=/dev/null bs=4M $RDIF status=none; T1=$(date +%s%N)
               echo "PHASE-D: garage baseline 2 $(elapsed $T0 $T1)s"
               MD=$(md5sum /jfs-base/bench25g.bin | cut -d' ' -f1)
               [ "$MD" = "$MD5" ] && echo "PHASE-D: md5 OK" || { echo "PHASE-D: MD5 MISMATCH"; exit 1; }
@@ -145,14 +164,16 @@ spec:
       runtimeClassName: nvidia-rdma
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
-      nodeSelector: {kubernetes.io/hostname: octant}
+      # RISK-0018 / DEC-0024: bounded, model-free spark, priority 0.
+      nodeSelector: {kubernetes.io/hostname: chronometer}
       restartPolicy: Never
       containers:
         - name: bench
           image: 172.16.1.50:31872/gcache-juicefs:arm64
           securityContext: {privileged: true}
           resources:
-            requests: {cpu: "500m", memory: 1Gi}
+            requests: {cpu: "1", memory: 2Gi}
+            limits: {cpu: "4", memory: 6Gi}
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -186,8 +207,13 @@ spec:
               MPID=$!
               for i in $(seq 1 40); do test -f /jfs/.stats && break; sleep 1; done
               test -f /jfs/.stats || { echo "FAIL: ring mount during outage"; exit 1; }
+              if dd if=/jfs/bench25g.bin of=/dev/null bs=4M count=1 iflag=direct status=none 2>/dev/null; then
+                RDIF="iflag=direct"
+              else
+                RDIF=""
+              fi
               E0=$(stats errors)
-              T0=$(date +%s%N); dd if=/jfs/bench25g.bin of=/dev/null bs=4M status=none; T1=$(date +%s%N)
+              T0=$(date +%s%N); dd if=/jfs/bench25g.bin of=/dev/null bs=4M $RDIF status=none; T1=$(date +%s%N)
               echo "FO-OUTAGE: read with sextant down $(elapsed $T0 $T1)s"
               MD=$(md5sum /jfs/bench25g.bin | cut -d' ' -f1)
               EXPECTED=$(cat /jfs/bench25g.md5)
@@ -195,7 +221,6 @@ spec:
               sleep 3
               E1=$(stats errors)
               echo "FO-OUTAGE: remotecache errors delta=$((E1-E0)) (fallbacks; expect >0)"
-              echo "FO-OUTAGE: data intact - read succeeded with a member down"
               umount /jfs 2>/dev/null || fusermount3 -u /jfs || true
               kill $MPID 2>/dev/null || true; wait $MPID 2>/dev/null || true
 
@@ -218,7 +243,7 @@ spec:
               MPID=$!
               for i in $(seq 1 40); do test -f /jfs/.stats && break; sleep 1; done
               G0=$(stats bytes); E0=$(stats errors)
-              T0=$(date +%s%N); dd if=/jfs/bench25g.bin of=/dev/null bs=4M status=none; T1=$(date +%s%N)
+              T0=$(date +%s%N); dd if=/jfs/bench25g.bin of=/dev/null bs=4M $RDIF status=none; T1=$(date +%s%N)
               echo "FO-REJOIN: read $(elapsed $T0 $T1)s"
               sleep 3
               G1=$(stats bytes); E1=$(stats errors)
