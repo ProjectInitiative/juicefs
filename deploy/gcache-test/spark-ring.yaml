@@ -201,7 +201,7 @@ spec:
               echo "database reachable"
               juicefs format "$META" gcachesparks \
                 --storage s3 \
-                --bucket "http://ingress.haproxy.svc.cluster.local:80/juicefs-mc/gcache-sparks" \
+                --bucket "http://ingress.haproxy.svc.cluster.local:80/ai-juicefs/gcache-sparks" \
                 --access-key "$(cat /etc/gcache/s3-access-key)" \
                 --secret-key "$(cat /etc/gcache/s3-secret-key)" \
                 --compress none \
