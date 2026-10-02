@@ -54,6 +54,25 @@ metadata:
   name: operator-auth-sa
   namespace: postgres-db
 ---
+# ============ VaultConnection per namespace (VSO CRDs are namespaced) ============
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultConnection
+metadata:
+  name: default
+  namespace: gcache-test
+spec:
+  address: http://openbao.openbao.svc.cluster.local:8200
+  skipTLSVerify: true
+---
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultConnection
+metadata:
+  name: default
+  namespace: postgres-db
+spec:
+  address: http://openbao.openbao.svc.cluster.local:8200
+  skipTLSVerify: true
+---
 # ============ VaultAuth per namespace ============
 apiVersion: secrets.hashicorp.com/v1beta1
 kind: VaultAuth
@@ -99,7 +118,7 @@ spec:
   mount: k8s
   type: kv-v2
   path: gcache-test/sparks
-  refreshInterval: 1h
+  refreshAfter: 1h
   destination:
     name: gcache-creds
     create: true
@@ -116,7 +135,7 @@ spec:
   mount: k8s
   type: kv-v2
   path: gcache-test/sparks
-  refreshInterval: 1h
+  refreshAfter: 1h
   destination:
     name: gcache-pg-role
     type: kubernetes.io/basic-auth
