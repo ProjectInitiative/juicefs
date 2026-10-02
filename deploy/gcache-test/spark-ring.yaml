@@ -350,14 +350,14 @@ spec:
         - name: fuse
           hostPath: {path: /dev/fuse, type: CharDevice}
 ---
-# Third ring member: scale to 1 for the 3-node drill (octant).
+# Third ring member (octant) — full 3-node mesh.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: member-octant
   namespace: gcache-test
 spec:
-  replicas: 0
+  replicas: 1
   strategy: {type: Recreate}
   selector: {matchLabels: {app: member-octant}}
   template:
