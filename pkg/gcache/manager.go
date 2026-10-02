@@ -129,8 +129,17 @@ func (m *Manager) Start(ctx context.Context) error {
 	if !m.cfg.NoSharing && m.src != nil {
 		ln, err := net.Listen("tcp", m.cfg.ListenAddr)
 		if err != nil {
-			m.cancel()
-			return err
+			// Port collision (e.g. two mount pods of the same volume on one
+			// node, or two volumes with the same fixed port): fall back to an
+			// ephemeral port so the pod still joins the ring as a serving
+			// member instead of degrading to fetch-only. The advertised
+			// address is the real listener addr, so peers can dial it.
+			ln, err = net.Listen("tcp", ":0")
+			if err != nil {
+				m.cancel()
+				return err
+			}
+			logger.Warnf("gcache listen %s failed, serving on ephemeral %s", m.cfg.ListenAddr, ln.Addr())
 		}
 		addr := m.cfg.AdvertiseAddr
 		if addr == "" {
@@ -138,11 +147,11 @@ func (m *Manager) Start(ctx context.Context) error {
 		}
 		m.mu.Lock()
 		m.addr = addr
-		// Multi-endpoint advertise: "ip1:p,ip2:p,..." (direct-ring fabrics
-		// expose one subnet per peer pair). The listener should be bound
-		// wildcard (ListenAddr ":p") so every endpoint is reachable.
-		if strings.Contains(addr, ",") {
-			m.addrs = strings.Split(addr, ",")
+		// Multi-endpoint advertise: separators "," or ";" — ";" exists so a
+		// multi-rail list survives the CSI driver's comma-split of the -o
+		// string (mount.juicefs parses -o options comma-separated).
+		if strings.ContainsAny(addr, ",;") {
+			m.addrs = strings.FieldsFunc(addr, func(r rune) bool { return r == ',' || r == ';' })
 			m.addr = m.addrs[0]
 		}
 		m.mu.Unlock()
