@@ -323,8 +323,9 @@ spec:
           env:
             - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
           resources:
-            requests: {cpu: "2", memory: 1Gi, rdma/hca_shared_devices: "1"}
-            limits: {cpu: "8", memory: 8Gi, rdma/hca_shared_devices: "1"}
+            # tensorfold-v12 holds sextant HCA slot; privileged pod gets devices anyway
+            requests: {cpu: "2", memory: 1Gi}
+            limits: {cpu: "8", memory: 8Gi}
           command: ["bash", "/entry/entry.sh"]
           ports:
             - {name: peer, containerPort: 3910, hostPort: 3910}
