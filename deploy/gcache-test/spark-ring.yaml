@@ -184,6 +184,7 @@ spec:
   template:
     spec:
       restartPolicy: OnFailure
+      nodeSelector: {kubernetes.io/hostname: chronometer}
       containers:
         - name: init
           image: 172.16.1.50:31872/gcache-juicefs:arm64
@@ -229,13 +230,10 @@ data:
     PGPASSWORD=$(cat /etc/gcache/password)
     META="postgres://${PGUSER}:${PGPASSWORD}@postgres-cluster-rw.postgres-db.svc:5432/gcache_sparks"
     # Resolve this node's first C7 rail IP from the fabric inventory
-    RAIL_IP=$(python3 - "/var/lib/dgx-spark/rdma-fabric.json" <<'PY'
-    import json, sys, ipaddress
-    f = json.load(open(sys.argv[1]))
-    rail = f["links"][0]["address"]
-    print(ipaddress.ip_interface(rail).ip)
-    PY
-    )
+    # (first "address" field = "x.x.x.x/prefix"; pure shell, no python3 in image)
+    RAIL_IP=$(grep -oE '"address"[[:space:]]*:[[:space:]]*"[0-9.]+' /var/lib/dgx-spark/rdma-fabric.json \
+      | head -1 | grep -oE '[0-9.]+$')
+    [ -n "$RAIL_IP" ] || { echo "[gcache-member] FATAL: no rail IP in fabric json"; exit 1; }
     echo "[gcache-member] node=$NODE_NAME rail-ip=$RAIL_IP"
     CACHE_DIR=/var/lib/gcache/${NODE_NAME}
     mkdir -p "$CACHE_DIR"
