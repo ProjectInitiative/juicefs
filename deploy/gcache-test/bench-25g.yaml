@@ -64,7 +64,7 @@ spec:
               NODE_IP=$(hostname -I | awk '{print $1}')
               drop_cache() { sync; echo 3 > /proc/sys/vm/drop_caches; }
               elapsed() { awk "BEGIN{printf \"%.1f\", ($2-$1)/1e9}"; }
-              peerbytes() { curl -s localhost:9904/metrics | grep '^juicefs_remotecache_bytes' | awk '{s+=$2} END {print s+0}'; }
+              peerbytes() { curl -s localhost:9904/metrics | grep '^juicefs_remotecache_bytes' | awk '{s+=$2} END {printf "%.0f", s+0}'; }
               # API canary via kube-vip: timestamped evidence of control-plane
               # health ON THE SAME LOG TIMELINE as the IO (401 = alive).
               ( while true; do
@@ -215,7 +215,7 @@ spec:
               NODE_IP=$(hostname -I | awk '{print $1}')
               drop_cache() { sync; echo 3 > /proc/sys/vm/drop_caches; }
               elapsed() { awk "BEGIN{printf \"%.1f\", ($2-$1)/1e9}"; }
-              stats() { curl -s localhost:9904/metrics | grep "^juicefs_remotecache_$1" | awk '{s+=$2} END {print s+0}'; }
+              stats() { curl -s localhost:9904/metrics | grep "^juicefs_remotecache_$1" | awk '{s+=$2} END {printf "%.0f", s+0}'; }
               SEX_ADDRS="172.16.5.56 172.16.6.56 172.16.9.56 172.16.10.56"
 
               echo "=== FO-WAIT: waiting for sextant member to go down"
