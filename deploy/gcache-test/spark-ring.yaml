@@ -230,8 +230,10 @@ data:
     PGPASSWORD=$(cat /etc/gcache/password)
     META="postgres://${PGUSER}:${PGPASSWORD}@postgres-cluster-rw.postgres-db.svc:5432/gcache_sparks"
     # Resolve this node's first C7 rail IP from the fabric inventory
-    # (first "address" field = "x.x.x.x/prefix"; pure shell, no python3 in image)
-    RAIL_IP=$(grep -oE '"address"[[:space:]]*:[[:space:]]*"[0-9.]+' /var/lib/dgx-spark/rdma-fabric.json \
+    # (strip controlPlane block first — its "address" is the mgmt IP;
+    # pure shell, no python3 in image)
+    RAIL_IP=$(sed 's/.*"links"//' /var/lib/dgx-spark/rdma-fabric.json \
+      | grep -oE '"address"[[:space:]]*:[[:space:]]*"[0-9.]+' \
       | head -1 | grep -oE '[0-9.]+$')
     [ -n "$RAIL_IP" ] || { echo "[gcache-member] FATAL: no rail IP in fabric json"; exit 1; }
     echo "[gcache-member] node=$NODE_NAME rail-ip=$RAIL_IP"
@@ -272,7 +274,7 @@ spec:
           env:
             - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
           resources:
-            requests: {cpu: "4", memory: 2Gi, rdma/hca_shared_devices: "1"}
+            requests: {cpu: "2", memory: 1Gi, rdma/hca_shared_devices: "1"}
             limits: {cpu: "8", memory: 8Gi, rdma/hca_shared_devices: "1"}
           command: ["bash", "/entry/entry.sh"]
           ports:
@@ -321,7 +323,7 @@ spec:
           env:
             - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
           resources:
-            requests: {cpu: "4", memory: 2Gi, rdma/hca_shared_devices: "1"}
+            requests: {cpu: "2", memory: 1Gi, rdma/hca_shared_devices: "1"}
             limits: {cpu: "8", memory: 8Gi, rdma/hca_shared_devices: "1"}
           command: ["bash", "/entry/entry.sh"]
           ports:
@@ -371,7 +373,7 @@ spec:
           env:
             - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
           resources:
-            requests: {cpu: "4", memory: 2Gi, rdma/hca_shared_devices: "1"}
+            requests: {cpu: "2", memory: 1Gi, rdma/hca_shared_devices: "1"}
             limits: {cpu: "8", memory: 8Gi, rdma/hca_shared_devices: "1"}
           command: ["bash", "/entry/entry.sh"]
           ports:
