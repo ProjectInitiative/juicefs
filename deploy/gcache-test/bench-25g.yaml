@@ -137,7 +137,7 @@ spec:
               }
               G0=$(peerbytes)
               timed_read /jfs/bench25g.bin || { echo "PHASE-B: read failed twice"; exit 1; }
-              echo "PHASE-B: cold ring read $ELAPSED$s"
+              echo "PHASE-B: cold ring read ${ELAPSED}s"
               sleep 3
               G1=$(peerbytes)
               echo "PHASE-B: peer bytes served=$((G1-G0)) ($(( (G1-G0)/1048576 ))MiB)"
@@ -148,7 +148,7 @@ spec:
               drop_cache
               G0=$G1
               timed_read /jfs/bench25g.bin || { echo "PHASE-B2: read failed twice"; exit 1; }
-              echo "PHASE-B2: warm-peer read $ELAPSED$s"
+              echo "PHASE-B2: warm-peer read ${ELAPSED}s"
               sleep 3
               G1=$(peerbytes)
               echo "PHASE-B2: peer bytes served=$((G1-G0)) ($(( (G1-G0)/1048576 ))MiB)"
@@ -166,10 +166,10 @@ spec:
               test -f /jfs-base/.stats || { echo "FAIL: base mount"; exit 1; }
               drop_cache
               timed_read /jfs-base/bench25g.bin || { echo "PHASE-C: read failed twice"; exit 1; }
-              echo "PHASE-C: garage baseline $ELAPSED$s"
+              echo "PHASE-C: garage baseline ${ELAPSED}s"
               drop_cache
               timed_read /jfs-base/bench25g.bin || { echo "PHASE-D: read failed twice"; exit 1; }
-              echo "PHASE-D: garage baseline 2 $ELAPSED$s"
+              echo "PHASE-D: garage baseline 2 ${ELAPSED}s"
               MD=$(md5sum /jfs-base/bench25g.bin | cut -d' ' -f1)
               [ "$MD" = "$MD5" ] && echo "PHASE-D: md5 OK" || { echo "PHASE-D: MD5 MISMATCH"; exit 1; }
               echo "BENCH-PERF-DONE"
