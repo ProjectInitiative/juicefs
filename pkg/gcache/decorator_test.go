@@ -33,7 +33,8 @@ import (
 // trackingInner wraps a static ObjectStorage and counts full-object Gets.
 type trackingInner struct {
 	object.ObjectStorage
-	fullGets atomic.Int32
+	fullGets    atomic.Int32
+	partialGets atomic.Int32
 }
 
 // newFakeInner returns a non-nil embedded ObjectStorage so trackingInner
@@ -84,6 +85,8 @@ var errNilStorage = errors.New("nilStorage method reached")
 func (ti *trackingInner) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
 	if off == 0 && limit == -1 {
 		ti.fullGets.Add(1)
+	} else {
+		ti.partialGets.Add(1)
 	}
 	attrs := object.ApplyGetters(getters...)
 	attrs.SetRequestID("inner-echo") // writes through the caller's pointer
@@ -277,5 +280,56 @@ func TestManagerEndToEnd(t *testing.T) {
 	}
 	if !strings.HasPrefix(selfMgr.UUID(), "") {
 		t.Fatal("unreachable") // keeps strings import used if asserts change
+	}
+}
+
+// Full-block Get issued with an explicit length (off==0, limit==blockSize)
+// must engage peer placement exactly like limit==-1. Regression: the reader
+// path in cached_store issues explicit-length whole-block Gets; the old
+// limit==-1-only check silently passed them through to object storage.
+func TestDecoratorExplicitLengthFullBlock(t *testing.T) {
+	peer := newFakeSource("none")
+	peerAddr, stop := listenerWithSrc(t, peer, 5*time.Second)
+	defer stop()
+	members := []Member{
+		{UUID: "self-uuid", Addr: "127.0.0.1:1"},
+		{UUID: "peer-uuid", Addr: peerAddr},
+	}
+	key := findKeyFor("peer-uuid", members)
+	if key == "" {
+		t.Fatal("no key maps to peer")
+	}
+	const blockSize = 4 << 20
+	block := bytes.Repeat([]byte{0xA7}, blockSize)
+	peer.blocks[key] = block
+	inner := &trackingInner{ObjectStorage: newFakeInner()}
+	rc := NewRingClient(time.Second, 31, "self-test")
+	decorated := NewRingStorage(inner, rc, func(string) []Member { return members }, "self-uuid")
+	SetBlockSizeOnStorage(decorated, blockSize)
+
+	r, err := decorated.Get(context.Background(), key, 0, blockSize)
+	if err != nil {
+		t.Fatalf("explicit-length Get: %v", err)
+	}
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Close()
+	if !bytes.Equal(got, block) {
+		t.Fatal("explicit-length full-block Get payload mismatch")
+	}
+	if inner.fullGets.Load() != 0 {
+		t.Fatal("inner.Get must not be called when peer serves an explicit-length full block")
+	}
+
+	// A sub-block read (limit != blockSize) must still pass through.
+	r, err = decorated.Get(context.Background(), key, 0, 64<<10)
+	if err != nil {
+		t.Fatalf("partial Get: %v", err)
+	}
+	r.Close()
+	if inner.partialGets.Load() != 1 {
+		t.Fatalf("partial Get must hit inner exactly once, got %d", inner.partialGets.Load())
 	}
 }

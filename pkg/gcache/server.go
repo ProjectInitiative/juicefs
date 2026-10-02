@@ -270,8 +270,9 @@ func (p *passthroughStorage) Restore(ctx context.Context, key string, days int32
 }
 
 // ringStorage is the client-side decorator: it intercepts full-object Gets
-// (off==0 && limit==-1, the only shape cachedStore.load() uses — CONTRACT
-// §2) and serves ring-owned blocks from the owning peer; everything else
+// (off==0 && (limit==-1 || limit==blockSize), the shapes cachedStore issues
+// for whole-block fetches — CONTRACT §2) and serves ring-owned blocks from
+// the owning peer; everything else
 // falls through to the wrapped ObjectStorage untouched.
 type ringStorage struct {
 	passthroughStorage
@@ -279,7 +280,8 @@ type ringStorage struct {
 	group        string // registry group whose members() closure is wired
 	members      func(group string) []Member
 	selfUUID     string
-	fillOnUpload bool // --fill-group-cache: push uploaded blocks to owners
+	fillOnUpload bool  // --fill-group-cache: push uploaded blocks to owners
+	blockSize    int64 // chunk block size; 0 = only limit==-1 counts as full-block
 }
 
 // SetFillOnUpload enables --fill-group-cache push-on-upload semantics on a
@@ -287,6 +289,15 @@ type ringStorage struct {
 func SetFillOnStorage(os object.ObjectStorage, v bool) {
 	if rs, ok := os.(*ringStorage); ok {
 		rs.fillOnUpload = v
+	}
+}
+
+// SetBlockSizeOnStorage teaches the decorator the chunk block size so that
+// full-block Gets issued with an explicit length (off==0, limit==blockSize)
+// engage peer placement, not just limit==-1. No-op for other storages.
+func SetBlockSizeOnStorage(os object.ObjectStorage, n int64) {
+	if rs, ok := os.(*ringStorage); ok && n > 0 {
+		rs.blockSize = n
 	}
 }
 
@@ -348,7 +359,8 @@ func NewRingStorage(inner object.ObjectStorage, rc *RingClient, members func(gro
 }
 
 func (s *ringStorage) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
-	if off != 0 || limit != -1 || isServerFill(ctx) {
+	fullBlock := off == 0 && (limit == -1 || (s.blockSize > 0 && limit == s.blockSize))
+	if !fullBlock || isServerFill(ctx) {
 		return s.inner.Get(ctx, key, off, limit, getters...)
 	}
 	members := s.members(s.group)

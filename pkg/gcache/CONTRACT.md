@@ -135,6 +135,7 @@ func (m *Manager) Members(group string) []Member                       // exclud
 // pkg/gcache/server.go (stubs to REPLACE, signatures are locked):
 func ServeConn(ctx context.Context, conn net.Conn, src ServerSource, timeout time.Duration)
 func NewRingStorage(inner object.ObjectStorage, rc *RingClient, members func(group string) []Member, selfUUID string) object.ObjectStorage
+func SetBlockSizeOnStorage(os object.ObjectStorage, n int64) // Get also engages on off==0 && limit==blockSize
 ```
 
 ```go
