@@ -21,7 +21,10 @@ COPY . .
 RUN CGO_ENABLED=1 go build -o /out/juicefs .
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends fuse3 ca-certificates curl bash postgresql-client && apt-get clean && echo user_allow_other >> /etc/fuse.conf
+RUN apt-get update && apt-get install -y --no-install-recommends fuse3 ca-certificates curl bash postgresql-client && apt-get clean \
+  && echo user_allow_other >> /etc/fuse.conf \
+  # The CSI mount command uses Bash ANSI-C quoting ($'...') in sh -c.
+  && ln -sf /bin/bash /bin/sh
 COPY --from=build /out/juicefs /usr/local/bin/juicefs
 RUN chmod +x /usr/local/bin/juicefs \
   && ln -sf /usr/local/bin/juicefs /bin/mount.juicefs \
