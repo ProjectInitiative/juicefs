@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -64,6 +65,54 @@ type Config struct {
 	FillOnUpload  bool          // push uploaded blocks to owners (best-effort)
 	RdmaNics      []string      // --rdma-network: NICs to advertise for RDMA ("" or empty => TCP-only)
 	RdmaAdvertise string        // advertised RDMA host:port ("" : rdmaTransport picks)
+}
+
+func autoC7Advertise(listenAddr string) (string, error) {
+	_, port, err := net.SplitHostPort(listenAddr)
+	if err != nil || port == "" {
+		port = "13910"
+	}
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+	var names []string
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if strings.HasPrefix(iface.Name, "enp") || strings.HasPrefix(iface.Name, "enP") || strings.HasPrefix(iface.Name, "ib") {
+			names = append(names, iface.Name)
+		}
+	}
+	sort.Strings(names)
+	var addrs []string
+	for _, name := range names {
+		iface, err := net.InterfaceByName(name)
+		if err != nil {
+			continue
+		}
+		entries, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			var ip net.IP
+			switch value := entry.(type) {
+			case *net.IPNet:
+				ip = value.IP
+			case *net.IPAddr:
+				ip = value.IP
+			}
+			if ip4 := ip.To4(); ip4 != nil {
+				addrs = append(addrs, net.JoinHostPort(ip4.String(), port))
+			}
+		}
+	}
+	if len(addrs) == 0 {
+		return "", fmt.Errorf("no C7 interface addresses found")
+	}
+	return strings.Join(addrs, ";"), nil
 }
 
 func (m *Manager) self(addr string) Member {
@@ -142,7 +191,14 @@ func (m *Manager) Start(ctx context.Context) error {
 			logger.Warnf("gcache listen %s failed, serving on ephemeral %s", m.cfg.ListenAddr, ln.Addr())
 		}
 		addr := m.cfg.AdvertiseAddr
-		if addr == "" {
+		if addr == "auto-c7" {
+			addr, err = autoC7Advertise(m.cfg.ListenAddr)
+			if err != nil {
+				m.cancel()
+				return fmt.Errorf("derive C7 advertise addresses: %w", err)
+			}
+			logger.Infof("gcache advertising C7 endpoints %s", addr)
+		} else if addr == "" {
 			addr = ln.Addr().String()
 		}
 		m.mu.Lock()
