@@ -35,6 +35,8 @@ type endpointState struct {
 	downAt   time.Time
 }
 
+const tcpEndpointDialTimeout = 2 * time.Second
+
 // dialFailover dials member with transport failover: prefer RDMA when the
 // member advertises an RdmaAddr and RDMA isn't in backoff; on RDMA failure
 // fall through to TCP and start a retry backoff; on success over TCP during
@@ -63,9 +65,14 @@ func (c *RingClient) dialFailover(ctx context.Context, m Member) (net.Conn, Tran
 	var err error
 	for _, a := range addrs {
 		var conn net.Conn
-		conn, err = c.tcp.Dial(ctx, a)
+		endpointCtx, cancel := context.WithTimeout(ctx, tcpEndpointDialTimeout)
+		conn, err = c.tcp.Dial(endpointCtx, a)
+		cancel()
 		if err == nil {
 			return conn, c.tcp, nil
+		}
+		if ctx.Err() != nil {
+			break
 		}
 	}
 	return nil, nil, err
