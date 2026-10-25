@@ -185,7 +185,7 @@ func (c *RingClient) Fetch(ctx context.Context, group, key string, members []Mem
 }
 
 // fetchOnce performs one request against the best candidate peer.
-func (c *RingClient) fetchOnce(ctx context.Context, key string, members []Member) (io.ReadCloser, error) {
+func (c *RingClient) fetchOnce(ctx context.Context, key string, members []Member) (*payloadReader, error) {
 	m := c.candidate(key, members, c.selfUUID)
 	if m == nil {
 		return nil, errNoOwners
@@ -193,7 +193,7 @@ func (c *RingClient) fetchOnce(ctx context.Context, key string, members []Member
 	peer := m.Addr
 	start := time.Now()
 	var fetched int64
-	var reader io.ReadCloser
+	var reader *payloadReader
 	var err error
 	func() {
 		var conn net.Conn
@@ -232,6 +232,7 @@ func (c *RingClient) fetchOnce(ctx context.Context, key string, members []Member
 		reader = &payloadReader{
 			conn:      conn,
 			remaining: int64(plen),
+			plen:      int64(plen),
 			algo:      algo,
 			xid:       xid,
 			timeout:   c.timeout,
@@ -368,6 +369,7 @@ func readFull(conn net.Conn, b []byte) error {
 type payloadReader struct {
 	conn      net.Conn
 	remaining int64
+	plen      int64 // expected total payload length (premature-EOF detection)
 	algo      uint8
 	xid       uint32
 	timeout   time.Duration
@@ -396,3 +398,64 @@ func (p *payloadReader) Close() error {
 	}
 	return p.conn.Close()
 }
+
+// NoLocalCache marks peer-fetched payloads: strict one-copy sharded
+// ownership keeps them out of the local persistent block cache (the ring
+// owner holds the copy). detected via a structural interface in pkg/chunk.
+func (p *payloadReader) NoLocalCache() {}
+
+// peerReader serves one peer-fetched block payload with mid-stream recovery:
+// if the peer stream breaks before plen bytes arrive (peer timeout,
+// eviction, socket reset), the block is re-read once from object storage and
+// the already-consumed prefix is skipped, so a transient peer failure never
+// surfaces as EIO to the read path.
+type peerReader struct {
+	cur      io.ReadCloser
+	total    int64
+	consumed int64
+	refill   func(consumed int64) (io.ReadCloser, error)
+	refilled bool
+}
+
+func (r *peerReader) NoLocalCache() {}
+
+func (r *peerReader) Read(b []byte) (int, error) {
+	for {
+		if r.consumed >= r.total {
+			return 0, io.EOF
+		}
+		n, err := r.cur.Read(b)
+		r.consumed += int64(n)
+		if n > 0 {
+			return n, err
+		}
+		if err == nil {
+			return 0, nil
+		}
+		if !errors.Is(err, io.EOF) {
+			return n, err
+		}
+		// Stream ended before plen bytes: heal once via refill, otherwise
+		// surface the truncation explicitly instead of a silent short read.
+		if !r.refilled && r.refill != nil {
+			r.refilled = true
+			nr, rerr := r.refill(r.consumed)
+			if rerr == nil {
+				_ = r.cur.Close()
+				r.cur = nr
+				continue
+			}
+			return 0, rerr
+		}
+		return 0, io.ErrUnexpectedEOF
+	}
+}
+
+func (r *peerReader) Close() error { return r.cur.Close() }
+
+// noCacheReader marks a non-owner fallback read (straight from object
+// storage): the block belongs to another ring member, so it must not enter
+// the local persistent cache.
+type noCacheReader struct{ io.ReadCloser }
+
+func (noCacheReader) NoLocalCache() {}

@@ -73,18 +73,18 @@ func ServeConn(ctx context.Context, conn net.Conn, src ServerSource, timeout tim
 			return // EOF / timeout: normal connection end
 		}
 		if hdr[0] != magic0 || hdr[1] != magic1 || hdr[2] != protoVer {
-			_ = sendError(ctx, conn, errors.New("bad request header"))
+			_ = sendError(ctx, conn, errors.New("bad request header"), timeout)
 			return
 		}
 		switch hdr[3] {
 		case MsgBlockReq, MsgBlockPush, MsgBlockDrop:
 		default:
-			_ = sendError(ctx, conn, fmt.Errorf("bad request type 0x%x", hdr[3]))
+			_ = sendError(ctx, conn, fmt.Errorf("bad request type 0x%x", hdr[3]), timeout)
 			return
 		}
 		klen := int(binary.LittleEndian.Uint16(hdr[9:11]))
 		if klen == 0 || klen > 4096 {
-			_ = sendError(ctx, conn, errors.New("invalid key length"))
+			_ = sendError(ctx, conn, errors.New("invalid key length"), timeout)
 			return
 		}
 		key := make([]byte, klen)
@@ -98,12 +98,12 @@ func ServeConn(ctx context.Context, conn net.Conn, src ServerSource, timeout tim
 			servPush(ctx, conn, src, string(key), hdr, timeout)
 		case MsgBlockDrop:
 			if err := src.DropCached(string(key)); err != nil {
-				_ = sendError(ctx, conn, err)
+				_ = sendError(ctx, conn, err, timeout)
 				continue
 			}
-			_ = writeResp(ctx, conn, WireRaw, bytes.NewReader(nil))
+			_ = writeResp(ctx, conn, WireRaw, bytes.NewReader(nil), timeout)
 		default:
-			_ = sendError(ctx, conn, fmt.Errorf("bad request type 0x%x", hdr[3]))
+			_ = sendError(ctx, conn, fmt.Errorf("bad request type 0x%x", hdr[3]), timeout)
 		}
 	}
 }
@@ -116,46 +116,59 @@ const maxBlockPayload = 64 << 20
 func servPush(ctx context.Context, conn net.Conn, src ServerSource, key string, hdr []byte, timeout time.Duration) {
 	plen := binary.LittleEndian.Uint64(hdr[12:20])
 	if plen > maxBlockPayload {
-		_ = sendError(ctx, conn, fmt.Errorf("payload too large: %d", plen))
+		_ = sendError(ctx, conn, fmt.Errorf("payload too large: %d", plen), timeout)
 		return
 	}
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	// Chunked read with a refreshed read deadline per chunk: a slow client
+	// must not blow a single absolute deadline mid-payload.
 	data := make([]byte, plen)
-	if _, err := io.ReadFull(conn, data); err != nil {
-		_ = sendError(ctx, conn, fmt.Errorf("read payload: %w", err))
-		return
+	for off := 0; off < len(data); {
+		end := off + writeChunk
+		if end > len(data) {
+			end = len(data)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(timeout))
+		if _, err := io.ReadFull(conn, data[off:end]); err != nil {
+			_ = sendError(ctx, conn, fmt.Errorf("read payload: %w", err), timeout)
+			return
+		}
+		off = end
 	}
 	if err := src.StorePushed(ctx, key, data); err != nil {
-		_ = sendError(ctx, conn, err)
+		_ = sendError(ctx, conn, err, timeout)
 		return
 	}
-	_ = writeResp(ctx, conn, WireRaw, bytes.NewReader(nil))
+	_ = writeResp(ctx, conn, WireRaw, bytes.NewReader(nil), timeout)
 }
 
-// serveBlock resolves one key and writes the response frame.
+// serveBlock resolves one key and writes the response frame. No absolute
+// deadline is set here: cache fill, compression and payload writes each get
+// fresh per-chunk deadlines inside writeResp. A single deadline spanning the
+// whole serve would abort mid-payload whenever the fill (object-storage
+// download on the owner) or a slow consumer exceeds the timeout — surfacing
+// on the client as a truncated stream ("unexpected EOF").
 func servData(ctx context.Context, conn net.Conn, src ServerSource, key string, timeout time.Duration) {
-	_ = conn.SetDeadline(time.Now().Add(timeout))
-	if err := serveBlock(ctx, conn, src, key); err != nil {
+	if err := serveBlock(ctx, conn, src, key, timeout); err != nil {
 		logger.Debugf("gcache serve %s: %v", key, err)
 	}
 }
 
-func serveBlock(ctx context.Context, conn net.Conn, src ServerSource, key string) error {
+func serveBlock(ctx context.Context, conn net.Conn, src ServerSource, key string, timeout time.Duration) error {
 	r, err := src.LoadCached(key)
 	if errors.Is(err, os.ErrNotExist) {
 		r, err = src.FillFromStorage(withServerFill(ctx), key)
 	}
 	if err != nil {
-		return sendError(ctx, conn, err)
+		return sendError(ctx, conn, err, timeout)
 	}
 	defer r.Close()
 
 	data, err := io.ReadAll(io.LimitReader(r, maxBlockPayload+1))
 	if err != nil {
-		return sendError(ctx, conn, fmt.Errorf("read cached block: %w", err))
+		return sendError(ctx, conn, fmt.Errorf("read cached block: %w", err), timeout)
 	}
 	if len(data) > maxBlockPayload {
-		return sendError(ctx, conn, errors.New("block exceeds payload limit"))
+		return sendError(ctx, conn, errors.New("block exceeds payload limit"), timeout)
 	}
 
 	algo := WireRaw
@@ -167,20 +180,27 @@ func serveBlock(ctx context.Context, conn net.Conn, src ServerSource, key string
 			// Serving raw bytes would corrupt the volume format (the
 			// client's load() would try to decompress them) — fail the
 			// request instead so the caller falls back to object storage.
-			return sendError(ctx, conn, fmt.Errorf("compress block: %w", cerr))
+			return sendError(ctx, conn, fmt.Errorf("compress block: %w", cerr), timeout)
 		}
 		algo = WireCompressed
 		payload = bytes.NewReader(dst[:n])
 	}
 
-	if err := writeResp(ctx, conn, algo, payload); err != nil {
+	if err := writeResp(ctx, conn, algo, payload, timeout); err != nil {
 		return fmt.Errorf("write response: %w", err)
 	}
 	return nil
 }
 
-// writeResp writes a MsgBlockResp header followed by the payload stream.
-func writeResp(ctx context.Context, conn net.Conn, algo uint8, payload *bytes.Reader) error {
+// writeChunk bounds each payload read/write so deadlines are refreshed per
+// chunk (idle-based liveness) instead of one absolute deadline for the whole
+// transfer. Writing via conn.Write per chunk also keeps the zero-copy
+// ReadFrom path out of reach (the old writerOnly dance).
+const writeChunk = 512 << 10
+
+// writeResp writes a MsgBlockResp header followed by the payload stream,
+// with a fresh write deadline per chunk.
+func writeResp(ctx context.Context, conn net.Conn, algo uint8, payload *bytes.Reader, timeout time.Duration) error {
 	hdr := make([]byte, headerLen)
 	hdr[0], hdr[1], hdr[2] = magic0, magic1, protoVer
 	hdr[3] = MsgBlockResp
@@ -191,12 +211,25 @@ func writeResp(ctx context.Context, conn net.Conn, algo uint8, payload *bytes.Re
 	if err := ctxSend(ctx, conn, hdr); err != nil {
 		return err
 	}
-	_, err := io.CopyN(writerOnly{conn}, payload, int64(payload.Len()))
-	return err
+	buf := make([]byte, writeChunk)
+	for payload.Len() > 0 {
+		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+		n, rerr := payload.Read(buf)
+		if n > 0 {
+			if _, werr := conn.Write(buf[:n]); werr != nil {
+				return werr
+			}
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
+	return nil
 }
 
 // sendError writes a MsgError frame: plen=^uint64(0), then klen+msg.
-func sendError(ctx context.Context, conn net.Conn, cause error) error {
+func sendError(ctx context.Context, conn net.Conn, cause error, timeout time.Duration) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
 	msg := cause.Error()
 	if len(msg) > 4096 {
 		msg = msg[:4096]
@@ -212,12 +245,6 @@ func sendError(ctx context.Context, conn net.Conn, cause error) error {
 	}
 	return ctxSend(ctx, conn, []byte(msg))
 }
-
-// writerOnly hides io.ReaderFrom on net.Conn so io.CopyN cannot claim a
-// zero-copy path that ignores the context wrapper.
-type writerOnly struct{ w io.Writer }
-
-func (wo writerOnly) Write(p []byte) (int, error) { return wo.w.Write(p) }
 
 // passthroughStorage delegates every ObjectStorage method to inner.
 // ringStorage embeds it and overrides Get only.
@@ -377,9 +404,35 @@ func (s *ringStorage) Get(ctx context.Context, key string, off, limit int64, get
 	r, err := s.rc.Fetch(ctx, s.group, key, members)
 	if err != nil {
 		// Peer fetch failed (error frame, timeout, or eviction): the client
-		// always stays serviceable — fall through to object storage.
+		// always stays serviceable — fall through to object storage. The
+		// block belongs to another member, so strict one-copy sharding
+		// keeps the fallback bytes out of the local persistent cache.
 		logger.Debugf("gcache peer fetch %s failed, falling back: %v", key, err)
-		return s.inner.Get(ctx, key, off, limit, getters...)
+		in, gerr := s.inner.Get(ctx, key, off, limit, getters...)
+		if gerr != nil {
+			return nil, gerr
+		}
+		return noCacheReader{ReadCloser: in}, nil
 	}
-	return r, nil
+	pr, ok := r.(*payloadReader)
+	if !ok {
+		return r, nil // defensive: unexpected reader type, serve as-is
+	}
+	return &peerReader{
+		cur:   pr,
+		total: pr.plen,
+		refill: func(consumed int64) (io.ReadCloser, error) {
+			in, gerr := s.inner.Get(ctx, key, 0, -1, getters...)
+			if gerr != nil {
+				return nil, gerr
+			}
+			if consumed > 0 {
+				if _, err := io.CopyN(io.Discard, in, consumed); err != nil {
+					_ = in.Close()
+					return nil, fmt.Errorf("skip %d consumed bytes of %s: %w", consumed, key, err)
+				}
+			}
+			return in, nil
+		},
+	}, nil
 }

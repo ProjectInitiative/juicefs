@@ -785,13 +785,20 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 	} else {
 		p = page
 	}
-	tmp := getResult{sc: object.DefaultStorageClass}
+	var (
+		tmp          = getResult{sc: object.DefaultStorageClass}
+		nonCacheable bool // gcache peer payload / non-owner fallback: no local persist
+	)
 	p.Acquire()
 	err = utils.WithTimeout(ctx, func(cCtx context.Context) error {
 		defer p.Release()
 		// it will be retried in the upper layer.
 		in, getErr := store.storage.Get(cCtx, key, 0, -1, object.WithRequestID(&tmp.reqID), object.WithStorageClass(&tmp.sc))
 		if getErr == nil {
+			// Strict one-copy sharded cache-group ownership: blocks served
+			// by a peer (or read from object storage by a non-owner) carry
+			// the NoLocalCache marker and must not be persisted locally.
+			_, nonCacheable = in.(interface{ NoLocalCache() })
 			tmp.n, getErr = io.ReadFull(in, p.Data)
 			_ = in.Close()
 		}
@@ -824,7 +831,7 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 	if err != nil || res.n < len(page.Data) {
 		return fmt.Errorf("read %s fully: %v (%d < %d) after %s", key, err, res.n, len(page.Data), used)
 	}
-	if cache {
+	if cache && !nonCacheable {
 		store.bcache.cache(key, page, forceCache, !store.conf.OSCache)
 	}
 	return nil
