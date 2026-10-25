@@ -205,7 +205,7 @@ spec:
               set -e
               META=$(cat /etc/gcache/meta-uri)
               until pg_isready -h postgres.gcache-test.svc -U postgres -t 2; do sleep 1; done
-              until curl -sf -o /dev/null http://s3.gcache-test.svc:3900; do sleep 1; done
+              until curl -s -o /dev/null http://s3.gcache-test.svc:3900; do sleep 1; done
               juicefs format "$META" gcachetest \
                 --storage s3 \
                 --bucket http://s3.gcache-test.svc:3900/gcachetest \
@@ -255,6 +255,8 @@ spec:
                 --cache-dir=/cache \
                 --cache-size 1024 \
                 --group-listen 0.0.0.0:3910 \
+  --group-advertise $IP:3910 \
+  --group-advertise $IP:3910 \
                 --no-bgjob \
                 --metrics 0.0.0.0:9900 \
                 --log-level debug \
@@ -313,6 +315,8 @@ spec:
                 --cache-dir=/cache \
                 --cache-size 1024 \
                 --group-listen 0.0.0.0:3910 \
+  --group-advertise $IP:3910 \
+  --group-advertise $IP:3910 \
                 --no-bgjob \
                 --metrics 0.0.0.0:9900 \
                 --log-level debug \
