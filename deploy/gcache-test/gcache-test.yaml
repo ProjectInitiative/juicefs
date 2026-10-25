@@ -203,7 +203,9 @@ spec:
           args:
             - |
               set -e
-              META=$(cat /etc/gcache/meta-uri)
+                IP=$(hostname -i)
+                IP=${IP%% *}
+                META=$(cat /etc/gcache/meta-uri)
               until pg_isready -h postgres.gcache-test.svc -U postgres -t 2; do sleep 1; done
               until curl -sf -o /dev/null http://s3.gcache-test.svc:3900; do sleep 1; done
               juicefs format "$META" gcachetest \
@@ -249,6 +251,8 @@ spec:
           args:
             - |
               set -e
+                IP=$(hostname -i)
+                IP=${IP%% *}
               META=$(cat /etc/gcache/meta-uri)
               exec juicefs mount "$META" /jfs \
                 --cache-group=test \
@@ -307,6 +311,8 @@ spec:
           args:
             - |
               set -e
+                IP=$(hostname -i)
+                IP=${IP%% *}
               META=$(cat /etc/gcache/meta-uri)
               exec juicefs mount "$META" /jfs \
                 --cache-group=test \
@@ -360,12 +366,16 @@ spec:
           args:
             - |
               set -e
-              META=$(cat /etc/gcache/meta-uri)
+                IP=$(hostname -i)
+                IP=${IP%% *}
+                META=$(cat /etc/gcache/meta-uri)
               # wait for both members to be ready (3 heartbeats)
               sleep 20
               juicefs mount "$META" /jfs \
                 --cache-group=test \
                 --cache-size 0 \
+                                --group-listen 0.0.0.0:3910 \
+                --group-advertise $IP:3910 \
                 --no-bgjob \
                 --metrics 127.0.0.1:9902 \
                 --log-level debug \

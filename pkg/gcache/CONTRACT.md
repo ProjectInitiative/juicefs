@@ -194,3 +194,23 @@ sync: `go test ./pkg/gcache/ -run TestContract`.
 * Flag: `--rdma-network eth1:eth2` (NIC list; parseRdmaNics in cmd/).
 * Wire protocol, frame loop, and ServeConn are transport-agnostic — a verbs
   (RC QP) transport later only implements Transport + a listener.
+
+## 12. Strict one-copy sharded persistence + mid-stream recovery
+
+* **Strict one-copy ownership**: only the block's rendezvous owner persists a
+  copy in its local cache. Peer-fetched payloads (`payloadReader`,
+  `peerReader`) and non-owner object-storage fallbacks (`noCacheReader`)
+  carry a `NoLocalCache()` marker; `cachedStore.load` (pkg/chunk) skips
+  `bcache.cache` for marked readers. The owner's own fill path
+  (`fillFromStorage`, forceCache) is unaffected — it IS the persistent copy.
+* **Mid-stream recovery**: `peerReader` tracks the expected payload length;
+  if the peer stream breaks before plen bytes (peer timeout, eviction, TCP
+  reset), the block is re-read once from object storage with the consumed
+  prefix skipped. A second breakage surfaces `io.ErrUnexpectedEOF` (never a
+  silent short read); `io.ReadFull` in `load` already rejects short reads.
+* **Per-chunk deadlines (server)**: `writeResp`/push-reads refresh the socket
+  deadline every `writeChunk` (512 KiB) instead of one absolute deadline
+  spanning fill+compress+payload. The old absolute deadline aborted
+  mid-payload whenever the owner's fill or a slow consumer exceeded
+  `--remote-timeout` — the client saw a truncated stream ("unexpected EOF")
+  and the read surfaced as EIO to the application.
