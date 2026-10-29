@@ -58,12 +58,28 @@ func rdmaAvailable() error {
 	return nil
 }
 
+// RdmaTransport implements Transport over rsockets and Listener over the
+// rsocket listener. Satisfies both via the same struct. The actual datapath
+// lives behind build-tag hooks: builds with `-tags rdma` link librdmacm's
+// rsockets API (rdma_rsocket.go); without the tag both entry points return
+// ErrRdmaUnsupported (normal builds need no RDMA headers or libraries).
+var (
+	// rdmaDialFn is set by the rdma-tagged build; nil ⇒ unsupported.
+	rdmaDialFn func(ctx context.Context, addr string) (net.Conn, error)
+	// rdmaListenFn is set by the rdma-tagged build; nil ⇒ unsupported. It
+	// returns the listener and the advertised host:port.
+	rdmaListenFn func(nics []string, advertise string) (net.Listener, string, error)
+)
+
 // DialRDMA returns an RDMA Transport for the client side. Returns an error
 // when RDMA userland is absent (caller decides: fatal at startup per
-// enterprise semantics).
+// enterprise semantics) or the build lacks the rsockets backend.
 func DialRDMA() (*RdmaTransport, error) {
 	if err := rdmaAvailable(); err != nil {
 		return nil, err
+	}
+	if rdmaDialFn == nil {
+		return nil, ErrRdmaUnsupported
 	}
 	return &RdmaTransport{}, nil
 }
@@ -76,12 +92,14 @@ func ListenRDMA(nics []string, advertise string) (*RdmaTransport, error) {
 	if err := rdmaAvailable(); err != nil {
 		return nil, err
 	}
-	_ = nics
-	_ = advertise
-	// rsocket listener creation needs librdmacm (rdma_create_ep). The
-	// rsockets backend is build-tag gated (see riodma_rsocket.go); without
-	// it we fail cleanly so the manager can refuse --rdma-network startup.
-	return nil, ErrRdmaUnsupported
+	if rdmaListenFn == nil {
+		return nil, ErrRdmaUnsupported
+	}
+	ln, adv, err := rdmaListenFn(nics, advertise)
+	if err != nil {
+		return nil, err
+	}
+	return &RdmaTransport{ln: ln, advAddr: adv}, nil
 }
 
 // ErrRdmaUnsupported is returned when the build lacks the rsockets backend
@@ -114,7 +132,10 @@ func (t *RdmaTransport) Addr() string { return t.advAddr }
 
 // Dial connects to an rsocket endpoint (net.Conn over RDMA).
 func (t *RdmaTransport) Dial(ctx context.Context, addr string) (net.Conn, error) {
-	return nil, ErrRdmaUnsupported
+	if rdmaDialFn == nil {
+		return nil, ErrRdmaUnsupported
+	}
+	return rdmaDialFn(ctx, addr)
 }
 
 // Name identifies the transport.
