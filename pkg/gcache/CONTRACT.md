@@ -95,6 +95,39 @@ the rest. NOTE: `ReadCloser` here is `chunk.ReadCloser` (pkg/chunk/cache_manager
 ```
 
 Client may pipeline requests per connection; responses carry matching xid.
+(Implementation note: current clients use one in-flight request per pooled
+connection — xid stays 0; pipelining remains a valid future extension.)
+
+### 6a. Ranged reads (fork extension, backward compatible)
+
+```
+type 0x06 RANGE_REQ: header plen=16; body = key (klen) || off u64 || len u64
+response: standard BLOCK_RESP, algo=WireRaw, plen = bytes served
+  payload = raw block bytes (decompressed, post-decrypt) at [off, off+len)
+```
+
+* The response is NOT volume-format for compressed volumes — it is the exact
+  window the owner's local-cache `ReadAt` would return. Only new clients send
+  0x06 and only they interpret the payload (the chunk-layer hook consumes it
+  directly as file bytes; it never reaches `load()`).
+* Old servers reject the unknown type (`sendError`+close). Clients memoize
+  the rejection per peer for 5 minutes (`rangeNo` map) and fall back. Any
+  plen != requested is a protocol error → fallback. No version bump needed;
+  all pre-existing frames are byte-identical.
+* Server-side validation: `off >= 0`, `0 < len <= maxRangePayload (4 MiB)`;
+  the range is clamped to the key-embedded block size when parseable
+  (`<id>_<indx>_<size>`, plain mode; hash-prefix keys carry no size and rely
+  on the panic-guarded positional read in the bridge).
+* Optional source extension (structural, ServeConn type-asserts):
+  `RangeSource.LoadCachedRange(key string, off, limit int64) (io.ReadCloser, error)`
+  — implemented by `GcacheBridge` via `cachedStore.loadCachedRange`
+  (positional read from the local cache; NO whole-block read, NO decompress,
+  NO re-compress). Owner miss ⇒ `FillFromStorage` (the designated-copy fill)
+  then serve. Metrics: `remotecache_range_gets/_bytes/_errors`.
+* Client eligibility: `--peer-range-read` + read ≤ blockSize/4; wired via
+  `chunk.SetPeerRangeLoaderOnStore` (atomic loader on cachedStore); any
+  failure falls through to the pre-existing seekable-range / full-block paths.
+  Counters: `blockcache_peer_range_hits/_bytes`.
 
 ## 7. Failure semantics (enterprise parity)
 
@@ -115,7 +148,9 @@ Client may pipeline requests per connection; responses carry matching xid.
 
 `--cache-group` (strings slice), `--group-weight`, `--group-listen`,
 `--group-advertise`, `--group-heartbeat`, `--remote-timeout`, `--no-sharing`,
-`--fill-group-cache`. Names mirror the enterprise command reference.
+`--fill-group-cache`, `--peer-range-read`, `--read-socket` (readsvc),
+`--rdma-network`. Names mirror the enterprise command reference where they
+overlap.
 
 ## 10. Committed Go signatures (both workers code against these EXACTLY)
 
@@ -183,7 +218,9 @@ sync: `go test ./pkg/gcache/ -run TestContract`.
 
 * Client: `Transport` interface (transport.go): `Dial(ctx, addr) (net.Conn, error)`
   + `Name() string`. TCP default; rsockets backend is build-tag gated
-  (rdma.go; `ErrRdmaUnsupported` without it).
+  (`-tags rdma`, rdma_rsocket.go: real librdmacm rsockets datapath with
+  deadline support; without the tag `ErrRdmaUnsupported`). Tagged binaries
+  require librdmacm.so.1 at load time; verify devices with `rping` first.
 * Failover state machine (`dialFailover`): prefer `Member.RdmaAddr` unless in
   backoff; RDMA failure → TCP + 5m backoff (`rdmaRetryInterval` =
   IORPC_RDMA_RETRY_DURATION parity); success clears backoff (failback);
