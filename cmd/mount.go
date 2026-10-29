@@ -40,9 +40,11 @@ import (
 	"github.com/urfave/cli/v2"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
+	"github.com/juicedata/juicefs/pkg/fs"
 	"github.com/juicedata/juicefs/pkg/gcache"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/metric"
+	"github.com/juicedata/juicefs/pkg/readsvc"
 	"github.com/juicedata/juicefs/pkg/usage"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
@@ -768,6 +770,27 @@ func mount(c *cli.Context) error {
 		} else {
 			logger.Infof("cache group %v joined, serving on %s", c.StringSlice("cache-group"), gmgr.Addr())
 			defer gmgr.Stop()
+		}
+	}
+
+	// gcache (community fork): opt-in FUSE-bypassing read service. It shares
+	// the mount's meta client + chunk store, so every cache (page, disk,
+	// cache-group peers, ranged reads) applies identically to readsvc reads.
+	if sockPath := c.String("read-socket"); sockPath != "" {
+		rfs, err := fs.NewFileSystem(vfsConf, metaCli, store, registry)
+		if err != nil {
+			logger.Warnf("read service disabled: %s", err)
+		} else {
+			_ = os.Remove(sockPath) // stale socket from an unclean exit
+			if ln, lerr := net.Listen("unix", sockPath); lerr != nil {
+				logger.Warnf("read service listen %s: %s", sockPath, lerr)
+			} else {
+				_ = os.Chmod(sockPath, 0o660)
+				srv := readsvc.NewServer(&readsvc.FSBackend{FS: rfs}, sockPath)
+				go func() { _ = srv.Serve(context.Background(), ln) }()
+				defer srv.Close()
+				logger.Infof("read service listening on %s", sockPath)
+			}
 		}
 	}
 

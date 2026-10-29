@@ -53,6 +53,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/juicedata/juicefs/pkg/gcache"
+	"github.com/juicedata/juicefs/pkg/readsvc"
 )
 
 // ---------------------------------------------------------------- results
@@ -463,7 +464,9 @@ func (p *peerClient) rangeAt(key string, off int64, buf []byte) error {
 
 func cmdRead(args []string) {
 	fs := newFlagSet("read")
-	backend := fs.String("backend", "peer", "peer | fuse | nvme")
+	backend := fs.String("backend", "peer", "peer | fuse | nvme | readsvc")
+	sockPath := fs.String("sock", "", "readsvc unix socket (backend=readsvc)")
+	openPath := fs.String("open-path", "", "file path to open in the readsvc backend")
 	addr := fs.String("addr", "", "peer host:port (backend=peer)")
 	path := fs.String("path", "", "file path (backend=fuse|nvme)")
 	useRange := fs.Bool("range", false, "use ranged peer reads (MsgRangeReq) instead of full-block fetch")
@@ -498,7 +501,7 @@ func cmdRead(args []string) {
 	for _, ln := range splitInts(*lens) {
 		for _, qd := range splitInts(*qds) {
 			res := runOnce(*backend, *addr, *path, *useRange, ln, qd, *batch, *secs,
-				*keys, *bs, *unique, *direct, *drop, *seed, *timeout)
+				*keys, *bs, *unique, *direct, *drop, *seed, *timeout, *sockPath, *openPath)
 			results = append(results, res)
 			printTable(res)
 			if *out != "" {
@@ -512,7 +515,8 @@ func cmdRead(args []string) {
 }
 
 func runOnce(backend, addr, path string, useRange bool, length, qd, batch int, secs float64,
-	keys, bs int, unique, direct, drop bool, seed int64, timeout time.Duration) runResult {
+	keys, bs int, unique, direct, drop bool, seed int64, timeout time.Duration,
+	sockPath, openPath string) runResult {
 
 	res := runResult{
 		Backend: backend, Addr: addr, Path: path, Range: useRange, Len: length, QD: qd,
@@ -527,27 +531,52 @@ func runOnce(backend, addr, path string, useRange bool, length, qd, batch int, s
 	var fr *fileReader
 	var pr *peerClient
 	dataSize := int64(bs)
+	// readWorker pairs a read function with per-worker cleanup; shared
+	// backends return the same fn for every worker.
+	type readWorker struct {
+		read func(buf []byte, off int64, rnd *rand.Rand) error
+		done func()
+	}
+	var setupWorker func(id int) *readWorker
 	switch backend {
 	case "nvme", "fuse":
 		fr = openReader(path, direct && backend == "nvme", drop)
 		dataSize = fr.size
-	case "peer":
-		pr = newPeer(addr, keys, bs, useRange, unique, timeout)
-	default:
-		fatalf("unknown backend %q", backend)
-	}
-
-	reader := func(buf []byte, off int64, rnd *rand.Rand) error {
-		switch backend {
-		case "nvme", "fuse":
+		shared := &readWorker{read: func(buf []byte, off int64, _ *rand.Rand) error {
 			if drop {
 				fr.dropCache()
 			}
 			_, err := fr.preadAt(buf, off)
 			return err
-		default:
-			return pr.readAt(buf, off, rnd)
+		}, done: func() {}}
+		setupWorker = func(int) *readWorker { return shared }
+	case "peer":
+		pr = newPeer(addr, keys, bs, useRange, unique, timeout)
+		shared := &readWorker{read: pr.readAt, done: func() {}}
+		setupWorker = func(int) *readWorker { return shared }
+	case "readsvc":
+		if sockPath == "" {
+			fatalf("--sock required for backend=readsvc")
 		}
+		setupWorker = func(id int) *readWorker {
+			c, err := readsvc.Dial(sockPath)
+			if err != nil {
+				fatalf("dial %s: %v", sockPath, err)
+			}
+			h, err := c.OpenHandle(openPath)
+			if err != nil {
+				fatalf("open %s: %v", openPath, err)
+			}
+			return &readWorker{
+				read: func(buf []byte, off int64, _ *rand.Rand) error {
+					_, err := h.ReadAt(buf, off)
+					return err
+				},
+				done: func() { _ = h.Close(); _ = c.Close() },
+			}
+		}
+	default:
+		fatalf("unknown backend %q", backend)
 	}
 
 	stop := make(chan struct{})
@@ -568,10 +597,17 @@ func runOnce(backend, addr, path string, useRange bool, length, qd, batch int, s
 		// an RNG (rand.Rand is not goroutine-safe).
 		bufs := make([][]byte, batch)
 		rngs := make([]*rand.Rand, batch)
+		slots := make([]*readWorker, batch)
 		for i := range bufs {
 			bufs[i] = alignedBuf(length)
 			rngs[i] = rand.New(rand.NewSource(seed + int64(i)))
+			slots[i] = setupWorker(i)
 		}
+		defer func() {
+			for _, s := range slots {
+				s.done()
+			}
+		}()
 		for time.Now().Before(deadline) {
 			offs := make([]int64, batch)
 			for i := range offs {
@@ -584,7 +620,7 @@ func runOnce(backend, addr, path string, useRange bool, length, qd, batch int, s
 				go func(i int) {
 					defer wg.Done()
 					s := time.Now()
-					if err := reader(bufs[i], offs[i], rngs[i]); err != nil {
+					if err := slots[i].read(bufs[i], offs[i], rngs[i]); err != nil {
 						errs.Add(1)
 					} else {
 						d := float64(time.Since(s).Microseconds())
@@ -609,6 +645,15 @@ func runOnce(backend, addr, path string, useRange bool, length, qd, batch int, s
 		res.BatchDone = summarize(batchLat)
 	} else {
 		var wg sync.WaitGroup
+		workers := make([]*readWorker, qd)
+		for i := 0; i < qd; i++ {
+			workers[i] = setupWorker(i)
+		}
+		defer func() {
+			for _, w := range workers {
+				w.done()
+			}
+		}()
 		for i := 0; i < qd; i++ {
 			wg.Add(1)
 			go func(id int) {
@@ -623,7 +668,7 @@ func runOnce(backend, addr, path string, useRange bool, length, qd, batch int, s
 					}
 					off := pickOff(rnd)
 					start := time.Now()
-					err := reader(buf, off, rnd)
+					err := workers[id].read(buf, off, rnd)
 					d := float64(time.Since(start).Microseconds())
 					if err != nil {
 						errs.Add(1)

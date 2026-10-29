@@ -327,6 +327,10 @@ func dataCacheFlags() []cli.Flag {
 			Name:  "peer-range-read",
 			Usage: "serve small random reads (<= blocksize/4) positionally from the cache-group owner's cached block instead of fetching whole blocks; falls back to the standard paths on any error (fork extension, see docs/LOW_LATENCY_CACHE_REVIEW.md)",
 		},
+		&cli.StringFlag{
+			Name:  "read-socket",
+			Usage: "unix socket path for the FUSE-bypassing read service (fork extension; clients use pkg/readsvc for Open/ReadAt/BatchReadAt against this mount's caches)",
+		},
 	})
 }
 
