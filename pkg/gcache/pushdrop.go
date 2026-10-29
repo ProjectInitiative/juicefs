@@ -60,11 +60,17 @@ func (c *RingClient) Push(ctx context.Context, group, key string, data []byte, m
 	owner := owners[0]
 	peer := owner.Addr
 	start := time.Now()
-	conn, _, derr := c.dialFailover(ctx, owner)
+	pc, _, derr := c.pool.acquire(peer, func() (net.Conn, Transport, error) {
+		return c.dialFailover(ctx, owner)
+	})
 	var err error
 	if derr == nil {
-		err = c.sendWrite(ctx, conn, MsgBlockPush, key, data)
-		_ = conn.Close()
+		err = c.sendWrite(ctx, pc.Conn, MsgBlockPush, key, data)
+		if err != nil {
+			c.pool.discard(pc.Conn)
+		} else {
+			c.pool.release(peer, pc.Conn, pc.tr)
+		}
 	} else {
 		err = derr
 	}
@@ -92,11 +98,17 @@ func (c *RingClient) Drop(ctx context.Context, group, key string, members []Memb
 		m := members[i]
 		peer := m.Addr
 		start := time.Now()
-		conn, _, derr := c.dialFailover(ctx, m)
+		pc, _, derr := c.pool.acquire(peer, func() (net.Conn, Transport, error) {
+			return c.dialFailover(ctx, m)
+		})
 		var err error
 		if derr == nil {
-			err = c.sendWrite(ctx, conn, MsgBlockDrop, key, nil)
-			_ = conn.Close()
+			err = c.sendWrite(ctx, pc.Conn, MsgBlockDrop, key, nil)
+			if err != nil {
+				c.pool.discard(pc.Conn)
+			} else {
+				c.pool.release(peer, pc.Conn, pc.tr)
+			}
 		} else {
 			err = derr
 		}

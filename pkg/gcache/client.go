@@ -43,6 +43,7 @@ type RingClient struct {
 	tcp         Transport
 	rdma        Transport // nil => TCP-only
 	epState     map[string]endpointState
+	pool        *connPool
 
 	mu      sync.Mutex
 	failCnt map[string]int // peer addr -> consecutive failures
@@ -67,6 +68,7 @@ func NewRingClient(timeout time.Duration, maxFailures int, selfUUID string) *Rin
 		tcp:         &TCPTransport{Timeout: timeout},
 		rdma:        nil,
 		epState:     make(map[string]endpointState),
+		pool:        newConnPool(0, 0),
 		failCnt:     make(map[string]int),
 		evicted:     make(map[string]time.Time),
 	}
@@ -184,7 +186,10 @@ func (c *RingClient) Fetch(ctx context.Context, group, key string, members []Mem
 	return nil, err2
 }
 
-// fetchOnce performs one request against the best candidate peer.
+// fetchOnce performs one request against the best candidate peer. The
+// connection comes from the per-peer pool (fresh dial on miss); it is
+// returned to the pool only after the response is fully consumed (or drained)
+// in payloadReader.Close — any error discards it.
 func (c *RingClient) fetchOnce(ctx context.Context, key string, members []Member) (*payloadReader, error) {
 	m := c.candidate(key, members, c.selfUUID)
 	if m == nil {
@@ -196,19 +201,16 @@ func (c *RingClient) fetchOnce(ctx context.Context, key string, members []Member
 	var reader *payloadReader
 	var err error
 	func() {
-		var conn net.Conn
-		var tr Transport
-		conn, tr, err = c.dialFailover(ctx, *m)
-		if err == nil {
-			_ = conn.SetDeadline(time.Now().Add(c.timeout))
-			_ = tr // transport used (logging/metrics follow-up)
-		}
-		if err != nil {
-			err = fmt.Errorf("dial peer %s: %w", peer, err)
+		pc, _, derr := c.pool.acquire(peer, func() (net.Conn, Transport, error) {
+			return c.dialFailover(ctx, *m)
+		})
+		if derr != nil {
+			err = fmt.Errorf("dial peer %s: %w", peer, derr)
 			return
 		}
+		conn := pc.Conn
 		if err = c.sendReq(ctx, conn, key); err != nil {
-			_ = conn.Close()
+			c.pool.discard(conn)
 			err = fmt.Errorf("send to peer %s: %w", peer, err)
 			return
 		}
@@ -218,14 +220,14 @@ func (c *RingClient) fetchOnce(ctx context.Context, key string, members []Member
 		var isErr bool
 		algo, xid, plen, isErr, err = c.readRespHeader(ctx, conn)
 		if err != nil {
-			_ = conn.Close()
+			c.pool.discard(conn)
 			err = fmt.Errorf("read from peer %s: %w", peer, err)
 			return
 		}
 		if isErr {
-			_ = conn.Close()
-			c.MarkSuccess(peer) // peer answered; fetch-level failure, not peer failure
-			return              // err already holds the *errFrame
+			c.pool.discard(conn) // error frame: frame sync is fine, but keep the simple path
+			c.MarkSuccess(peer)  // peer answered; fetch-level failure, not peer failure
+			return               // err already holds the *errFrame
 		}
 		c.MarkSuccess(peer) // header OK; payload streams below
 		fetched = int64(plen)
@@ -236,6 +238,9 @@ func (c *RingClient) fetchOnce(ctx context.Context, key string, members []Member
 			algo:      algo,
 			xid:       xid,
 			timeout:   c.timeout,
+			pool:      c.pool,
+			peer:      peer,
+			tr:        pc.tr,
 		}
 	}()
 	observeFetch(peer, fetched, err, time.Since(start).Seconds())
@@ -365,7 +370,9 @@ func readFull(conn net.Conn, b []byte) error {
 
 // payloadReader streams the payload of one MsgBlockResp, read-capped at
 // plen bytes, with a fresh per-Read deadline (payload transfer is not
-// bounded by the header deadline).
+// bounded by the header deadline). On Close the underlying connection is
+// returned to the per-peer pool when the payload was fully consumed (or the
+// small remainder drained); otherwise the conn is closed.
 type payloadReader struct {
 	conn      net.Conn
 	remaining int64
@@ -373,6 +380,9 @@ type payloadReader struct {
 	algo      uint8
 	xid       uint32
 	timeout   time.Duration
+	pool      *connPool // nil => close conn on Close (legacy/test path)
+	peer      string
+	tr        Transport
 }
 
 func (p *payloadReader) Read(b []byte) (int, error) {
@@ -390,11 +400,17 @@ func (p *payloadReader) Read(b []byte) (int, error) {
 
 func (p *payloadReader) Close() error {
 	// Best-effort drain of a small remainder so the peer sees a clean
-	// connection close; hard-close otherwise.
+	// request/response boundary; hard-close otherwise. A fully consumed (or
+	// drained) conn is byte-clean for the next request and goes back to the
+	// per-peer pool.
 	const maxDrain = 1 << 20
 	if p.remaining > 0 && p.remaining <= maxDrain {
 		_ = p.conn.SetReadDeadline(time.Now().Add(time.Second))
 		_, _ = io.CopyN(io.Discard, p, p.remaining)
+	}
+	if p.remaining <= 0 && p.pool != nil {
+		p.pool.release(p.peer, p.conn, p.tr)
+		return nil
 	}
 	return p.conn.Close()
 }
