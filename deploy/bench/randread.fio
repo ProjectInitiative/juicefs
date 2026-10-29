@@ -1,0 +1,28 @@
+# fio job template for the local-NVMe baseline (Phase 1).
+#
+# Usage (one line):
+#   fio deploy/bench/randread.fio --filename=/mnt/data/engram.bin --output=fio-4k-qd1.json --eta=never
+#
+# Override per run: --bs=4k|16k|64k|4m --iodepth=1|8|32|64|128 --direct=1|0
+# For the JuiceFS FUSE comparison use --direct=0 (FUSE is buffered) and pair
+# with tools/latencybench read --backend fuse --drop-cache for cold rounds.
+
+[global]
+name=randread-baseline
+ioengine=libaio
+rw=randread
+bs=4k
+iodepth=1
+direct=1
+runtime=10
+time_based=1
+size=100%
+group_reporting=1
+percentile_list=50:90:95:99:99.9
+write_bw_log=fio
+write_iops_log=fio
+write_lat_log=fio
+log_avg_msec=100
+
+[randread]
+stonewall

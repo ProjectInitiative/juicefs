@@ -117,7 +117,7 @@ func (f *fakeSource) DropCached(key string) error {
 var fmtErrNotExist = os.ErrNotExist
 
 // listenerWithSrc serves connections on a fresh loopback port.
-func listenerWithSrc(t *testing.T, src ServerSource, timeout time.Duration) (addr string, stop func()) {
+func listenerWithSrc(t testing.TB, src ServerSource, timeout time.Duration) (addr string, stop func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
