@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -46,8 +47,9 @@ type RingClient struct {
 	pool        *connPool
 
 	mu      sync.Mutex
-	failCnt map[string]int // peer addr -> consecutive failures
+	failCnt map[string]int    // peer addr -> consecutive failures
 	evicted map[string]time.Time
+	rangeNo map[string]time.Time // peer addr -> range-unsupported until
 }
 
 // NewRingClient creates a client with per-request timeout and eviction
@@ -71,6 +73,7 @@ func NewRingClient(timeout time.Duration, maxFailures int, selfUUID string) *Rin
 		pool:        newConnPool(0, 0),
 		failCnt:     make(map[string]int),
 		evicted:     make(map[string]time.Time),
+		rangeNo:     make(map[string]time.Time),
 	}
 }
 
@@ -119,6 +122,35 @@ func (e *errFrame) Error() string { return e.msg }
 
 // errNoOwners: every candidate peer was evicted.
 var errNoOwners = errors.New("no available peer for key")
+
+// Ranged-read outcomes (fork extension). Callers fall back to the standard
+// paths on any of these; errRangeUnsupported additionally memoizes the peer
+// so later ranged reads skip it (re-probed after rangeReprobeInterval).
+var (
+	errSelfOwned        = errors.New("block owned by self")
+	errRangeUnsupported = errors.New("peer does not support ranged reads")
+)
+
+// rangeReprobeInterval: how long a peer is assumed range-incapable after a
+// rejection (covers rolling upgrades: upgraded peers are picked up again).
+const rangeReprobeInterval = 5 * time.Minute
+
+// rangeUnsupported reports whether peer rejected ranged reads recently.
+func (c *RingClient) rangeUnsupported(peer string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	until, ok := c.rangeNo[peer]
+	return ok && time.Now().Before(until)
+}
+
+func (c *RingClient) markRangeUnsupported(peer string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rangeNo == nil {
+		c.rangeNo = make(map[string]time.Time)
+	}
+	c.rangeNo[peer] = time.Now().Add(rangeReprobeInterval)
+}
 
 // SetKick wires the membership-refresh hook (called when the member view
 // is empty or yields no owner for a key).
@@ -475,3 +507,119 @@ func (r *peerReader) Close() error { return r.cur.Close() }
 type noCacheReader struct{ io.ReadCloser }
 
 func (noCacheReader) NoLocalCache() {}
+
+// RangeRead fetches exactly [off, off+len(buf)) of a block's raw (decompressed)
+// bytes from the ring owner via MsgRangeReq. It is the fast path for 4 KiB-
+// class random reads: the owner serves positionally from its cache without
+// transferring the whole block. Returned errors are final for this read — the
+// caller falls back to the standard paths:
+//   - errSelfOwned / errNoOwners: placement says serve locally / no peer
+//   - errRangeUnsupported: the peer predates MsgRangeReq (memoized per peer
+//     for rangeReprobeInterval, so rolling upgrades re-enable it)
+//   - anything else: transport/protocol failure (peer health is updated)
+func (c *RingClient) RangeRead(ctx context.Context, group, key string, off int64, buf []byte, members []Member) (int, error) {
+	if len(members) == 0 {
+		if c.kick != nil {
+			c.kick()
+		}
+		return 0, ErrNoMembers
+	}
+	m := c.candidate(key, members, c.selfUUID)
+	if m == nil {
+		// distinguish self-owned (serve locally) from all-evicted
+		owners := Owners(key, members, 1)
+		if len(owners) > 0 && owners[0].UUID == c.selfUUID {
+			return 0, errSelfOwned
+		}
+		return 0, errNoOwners
+	}
+	peer := m.Addr
+	if c.rangeUnsupported(peer) {
+		return 0, errRangeUnsupported
+	}
+	start := time.Now()
+	n, err := c.rangeOnce(ctx, m, key, off, buf)
+	observeRange(peer, n, err, time.Since(start).Seconds())
+	if err != nil {
+		if ctx.Err() == nil {
+			c.MarkFailure(peer)
+		}
+		return 0, err
+	}
+	c.MarkSuccess(peer)
+	return n, nil
+}
+
+// rangeOnce performs one ranged request against peer member m.
+func (c *RingClient) rangeOnce(ctx context.Context, m *Member, key string, off int64, buf []byte) (int, error) {
+	peer := m.Addr
+	pc, _, err := c.pool.acquire(peer, func() (net.Conn, Transport, error) {
+		return c.dialFailover(ctx, *m)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("dial peer %s: %w", peer, err)
+	}
+	conn := pc.Conn
+	if err = c.sendRangeReq(ctx, conn, key, off, len(buf)); err != nil {
+		c.pool.discard(conn)
+		return 0, fmt.Errorf("send to peer %s: %w", peer, err)
+	}
+	algo, _, plen, isErr, err := c.readRespHeader(ctx, conn)
+	if err != nil {
+		c.pool.discard(conn)
+		if isErr {
+			if e, ok := err.(*errFrame); ok && strings.Contains(e.msg, "bad request type") {
+				// legacy peer: it rejects the unknown type and closes the conn
+				c.markRangeUnsupported(peer)
+				return 0, errRangeUnsupported
+			}
+		}
+		return 0, fmt.Errorf("read from peer %s: %w", peer, err)
+	}
+	if algo != WireRaw {
+		c.pool.discard(conn)
+		return 0, fmt.Errorf("unexpected range payload algo %d from %s", algo, peer)
+	}
+	if plen != uint64(len(buf)) {
+		// protocol violation (short block or corrupt peer): do not guess
+		c.pool.discard(conn)
+		return 0, fmt.Errorf("range payload length mismatch: got %d want %d", plen, len(buf))
+	}
+	pr := &payloadReader{
+		conn:      conn,
+		remaining: int64(plen),
+		plen:      int64(plen),
+		algo:      algo,
+		timeout:   c.timeout,
+		pool:      c.pool,
+		peer:      peer,
+		tr:        pc.tr,
+	}
+	if _, err = io.ReadFull(pr, buf); err != nil {
+		pr.Close() // drains/releases when clean, closes otherwise
+		return 0, fmt.Errorf("read range payload from %s: %w", peer, err)
+	}
+	pr.Close() // fully consumed: release to pool
+	return len(buf), nil
+}
+
+// sendRangeReq writes one MsgRangeReq frame: header + key + off/len pair.
+func (c *RingClient) sendRangeReq(ctx context.Context, conn net.Conn, key string, off int64, n int) error {
+	_ = conn.SetDeadline(time.Now().Add(c.timeout))
+	hdr := make([]byte, headerLen)
+	hdr[0], hdr[1], hdr[2] = magic0, magic1, protoVer
+	hdr[3] = MsgRangeReq
+	binary.LittleEndian.PutUint32(hdr[5:9], 0)  // xid (single-flight per conn)
+	binary.LittleEndian.PutUint16(hdr[9:11], uint16(len(key)))
+	binary.LittleEndian.PutUint64(hdr[12:20], 16) // trailing off/len pair
+	if err := ctxSend(ctx, conn, hdr); err != nil {
+		return err
+	}
+	if err := ctxSend(ctx, conn, []byte(key)); err != nil {
+		return err
+	}
+	var pair [16]byte
+	binary.LittleEndian.PutUint64(pair[0:8], uint64(off))
+	binary.LittleEndian.PutUint64(pair[8:16], uint64(n))
+	return ctxSend(ctx, conn, pair[:])
+}

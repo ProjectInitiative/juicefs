@@ -139,6 +139,21 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	s.store.cacheMiss.Add(1)
 	s.store.cacheMissBytes.Add(float64(len(p)))
 
+	// gcache fork: peer ranged reads for small random reads (--peer-range-
+	// read). Serves the window from the ring owner's cached block without
+	// transferring the whole block over the network. Any failure falls
+	// through silently to the pre-existing paths below (storage range read /
+	// full-block singleflight load), so this is strictly a fast path.
+	if limit := s.store.peerRangeLimit(); limit > 0 && len(p) <= limit {
+		if fn := s.store.peerRange.Load(); fn != nil {
+			if n, perr := (*fn)(ctx, key, int64(boff), p); perr == nil && n == len(p) {
+				s.store.peerRangeHits.Add(1)
+				s.store.peerRangeBytes.Add(float64(n))
+				return n, nil
+			}
+		}
+	}
+
 	if s.store.seekable &&
 		(!s.store.conf.CacheEnabled() || (boff > 0 && len(p) <= blockSize/4)) {
 		n, err = s.store.loadRange(ctx, key, page, boff)
@@ -688,6 +703,13 @@ type cachedStore struct {
 	objectDataBytes     *prometheus.CounterVec
 	stageBlockDelay     prometheus.Counter
 	stageBlockErrors    prometheus.Counter
+
+	// gcache fork: peer ranged reads (--peer-range-read). peerRange holds the
+	// optional loader wired post-construction via SetPeerRangeLoaderOnStore;
+	// nil = disabled. Counters are fork additions, registered in regMetrics.
+	peerRange       atomic.Pointer[PeerRangeLoader]
+	peerRangeHits   prometheus.Counter
+	peerRangeBytes  prometheus.Counter
 }
 
 func logRequest(typeStr, key, param, reqID string, err error, used time.Duration) {
@@ -988,6 +1010,15 @@ func (store *cachedStore) initMetrics() {
 		Name: "staging_block_errors",
 		Help: "Total errors when staging blocks",
 	})
+	// gcache fork: peer ranged-read fast path counters.
+	store.peerRangeHits = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "blockcache_peer_range_hits",
+		Help: "reads served by a cache-group peer ranged read (sub-block, --peer-range-read)",
+	})
+	store.peerRangeBytes = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "blockcache_peer_range_bytes",
+		Help: "bytes served by cache-group peer ranged reads",
+	})
 }
 
 func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
@@ -1004,6 +1035,9 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(store.objectDataBytes)
 	reg.MustRegister(store.stageBlockDelay)
 	reg.MustRegister(store.stageBlockErrors)
+	// gcache fork: peer ranged reads
+	reg.MustRegister(store.peerRangeHits)
+	reg.MustRegister(store.peerRangeBytes)
 	reg.MustRegister(prometheus.NewGaugeFunc(
 		prometheus.GaugeOpts{
 			Name: "blockcache_blocks",

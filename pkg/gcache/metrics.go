@@ -37,6 +37,10 @@ var (
 	metricErrors    prometheus.Counter
 	metricDurations prometheus.Histogram
 	metricFailures  *prometheus.GaugeVec
+	// fork extension: ranged (sub-block) peer reads
+	metricRangeGets   prometheus.Counter
+	metricRangeBytes  prometheus.Counter
+	metricRangeErrors prometheus.Counter
 )
 
 var metricsOnce sync.Once
@@ -68,10 +72,23 @@ func CollectMetrics(reg prometheus.Registerer) {
 			Name: "peer_failures",
 			Help: "Consecutive failures per cache-group peer",
 		}, []string{"peer"})
+		metricRangeGets = prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "remotecache_range_gets",
+			Help: "Count of distributed cache ranged (sub-block) peer reads",
+		})
+		metricRangeBytes = prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "remotecache_range_bytes",
+			Help: "Bytes fetched via ranged (sub-block) peer reads",
+		})
+		metricRangeErrors = prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "remotecache_range_errors",
+			Help: "Count of failed ranged peer reads (incl. unsupported-peer fallbacks)",
+		})
 		if reg == nil {
 			reg = prometheus.DefaultRegisterer
 		}
-		reg.MustRegister(metricGets, metricBytes, metricErrors, metricDurations, metricFailures)
+		reg.MustRegister(metricGets, metricBytes, metricErrors, metricDurations, metricFailures,
+			metricRangeGets, metricRangeBytes, metricRangeErrors)
 	})
 }
 
@@ -92,4 +109,30 @@ func observeFetch(peer string, n int64, err error, seconds float64) {
 	metricGets.Inc()
 	metricBytes.Add(float64(n))
 	metricDurations.Observe(seconds)
+}
+
+// observeRange records one ranged peer read outcome.
+func observeRange(peer string, n int, err error, seconds float64) {
+	if metricRangeGets == nil { // metrics not registered (pure-library use)
+		return
+	}
+	if err != nil {
+		if errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "operation was canceled") {
+			return
+		}
+		metricRangeErrors.Inc()
+		return
+	}
+	metricRangeGets.Inc()
+	metricRangeBytes.Add(float64(n))
+}
+
+// observeRangeServe records one ranged serve on the owner side (same range
+// counters so owner+client views reconcile).
+func observeRangeServe(n int) {
+	if metricRangeGets == nil {
+		return
+	}
+	metricRangeGets.Inc()
+	metricRangeBytes.Add(float64(n))
 }

@@ -41,6 +41,11 @@ type GcacheBridge struct {
 	CompressPayloadFn func(dst, src []byte) (int, error)
 	StorePushedFn     func(ctx context.Context, key string, data []byte) error
 	DropCachedFn      func(key string) error
+	// LoadCachedRangeFn (fork extension): positional read over the locally
+	// cached (decompressed) block without reading the whole block. Backs the
+	// peer ranged-read fast path (gcache MsgRangeReq). Optional — when nil
+	// the bridge does not satisfy gcache.RangeSource.
+	LoadCachedRangeFn func(key string, off, limit int64) (io.ReadCloser, error)
 }
 
 // NewGcacheBridge builds a GcacheBridge over a *cachedStore. It returns an
@@ -59,6 +64,7 @@ func NewGcacheBridge(store ChunkStore) (*GcacheBridge, error) {
 		CompressPayloadFn: cs.compressPayload,
 		StorePushedFn:     cs.storePushed,
 		DropCachedFn:      cs.dropCached,
+		LoadCachedRangeFn: cs.loadCachedRange,
 	}, nil
 }
 
@@ -86,6 +92,16 @@ func (b *GcacheBridge) StorePushed(ctx context.Context, key string, data []byte)
 }
 
 func (b *GcacheBridge) DropCached(key string) error { return b.DropCachedFn(key) }
+
+// LoadCachedRange satisfies gcache.RangeSource structurally (optional
+// extension; ServeConn type-asserts it). Returns nil-func-safe: callers that
+// never set the fn yield an error rather than a panic.
+func (b *GcacheBridge) LoadCachedRange(key string, off, limit int64) (io.ReadCloser, error) {
+	if b.LoadCachedRangeFn == nil {
+		return nil, fmt.Errorf("ranged serving not configured on this bridge")
+	}
+	return b.LoadCachedRangeFn(key, off, limit)
+}
 
 // loadCached returns a streaming reader over the locally cached (decompressed)
 // block. chunk.ReadCloser is ReaderAt+Closer (no Read), so wrap it for
@@ -155,6 +171,48 @@ func (cs *cachedStore) dropCached(key string) error {
 	cs.bcache.remove(key, false)
 	return nil
 }
+
+// loadCachedRange returns a reader over [off, off+limit) of the locally
+// cached (decompressed) block — a positional read, not a whole-block read.
+// Missing blocks map to an error wrapping os.ErrNotExist (CONTRACT.md §4).
+// Reads at/past the end of a shorter-than-requested block can panic inside
+// the disk-cache page code; the guard converts that into a short read, which
+// the peer client treats as a protocol error and falls back on.
+func (cs *cachedStore) loadCachedRange(key string, off, limit int64) (io.ReadCloser, error) {
+	r, err := cs.bcache.load(key)
+	if err != nil {
+		if err == errNotCached {
+			return nil, fmt.Errorf("load %s: %w", key, os.ErrNotExist)
+		}
+		return nil, err
+	}
+	if off < 0 || limit < 0 {
+		_ = r.Close()
+		return nil, fmt.Errorf("invalid range for %s: off=%d limit=%d", key, off, limit)
+	}
+	return &rangeReadCloser{r: r, s: io.NewSectionReader(r, off, limit)}, nil
+}
+
+// rangeReadCloser bounds a chunk ReadCloser (ReaderAt+Closer) to one window
+// and closes the underlying reader with the window.
+type rangeReadCloser struct {
+	r ReadCloser
+	s *io.SectionReader
+}
+
+func (a *rangeReadCloser) Read(p []byte) (n int, err error) {
+	defer func() {
+		if recover() != nil {
+			// positional read past the cached block's end (possible for
+			// hash-prefix keys that carry no size): serve a short payload
+			// instead of crashing the peer server.
+			n, err = 0, io.EOF
+		}
+	}()
+	return a.s.Read(p)
+}
+
+func (a *rangeReadCloser) Close() error { return a.r.Close() }
 
 // ReadAtReader adapts chunk.ReadCloser (ReaderAt+Closer) to io.ReadCloser.
 type ReadAtReader struct {

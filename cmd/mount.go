@@ -681,6 +681,8 @@ func mount(c *cli.Context) error {
 	// twice (supervisor stage-0 + worker), and only the worker serves data.
 	// Registering both would poison the registry with dead listener addrs.
 	var gmgr *gcache.Manager
+	var grc *gcache.RingClient // kept for the post-NewCachedStore peer-range wiring
+	var grange string
 	if groups := c.StringSlice("cache-group"); len(groups) > 0 && os.Getenv("_FUSE_FD_COMM") != "" {
 		if len(groups) > 1 {
 			logger.Warnf("multiple cache groups given; using first group %q for placement (v1 limitation)", groups[0])
@@ -706,6 +708,8 @@ func mount(c *cli.Context) error {
 			gmgr = gcache.NewManager(gcfg, greg, nil)
 			rc := gcache.NewRingClient(gcfg.RPCTimeout, gcache.DefaultMaxFailures, gmgr.UUID())
 			rc.SetKick(gmgr.Kick)
+			grc = rc
+			grange = groups[0]
 			// Placement runs over the FULL member set (AllMembers, self
 			// included) so every node derives the same owner per key; the
 			// client then skips self-owned keys (served locally instead).
@@ -729,6 +733,16 @@ func mount(c *cli.Context) error {
 	}
 
 	store := chunk.NewCachedStore(blob, *chunkConf, registerer)
+
+	// gcache (community fork): opt-in peer ranged reads for small random
+	// reads (--peer-range-read). Wired after the store exists; any loader
+	// failure falls back to the standard read paths inside rSlice.ReadAt.
+	if grc != nil && c.Bool("peer-range-read") {
+		chunk.SetPeerRangeLoaderOnStore(store, func(ctx context.Context, key string, off int64, buf []byte) (int, error) {
+			return grc.RangeRead(ctx, grange, key, off, buf, gmgr.AllMembers(grange))
+		})
+		logger.Infof("cache group peer ranged reads enabled (<= %d bytes per read)", int64(chunkConf.BlockSize)/4)
+	}
 
 	// gcache (community fork): attach the peer-serving source now that the
 	// store exists, so this mount serves cached blocks to group members.

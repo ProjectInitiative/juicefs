@@ -77,7 +77,20 @@ const (
 	MsgError     uint8 = 0x03
 	MsgBlockPush uint8 = 0x04 // client→server: store block bytes (--fill-group-cache)
 	MsgBlockDrop uint8 = 0x05 // client→server: drop cached copy of key (delete-broadcast)
+	// MsgRangeReq (fork extension, backward compatible): fetch exactly
+	// [off, off+len) of a block. Body: key (klen bytes) || off u64 || len u64;
+	// header plen = 16 (the trailing pair). The response is a standard
+	// MsgBlockResp with algo=WireRaw whose payload is the requested slice of
+	// the block's RAW bytes (decompressed, post-decrypt — exactly what the
+	// owner's local-cache ReadAt would return). Old servers reject the
+	// unknown type with an error frame + conn close; clients memoize that per
+	// peer and fall back (see RingClient.RangeRead).
+	MsgRangeReq uint8 = 0x06
 )
+
+// maxRangePayload bounds one ranged request (4 KiB-class random reads; larger
+// requests should use the full-block path).
+const maxRangePayload = 4 << 20
 
 // Payload format flags carried in the response header 'algo' byte.
 // The wire ALWAYS carries volume-format bytes (what storage.Get would return):

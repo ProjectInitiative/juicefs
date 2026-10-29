@@ -47,6 +47,18 @@ type ServerSource interface {
 	DropCached(key string) error
 }
 
+// RangeSource is an optional ServerSource extension serving sub-block ranges
+// from the locally cached (decompressed) block without reading the whole
+// block. ServeConn type-asserts it; sources without it get an error frame for
+// ranged requests and clients fall back to the full-block path.
+type RangeSource interface {
+	// LoadCachedRange returns a reader over decompressed block bytes
+	// [off, off+limit), or an error wrapping os.ErrNotExist if the block is
+	// not locally cached. The returned reader must serve exactly the
+	// requested window (or fewer bytes if the block ends earlier).
+	LoadCachedRange(key string, off, limit int64) (io.ReadCloser, error)
+}
+
 // Registry maintains cache-group membership in the meta engine.
 // One implementation per engine family: Redis, tkv, SQL (CONTRACT.md §5).
 type Registry interface {

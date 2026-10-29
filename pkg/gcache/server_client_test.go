@@ -39,17 +39,23 @@ type fakeSource struct {
 	loadCnt  map[string]int
 	pushCnt  map[string]int
 	dropCnt  map[string]int
-	fillHook func(key string) error
+	rangeCnt map[string]int
+	// rangeMiss models "block exists in object storage but is not cached
+	// locally": LoadCachedRange reports ErrNotExist until a fill lands.
+	rangeMiss map[string]bool
+	fillHook  func(key string) error
 }
 
 func newFakeSource(algo string) *fakeSource {
 	return &fakeSource{
-		blocks:  make(map[string][]byte),
-		algo:    algo,
-		fillCnt: make(map[string]int),
-		loadCnt: make(map[string]int),
-		pushCnt: make(map[string]int),
-		dropCnt: make(map[string]int),
+		blocks:   make(map[string][]byte),
+		algo:     algo,
+		fillCnt:  make(map[string]int),
+		loadCnt:  make(map[string]int),
+		pushCnt:  make(map[string]int),
+		dropCnt:  make(map[string]int),
+		rangeCnt:  make(map[string]int),
+		rangeMiss: make(map[string]bool),
 	}
 }
 
@@ -63,10 +69,33 @@ func (f *fakeSource) LoadCached(key string) (io.ReadCloser, error) {
 	return nil, fmtErrNotExist
 }
 
+// LoadCachedRange (RangeSource): positional window over the cached block.
+// Served from the same decompressed byte store; counted separately.
+func (f *fakeSource) LoadCachedRange(key string, off, limit int64) (io.ReadCloser, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rangeCnt[key]++
+	if f.rangeMiss[key] {
+		return nil, fmtErrNotExist
+	}
+	if b, ok := f.blocks[key]; ok {
+		if off >= int64(len(b)) {
+			return nil, fmtErrNotExist
+		}
+		end := off + limit
+		if end > int64(len(b)) {
+			end = int64(len(b))
+		}
+		return io.NopCloser(bytes.NewReader(b[off:end])), nil
+	}
+	return nil, fmtErrNotExist
+}
+
 func (f *fakeSource) FillFromStorage(_ context.Context, key string) (io.ReadCloser, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.fillCnt[key]++
+	delete(f.rangeMiss, key) // the fill persists the owner's copy
 	if f.fillHook != nil {
 		if err := f.fillHook(key); err != nil {
 			return nil, err

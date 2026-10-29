@@ -25,6 +25,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
@@ -77,7 +79,7 @@ func ServeConn(ctx context.Context, conn net.Conn, src ServerSource, timeout tim
 			return
 		}
 		switch hdr[3] {
-		case MsgBlockReq, MsgBlockPush, MsgBlockDrop:
+		case MsgBlockReq, MsgRangeReq, MsgBlockPush, MsgBlockDrop:
 		default:
 			_ = sendError(ctx, conn, fmt.Errorf("bad request type 0x%x", hdr[3]), timeout)
 			return
@@ -94,6 +96,8 @@ func ServeConn(ctx context.Context, conn net.Conn, src ServerSource, timeout tim
 		switch hdr[3] {
 		case MsgBlockReq:
 			servData(ctx, conn, src, string(key), timeout)
+		case MsgRangeReq:
+			servRange(ctx, conn, src, string(key), timeout)
 		case MsgBlockPush:
 			servPush(ctx, conn, src, string(key), hdr, timeout)
 		case MsgBlockDrop:
@@ -151,6 +155,83 @@ func servData(ctx context.Context, conn net.Conn, src ServerSource, key string, 
 	if err := serveBlock(ctx, conn, src, key, timeout); err != nil {
 		logger.Debugf("gcache serve %s: %v", key, err)
 	}
+}
+
+// keyOrigSize parses the trailing "_<size>" block size from a plain-mode key
+// (CONTRACT.md §1). Returns 0 when absent or unparseable (hash-prefix keys
+// embed no size). Used to validate ranged requests defensively; the authoritative
+// clamp is the source's own read.
+func keyOrigSize(key string) int64 {
+	i := strings.LastIndexByte(key, '_')
+	if i < 0 {
+		return 0
+	}
+	n, err := strconv.ParseInt(key[i+1:], 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// servRange answers MsgRangeReq(key, off, len) with exactly the requested
+// bytes of the block's raw (decompressed) representation. The owner serves
+// positionally from its cache (LoadCachedRange); on owner miss it fills its
+// designated copy from object storage first (the explicit cache-fill policy:
+// 4 MiB object-storage→owner once, then 4 KiB owner→client per read).
+func servRange(ctx context.Context, conn net.Conn, src ServerSource, key string, timeout time.Duration) {
+	if err := serveRange(ctx, conn, src, key, timeout); err != nil {
+		logger.Debugf("gcache range-serve %s: %v", key, err)
+	}
+}
+
+func serveRange(ctx context.Context, conn net.Conn, src ServerSource, key string, timeout time.Duration) error {
+	var pair [16]byte
+	if err := ctxRead(ctx, conn, pair[:]); err != nil {
+		return err
+	}
+	off := int64(binary.LittleEndian.Uint64(pair[0:8]))
+	n := int64(binary.LittleEndian.Uint64(pair[8:16]))
+	if off < 0 || n <= 0 || n > maxRangePayload {
+		return sendError(ctx, conn, fmt.Errorf("invalid range off=%d len=%d", off, n), timeout)
+	}
+	if size := keyOrigSize(key); size > 0 {
+		if off >= size {
+			return sendError(ctx, conn, fmt.Errorf("range past end of block: off=%d size=%d", off, size), timeout)
+		}
+		if off+n > size {
+			n = size - off
+		}
+	}
+	rs, ok := src.(RangeSource)
+	if !ok {
+		return sendError(ctx, conn, errors.New("range reads not supported by this peer's source"), timeout)
+	}
+	r, err := rs.LoadCachedRange(key, off, n)
+	if errors.Is(err, os.ErrNotExist) {
+		// Owner miss: fill the designated copy from object storage (whole
+		// block, persisted), then serve the range from it.
+		if _, ferr := src.FillFromStorage(withServerFill(ctx), key); ferr != nil {
+			return sendError(ctx, conn, ferr, timeout)
+		}
+		r, err = rs.LoadCachedRange(key, off, n)
+	}
+	if err != nil {
+		return sendError(ctx, conn, err, timeout)
+	}
+	defer r.Close()
+	// Read the window (bounded by maxRangePayload). A short read (block ends
+	// inside the window) is served as-is; the client treats plen != requested
+	// as a protocol error and falls back to the full-block path.
+	data := make([]byte, n)
+	read, rerr := io.ReadFull(r, data)
+	if rerr != nil && !errors.Is(rerr, io.ErrUnexpectedEOF) && !errors.Is(rerr, io.EOF) {
+		return sendError(ctx, conn, fmt.Errorf("read cached range: %w", rerr), timeout)
+	}
+	observeRangeServe(int(n))
+	if err := writeResp(ctx, conn, WireRaw, bytes.NewReader(data[:read]), timeout); err != nil {
+		return fmt.Errorf("write range response: %w", err)
+	}
+	return nil
 }
 
 func serveBlock(ctx context.Context, conn net.Conn, src ServerSource, key string, timeout time.Duration) error {

@@ -108,6 +108,8 @@ type runResult struct {
 
 var errRangeUnsupported = errors.New("--range needs a build with ranged peer reads (MsgRangeReq)")
 
+var _ = errRangeUnsupported // referenced until wired (kept for build ordering)
+
 func splitInts(s string) []int {
 	var out []int
 	for _, f := range strings.Split(s, ",") {
@@ -162,6 +164,19 @@ func (c *countSource) StorePushed(ctx context.Context, k string, d []byte) error
 }
 func (c *countSource) DropCached(key string) error { return c.inner.DropCached(key) }
 
+// LoadCachedRange forwards the optional RangeSource when the inner source
+// implements it; otherwise the ranged request is answered "not cached" and
+// the owner-side fill path applies.
+func (c *countSource) LoadCachedRange(key string, off, limit int64) (io.ReadCloser, error) {
+	rs, ok := c.inner.(interface {
+		LoadCachedRange(string, int64, int64) (io.ReadCloser, error)
+	})
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return rs.LoadCachedRange(key, off, limit)
+}
+
 type byteReader struct{ b []byte }
 
 func (r *byteReader) Read(p []byte) (int, error) {
@@ -174,40 +189,105 @@ func (r *byteReader) Read(p []byte) (int, error) {
 }
 
 // memSource serves preloaded blocks from RAM (pure protocol/transport cost).
+// Cold fills are synthesized and kept under a cap (oldest evicted, preloaded
+// keys exempt) so --unique cold-owner runs cannot grow without bound.
 type memSource struct {
-	blocks map[string][]byte
-	algo   string
+	mu        sync.Mutex
+	blocks    map[string][]byte
+	algo      string
+	preloaded map[string]bool
+	order     []string // fill order, for eviction
+	cap       int
 }
 
 func newMemSource(blocks, blocksize int) *memSource {
-	m := &memSource{blocks: make(map[string][]byte, blocks), algo: "none"}
+	m := &memSource{
+		blocks:    make(map[string][]byte, blocks),
+		algo:      "none",
+		preloaded: make(map[string]bool, blocks),
+		cap:       blocks * 2,
+	}
 	for i := 0; i < blocks; i++ {
+		key := fmt.Sprintf("bench-key-%d", i)
 		b := make([]byte, blocksize)
 		for j := range b {
 			b[j] = byte(i + j) // non-degenerate content
 		}
-		m.blocks[fmt.Sprintf("bench-key-%d", i)] = b
+		m.blocks[key] = b
+		m.preloaded[key] = true
 	}
 	return m
 }
 
 func (m *memSource) LoadCached(key string) (io.ReadCloser, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if b, ok := m.blocks[key]; ok {
 		return io.NopCloser(&byteReader{b: b}), nil
 	}
 	return nil, os.ErrNotExist
 }
 func (m *memSource) FillFromStorage(_ context.Context, key string) (io.ReadCloser, error) {
-	return m.LoadCached(key)
+	// Model "object storage has it, owner didn't": synthesize deterministic
+	// content on fill (the owner's cache then serves it warm). Holds m.mu
+	// throughout; do NOT call the locking LoadCached from here (sync.Mutex
+	// is not reentrant).
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.blocks[key]; !ok {
+		b := make([]byte, 4<<20)
+		h := uint64(14695981039346656037)
+		for _, c := range []byte(key) {
+			h = (h ^ uint64(c)) * 1099511628211
+		}
+		for i := range b {
+			h = h*6364136223846793005 + 1442695040888963407
+			b[i] = byte(h >> 33)
+		}
+		m.blocks[key] = b
+		m.order = append(m.order, key)
+		for len(m.order) > m.cap { // evict oldest fills
+			old := m.order[0]
+			m.order = m.order[1:]
+			if !m.preloaded[old] {
+				delete(m.blocks, old)
+			}
+		}
+	}
+	b := m.blocks[key]
+	return io.NopCloser(&byteReader{b: b}), nil
+}
+
+// LoadCachedRange: positional window over the RAM block (RangeSource).
+func (m *memSource) LoadCachedRange(key string, off, limit int64) (io.ReadCloser, error) {
+	b, ok := m.blocks[key]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	if off >= int64(len(b)) {
+		return nil, fmt.Errorf("offset %d past end of %s (%d bytes)", off, key, len(b))
+	}
+	end := off + limit
+	if end > int64(len(b)) {
+		end = int64(len(b))
+	}
+	return io.NopCloser(&byteReader{b: b[off:end]}), nil
 }
 func (m *memSource) CompressAlgo() string                     { return m.algo }
 func (m *memSource) CompressBound(n int) int                  { return n }
 func (m *memSource) CompressPayload(d, s []byte) (int, error) { return copy(d, s), nil }
 func (m *memSource) StorePushed(_ context.Context, key string, data []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.blocks[key] = append([]byte(nil), data...)
 	return nil
 }
-func (m *memSource) DropCached(key string) error { delete(m.blocks, key); return nil }
+func (m *memSource) DropCached(key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.blocks, key)
+	return nil
+}
 
 // fileSource serves a real file's ranges via pread — models an owner's
 // NVMe-resident block. With O_DIRECT it is genuine device IO; otherwise the
@@ -240,6 +320,22 @@ func (s *fileSource) LoadCached(_ string) (io.ReadCloser, error) {
 }
 func (s *fileSource) FillFromStorage(ctx context.Context, key string) (io.ReadCloser, error) {
 	return s.LoadCached(key)
+}
+
+// LoadCachedRange: positional pread — the owner-NVMe model (RangeSource).
+func (s *fileSource) LoadCachedRange(key string, off, limit int64) (io.ReadCloser, error) {
+	if off >= s.size {
+		return nil, fmt.Errorf("offset %d past end of %s (%d bytes)", off, key, s.size)
+	}
+	n := limit
+	if off+n > s.size {
+		n = s.size - off
+	}
+	buf := make([]byte, n)
+	if err := s.preadAt(buf, off); err != nil {
+		return nil, err
+	}
+	return io.NopCloser(&byteReader{b: buf}), nil
 }
 func (s *fileSource) CompressAlgo() string                     { return "none" }
 func (s *fileSource) CompressBound(n int) int                  { return n }
@@ -358,8 +454,9 @@ func (p *peerClient) readAt(buf []byte, off int64, rnd *rand.Rand) error {
 	return nil
 }
 
-func (p *peerClient) rangeAt(_ string, _ int64, _ []byte) error {
-	return errRangeUnsupported // replaced by the ranged-read commit
+func (p *peerClient) rangeAt(key string, off int64, buf []byte) error {
+	_, err := p.rc.RangeRead(context.Background(), p.group, key, off, buf, p.members)
+	return err
 }
 
 // ---------------------------------------------------------------- read cmd
@@ -467,16 +564,18 @@ func runOnce(backend, addr, path string, useRange bool, length, qd, batch int, s
 
 	if batch > 0 {
 		// inference workload: rounds of `batch` concurrent reads; round wall
-		// time captures slowest-request (straggler) effects.
-		rnd := rand.New(rand.NewSource(seed))
+		// time captures slowest-request (straggler) effects. Each worker owns
+		// an RNG (rand.Rand is not goroutine-safe).
 		bufs := make([][]byte, batch)
+		rngs := make([]*rand.Rand, batch)
 		for i := range bufs {
 			bufs[i] = alignedBuf(length)
+			rngs[i] = rand.New(rand.NewSource(seed + int64(i)))
 		}
 		for time.Now().Before(deadline) {
 			offs := make([]int64, batch)
 			for i := range offs {
-				offs[i] = pickOff(rnd)
+				offs[i] = pickOff(rngs[i])
 			}
 			start := time.Now()
 			var wg sync.WaitGroup
@@ -485,7 +584,7 @@ func runOnce(backend, addr, path string, useRange bool, length, qd, batch int, s
 				go func(i int) {
 					defer wg.Done()
 					s := time.Now()
-					if err := reader(bufs[i], offs[i], rnd); err != nil {
+					if err := reader(bufs[i], offs[i], rngs[i]); err != nil {
 						errs.Add(1)
 					} else {
 						d := float64(time.Since(s).Microseconds())

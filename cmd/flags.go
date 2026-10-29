@@ -323,6 +323,10 @@ func dataCacheFlags() []cli.Flag {
 			Name:  "fill-group-cache",
 			Usage: "send uploaded blocks to their cache group owners (best-effort, no guarantee)",
 		},
+		&cli.BoolFlag{
+			Name:  "peer-range-read",
+			Usage: "serve small random reads (<= blocksize/4) positionally from the cache-group owner's cached block instead of fetching whole blocks; falls back to the standard paths on any error (fork extension, see docs/LOW_LATENCY_CACHE_REVIEW.md)",
+		},
 	})
 }
 
