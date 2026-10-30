@@ -22,6 +22,17 @@
 // no POSIX semantics promises; see the deployment guide for the exact
 // guarantees and invalidation behavior.
 //
+// Identity & isolation (review hardening):
+//   - the caller's uid/gid/pid is taken from SO_PEERCRED and used for the
+//     metadata context, so the mount's own permission model applies to every
+//     open (never run as root unless the CALLER is root);
+//   - non-Linux or non-unix-socket connections are closed immediately;
+//   - handles are scoped per connection — an id from one connection is
+//     invalid on another — and a disconnect closes that connection's
+//     remaining handles;
+//   - the socket should still be owned by the intended service account
+//     (mode 0660 alone is not user-level authorization).
+//
 // Wire format (little-endian):
 //
 //	request:  op u8 | rid u32 | plen u32 | body[plen]
@@ -65,8 +76,12 @@ const (
 // Limits.
 const (
 	MaxReadLen = 4 << 20 // per single ReadAt / batch entry
-	// MaxBatchSize bounds one BatchReadAt request.
+	// MaxBatchSize bounds one BatchReadAt request entry count.
 	MaxBatchSize = 256
+	// MaxBatchBytes bounds the aggregate requested bytes of one batch
+	// (review finding 1: capacity must follow actual lengths, and a single
+	// batch must not be able to pin an unbounded response buffer).
+	MaxBatchBytes = 32 << 20
 	// handleIdleTTL closes handles idle past it (leak guard).
 	handleIdleTTL = 10 * time.Minute
 	// frameTimeout bounds one request/response exchange.
@@ -87,10 +102,73 @@ type Backend interface {
 }
 
 type handleEntry struct {
-	f       handleFile
-	size    int64
-	path    string
-	lastUse atomic.Int64 // unix nanos
+	f        handleFile
+	size     int64
+	path     string
+	lastUse  atomic.Int64 // unix nanos
+}
+
+// connState holds one connection's handles. Handle ids are scoped per
+// connection (review finding 4): an id observed on another connection is
+// invalid, and disconnect closes everything the connection left open.
+type connState struct {
+	mu      sync.Mutex
+	handles map[uint64]*handleEntry
+	next    uint64
+}
+
+func newConnState() *connState {
+	return &connState{handles: make(map[uint64]*handleEntry)}
+}
+
+func (cs *connState) put(f handleFile, size int64, path string) uint64 {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.next++
+	id := cs.next
+	cs.handles[id] = &handleEntry{f: f, size: size, path: path, lastUse: atomic.Int64{}}
+	cs.handles[id].lastUse.Store(time.Now().UnixNano())
+	return id
+}
+
+func (cs *connState) get(id uint64) (*handleEntry, bool) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	e, ok := cs.handles[id]
+	if ok {
+		e.lastUse.Store(time.Now().UnixNano())
+	}
+	return e, ok
+}
+
+func (cs *connState) remove(id uint64) (*handleEntry, bool) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	e, ok := cs.handles[id]
+	if ok {
+		delete(cs.handles, id)
+	}
+	return e, ok
+}
+
+func (cs *connState) closeIdle(now time.Time) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	for id, e := range cs.handles {
+		if now.UnixNano()-e.lastUse.Load() > handleIdleTTL.Nanoseconds() {
+			_ = e.f.Close(openCtxFor(0, 0, 0))
+			delete(cs.handles, id)
+		}
+	}
+}
+
+func (cs *connState) closeAll() {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	for id, e := range cs.handles {
+		_ = e.f.Close(openCtxFor(0, 0, 0))
+		delete(cs.handles, id)
+	}
 }
 
 // Server serves the read protocol over one listener (typically a unix
@@ -98,9 +176,8 @@ type handleEntry struct {
 type Server struct {
 	backend Backend
 
-	mu      sync.Mutex
-	handles map[uint64]*handleEntry
-	next    atomic.Uint64
+	mu    sync.Mutex
+	conns map[*connState]struct{}
 
 	sockPath string
 	closed   atomic.Bool
@@ -110,7 +187,7 @@ type Server struct {
 func NewServer(backend Backend, sockPath string) *Server {
 	return &Server{
 		backend:  backend,
-		handles:  make(map[uint64]*handleEntry),
+		conns:    make(map[*connState]struct{}),
 		sockPath: sockPath,
 	}
 }
@@ -160,24 +237,45 @@ func (s *Server) reapIdle(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		now := time.Now().UnixNano()
+		now := time.Now()
 		s.mu.Lock()
-		for id, e := range s.handles {
-			if now-e.lastUse.Load() > handleIdleTTL.Nanoseconds() {
-				_ = e.f.Close(openCtx())
-				delete(s.handles, id)
-			}
+		conns := make([]*connState, 0, len(s.conns))
+		for cs := range s.conns {
+			conns = append(conns, cs)
 		}
 		s.mu.Unlock()
+		for _, cs := range conns {
+			cs.closeIdle(now)
+		}
 	}
 }
 
-// openCtx: requests run with the mount's own identity (the mount already
-// authenticated; the socket is local and mode 0660 by default).
-func openCtx() meta.Context { return meta.NewContext(uint32(os.Getpid()), 0, []uint32{0}) }
+// openCtxFor builds the request context from the CALLER's SO_PEERCRED
+// identity, so the mount's permission model governs every open (review
+// finding 4: never serve reads as root unless the caller is root).
+func openCtxFor(uid, gid, pid uint32) meta.Context {
+	return meta.NewContext(pid, uid, []uint32{gid})
+}
 
 func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
+	uid, gid, pid, ok := peerCreds(conn)
+	if !ok {
+		// Unauthenticated transport (non-unix socket, or non-Linux build):
+		// refuse rather than fall back to a privileged identity.
+		return
+	}
+	mctx := openCtxFor(uid, gid, pid)
+	cs := newConnState()
+	s.mu.Lock()
+	s.conns[cs] = struct{}{}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.conns, cs)
+		s.mu.Unlock()
+		cs.closeAll() // disconnect closes leaked handles
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -189,7 +287,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		if err != nil {
 			return
 		}
-		resp := s.dispatch(op, rid, body)
+		resp := s.dispatch(cs, mctx, op, rid, body)
 		_ = conn.SetWriteDeadline(time.Now().Add(frameTimeout))
 		if err := writeResponse(conn, resp); err != nil {
 			return
@@ -197,22 +295,22 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func (s *Server) dispatch(op uint8, rid uint32, body []byte) response {
+func (s *Server) dispatch(cs *connState, mctx meta.Context, op uint8, rid uint32, body []byte) response {
 	switch op {
 	case OpOpen:
-		return s.handleOpen(rid, body)
+		return s.handleOpen(cs, mctx, rid, body)
 	case OpReadAt:
-		return s.handleReadAt(rid, body)
+		return s.handleReadAt(cs, mctx, rid, body)
 	case OpBatch:
-		return s.handleBatch(rid, body)
+		return s.handleBatch(cs, mctx, rid, body)
 	case OpClose:
-		return s.handleClose(rid, body)
+		return s.handleClose(cs, mctx, rid, body)
 	default:
 		return errResponse(rid, 0, fmt.Sprintf("unknown op 0x%x", op))
 	}
 }
 
-func (s *Server) handleOpen(rid uint32, body []byte) response {
+func (s *Server) handleOpen(cs *connState, mctx meta.Context, rid uint32, body []byte) response {
 	if len(body) < 2 {
 		return errResponse(rid, 0, "malformed open")
 	}
@@ -221,32 +319,18 @@ func (s *Server) handleOpen(rid uint32, body []byte) response {
 		return errResponse(rid, 0, "malformed open path")
 	}
 	path := string(body[2 : 2+n])
-	f, size, err := s.backend.Open(openCtx(), path)
+	f, size, err := s.backend.Open(mctx, path)
 	if err != nil {
 		return errResponse(rid, 0, err.Error())
 	}
-	id := s.next.Add(1)
-	s.mu.Lock()
-	s.handles[id] = &handleEntry{f: f, size: size, path: path, lastUse: atomic.Int64{}}
-	s.handles[id].lastUse.Store(time.Now().UnixNano())
-	s.mu.Unlock()
+	id := cs.put(f, size, path)
 	buf := make([]byte, 16)
 	binary.LittleEndian.PutUint64(buf[0:8], id)
 	binary.LittleEndian.PutUint64(buf[8:16], uint64(size))
 	return response{rid: rid, status: 0, body: buf}
 }
 
-func (s *Server) getHandle(id uint64) (*handleEntry, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	e, ok := s.handles[id]
-	if ok {
-		e.lastUse.Store(time.Now().UnixNano())
-	}
-	return e, ok
-}
-
-func (s *Server) handleReadAt(rid uint32, body []byte) response {
+func (s *Server) handleReadAt(cs *connState, mctx meta.Context, rid uint32, body []byte) response {
 	if len(body) != 20 {
 		return errResponse(rid, 0, "malformed readat")
 	}
@@ -256,12 +340,12 @@ func (s *Server) handleReadAt(rid uint32, body []byte) response {
 	if length > MaxReadLen {
 		return errResponse(rid, 0, fmt.Sprintf("read %d exceeds limit %d", length, MaxReadLen))
 	}
-	e, ok := s.getHandle(id)
+	e, ok := cs.get(id)
 	if !ok {
 		return errResponse(rid, 0, "bad handle")
 	}
 	buf := make([]byte, length)
-	n, err := e.f.Pread(openCtx(), buf, off)
+	n, err := e.f.Pread(mctx, buf, off)
 	if err != nil && n == 0 {
 		return errResponse(rid, 0, err.Error())
 	}
@@ -271,7 +355,7 @@ func (s *Server) handleReadAt(rid uint32, body []byte) response {
 	return resp
 }
 
-func (s *Server) handleBatch(rid uint32, body []byte) response {
+func (s *Server) handleBatch(cs *connState, mctx meta.Context, rid uint32, body []byte) response {
 	if len(body) < 2 {
 		return errResponse(rid, 0, "malformed batch")
 	}
@@ -285,6 +369,10 @@ func (s *Server) handleBatch(rid uint32, body []byte) response {
 		n   int
 	}
 	entries := make([]entry, n)
+	// Review finding 1: size the response from the ACTUAL requested lengths
+	// (never 5+MaxReadLen per entry) and enforce an aggregate budget before
+	// touching any handle.
+	aggregate := 0
 	for i := 0; i < n; i++ {
 		b := body[2+i*20 : 2+(i+1)*20]
 		entries[i] = entry{
@@ -292,18 +380,29 @@ func (s *Server) handleBatch(rid uint32, body []byte) response {
 			off: int64(binary.LittleEndian.Uint64(b[8:16])),
 			n:   int(binary.LittleEndian.Uint32(b[16:20])),
 		}
+		l := entries[i].n
+		if l > MaxReadLen {
+			l = 0 // oversized entries answer with an empty error body
+		}
+		if l > 0 {
+			aggregate += 5 + l
+		} else {
+			aggregate += 5
+		}
 	}
-	// response body: n u16 then per-entry {status u8, len u32, data}
-	out := make([]byte, 2, 2+n*(5+MaxReadLen))
+	if aggregate > MaxBatchBytes {
+		return errResponse(rid, 0, fmt.Sprintf("batch aggregate %d exceeds %d", aggregate, MaxBatchBytes))
+	}
+	out := make([]byte, 2, 2+aggregate)
 	binary.LittleEndian.PutUint16(out[0:2], uint16(n))
 	for _, e := range entries {
 		var st byte = 0
 		var data []byte
 		if e.n > MaxReadLen {
 			st = 1
-		} else if h, ok := s.getHandle(e.id); ok {
+		} else if h, ok := cs.get(e.id); ok {
 			buf := make([]byte, e.n)
-			got, err := h.f.Pread(openCtx(), buf, e.off)
+			got, err := h.f.Pread(mctx, buf, e.off)
 			if err != nil && got == 0 {
 				st = 1
 			} else {
@@ -324,21 +423,16 @@ func (s *Server) handleBatch(rid uint32, body []byte) response {
 	return response{rid: rid, status: 0, body: out}
 }
 
-func (s *Server) handleClose(rid uint32, body []byte) response {
+func (s *Server) handleClose(cs *connState, mctx meta.Context, rid uint32, body []byte) response {
 	if len(body) != 8 {
 		return errResponse(rid, 0, "malformed close")
 	}
 	id := binary.LittleEndian.Uint64(body)
-	s.mu.Lock()
-	e, ok := s.handles[id]
-	if ok {
-		delete(s.handles, id)
-	}
-	s.mu.Unlock()
+	e, ok := cs.remove(id)
 	if !ok {
 		return errResponse(rid, 0, "bad handle")
 	}
-	if eno := e.f.Close(openCtx()); eno != 0 {
+	if eno := e.f.Close(mctx); eno != 0 {
 		return errResponse(rid, 0, eno.Error())
 	}
 	return response{rid: rid, status: 0}

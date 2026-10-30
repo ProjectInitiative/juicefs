@@ -31,9 +31,19 @@ $LB read --backend fuse --path "$FILE" --len 4096 --batch 70 --secs 20 --drop-ca
 
 echo "== 4) peer transport (run latencybench serve on a peer node first) =="
 # on peer: ./latencybench serve --addr 0.0.0.0:13910 --src file --file /nvme/block.bin --direct
+# full-block path (pre-change baseline):
 for qd in 1 8 32 64 128; do
-  $LB read --backend peer --addr PEER:13910 --len 4096 --qd $qd --secs 10 --out "$OUT/lb-peer-tcp.json"
+  $LB read --backend peer --addr PEER:13910 --len 4096 --qd $qd --secs 10 --out "$OUT/lb-peer-tcp-fullblock.json"
 done
-$LB read --backend peer --addr PEER:13910 --len 4096 --batch 70 --secs 20 --out "$OUT/lb-peer-infer.json"
+$LB read --backend peer --addr PEER:13910 --len 4096 --batch 70 --secs 20 --out "$OUT/lb-peer-infer-fullblock.json"
+# ranged path (--range is REQUIRED for the fast-path protocol):
+for qd in 1 8 32 64 128; do
+  $LB read --backend peer --addr PEER:13910 --range --len 4096 --qd $qd --secs 10 --out "$OUT/lb-peer-tcp-range.json"
+done
+$LB read --backend peer --addr PEER:13910 --range --len 4096 --batch 70 --secs 20 --out "$OUT/lb-peer-infer-range.json"
+# RDMA (build latencybench with: go build -tags rdma; rping must pass first):
+for qd in 1 8 32 64 128; do
+  $LB read --backend peer --addr PEER:13910 --range --len 4096 --qd $qd --secs 10 --rdma --out "$OUT/lb-peer-rdma-range.json"
+done
 
 echo "Results in $OUT"

@@ -209,10 +209,15 @@ func serveRange(ctx context.Context, conn net.Conn, src ServerSource, key string
 	r, err := rs.LoadCachedRange(key, off, n)
 	if errors.Is(err, os.ErrNotExist) {
 		// Owner miss: fill the designated copy from object storage (whole
-		// block, persisted), then serve the range from it.
-		if _, ferr := src.FillFromStorage(withServerFill(ctx), key); ferr != nil {
+		// block, persisted), then serve the range from it. The fill returns
+		// a reader over the now-cached block — redundant here, and its file
+		// descriptor leaks if not closed (review finding: repeated cold
+		// fills must not grow resources).
+		fr, ferr := src.FillFromStorage(withServerFill(ctx), key)
+		if ferr != nil {
 			return sendError(ctx, conn, ferr, timeout)
 		}
+		_ = fr.Close()
 		r, err = rs.LoadCachedRange(key, off, n)
 	}
 	if err != nil {

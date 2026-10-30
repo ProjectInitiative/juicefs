@@ -40,6 +40,10 @@ type fakeSource struct {
 	pushCnt  map[string]int
 	dropCnt  map[string]int
 	rangeCnt map[string]int
+	// fillCloses counts Close() calls on readers returned by FillFromStorage
+	// (regression guard: the ranged-serve cold path must close the fill
+	// reader or its file descriptor leaks per cold fill).
+	fillCloses int
 	// rangeMiss models "block exists in object storage but is not cached
 	// locally": LoadCachedRange reports ErrNotExist until a fill lands.
 	rangeMiss map[string]bool
@@ -102,9 +106,20 @@ func (f *fakeSource) FillFromStorage(_ context.Context, key string) (io.ReadClos
 		}
 	}
 	if b, ok := f.blocks[key]; ok {
-		return io.NopCloser(bytes.NewReader(b)), nil
+		return &countingCloser{ReadCloser: io.NopCloser(bytes.NewReader(b)), cnt: &f.fillCloses}, nil
 	}
 	return nil, errors.New("no such block in storage")
+}
+
+// countingCloser counts Close() calls (fill-reader cleanup regression).
+type countingCloser struct {
+	io.ReadCloser
+	cnt *int
+}
+
+func (c *countingCloser) Close() error {
+	*c.cnt++
+	return c.ReadCloser.Close()
 }
 
 func (f *fakeSource) CompressAlgo() string { return f.algo }

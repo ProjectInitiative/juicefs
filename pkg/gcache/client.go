@@ -524,13 +524,18 @@ func (c *RingClient) RangeRead(ctx context.Context, group, key string, off int64
 		}
 		return 0, ErrNoMembers
 	}
+	// Self-ownership FIRST: candidate() skips self, so checking ownership
+	// only after it returns would route a locally-owned key to a non-owner
+	// peer — that peer would then fill and persist a copy belonging here
+	// (strict one-copy sharding violation, DEC-0050).
+	if owners := Owners(key, members, 1); len(owners) > 0 && owners[0].UUID == c.selfUUID {
+		return 0, errSelfOwned
+	}
 	m := c.candidate(key, members, c.selfUUID)
 	if m == nil {
-		// distinguish self-owned (serve locally) from all-evicted
-		owners := Owners(key, members, 1)
-		if len(owners) > 0 && owners[0].UUID == c.selfUUID {
-			return 0, errSelfOwned
-		}
+		// no non-evicted non-self member: the true owner is either evicted
+		// or unreachable — the caller falls back to the standard paths
+		// (identical placement to the full-block Fetch path).
 		return 0, errNoOwners
 	}
 	peer := m.Addr

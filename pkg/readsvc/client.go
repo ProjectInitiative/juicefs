@@ -154,6 +154,14 @@ func (h *Handle) BatchReadAt(bufs [][]byte, offs []int64) ([]int, error) {
 	if len(bufs) > MaxBatchSize {
 		return nil, fmt.Errorf("batch of %d exceeds %d", len(bufs), MaxBatchSize)
 	}
+	// aggregate budget (mirrors the server's check — fail fast client-side)
+	total := 0
+	for i := range bufs {
+		total += len(bufs[i])
+	}
+	if total > MaxBatchBytes {
+		return nil, fmt.Errorf("batch aggregate %d exceeds %d", total, MaxBatchBytes)
+	}
 	body := make([]byte, 0, 2+len(bufs)*20)
 	body = binary.LittleEndian.AppendUint16(body, uint16(len(bufs)))
 	for i := range bufs {

@@ -420,9 +420,17 @@ type peerClient struct {
 	uniqueN  atomic.Int64
 }
 
-func newPeer(addr string, keys, bs int, useRange, unique bool, timeout time.Duration) *peerClient {
+func newPeer(addr string, keys, bs int, useRange, unique, useRDMA bool, timeout time.Duration) *peerClient {
+	rc := gcache.NewRingClient(timeout, 31, "latencybench")
+	if useRDMA {
+		rt, err := gcache.DialRDMA()
+		if err != nil {
+			fatalf("--rdma unavailable: %v (build with -tags rdma and install rdma-core)", err)
+		}
+		rc.SetRDMA(rt)
+	}
 	return &peerClient{
-		rc:       gcache.NewRingClient(timeout, 31, "latencybench"),
+		rc:       rc,
 		members:  []gcache.Member{{UUID: "peer", Addr: addr}},
 		group:    "bench",
 		keys:     keys,
@@ -470,6 +478,7 @@ func cmdRead(args []string) {
 	addr := fs.String("addr", "", "peer host:port (backend=peer)")
 	path := fs.String("path", "", "file path (backend=fuse|nvme)")
 	useRange := fs.Bool("range", false, "use ranged peer reads (MsgRangeReq) instead of full-block fetch")
+	useRDMA := fs.Bool("rdma", false, "peer mode: dial the peer via rsockets (requires the -tags rdma build; TCP fallback stays active on failure)")
 	lens := fs.String("len", "4096", "comma list of request sizes")
 	qds := fs.String("qd", "1", "comma list of queue depths")
 	batch := fs.Int("batch", 0, "if >0: batched rounds of this many concurrent reads instead of steady QD")
@@ -484,11 +493,21 @@ func cmdRead(args []string) {
 	timeout := fs.Duration("timeout", 10*time.Second, "peer request timeout")
 	_ = fs.Parse(args)
 
-	if *backend != "peer" && *path == "" {
-		fatalf("--path required for backend=%s", *backend)
-	}
-	if *backend == "peer" && *addr == "" {
-		fatalf("--addr required for backend=peer")
+	switch *backend {
+	case "peer":
+		if *addr == "" {
+			fatalf("--addr required for backend=peer")
+		}
+	case "readsvc":
+		if *sockPath == "" || *openPath == "" {
+			fatalf("--sock and --open-path required for backend=readsvc")
+		}
+	case "nvme", "fuse":
+		if *path == "" {
+			fatalf("--path required for backend=%s", *backend)
+		}
+	default:
+		fatalf("unknown backend %q", *backend)
 	}
 
 	var results []runResult
@@ -500,7 +519,7 @@ func cmdRead(args []string) {
 
 	for _, ln := range splitInts(*lens) {
 		for _, qd := range splitInts(*qds) {
-			res := runOnce(*backend, *addr, *path, *useRange, ln, qd, *batch, *secs,
+			res := runOnce(*backend, *addr, *path, *useRange, *useRDMA, ln, qd, *batch, *secs,
 				*keys, *bs, *unique, *direct, *drop, *seed, *timeout, *sockPath, *openPath)
 			results = append(results, res)
 			printTable(res)
@@ -514,7 +533,7 @@ func cmdRead(args []string) {
 	}
 }
 
-func runOnce(backend, addr, path string, useRange bool, length, qd, batch int, secs float64,
+func runOnce(backend, addr, path string, useRange, useRDMA bool, length, qd, batch int, secs float64,
 	keys, bs int, unique, direct, drop bool, seed int64, timeout time.Duration,
 	sockPath, openPath string) runResult {
 
@@ -551,7 +570,7 @@ func runOnce(backend, addr, path string, useRange bool, length, qd, batch int, s
 		}, done: func() {}}
 		setupWorker = func(int) *readWorker { return shared }
 	case "peer":
-		pr = newPeer(addr, keys, bs, useRange, unique, timeout)
+		pr = newPeer(addr, keys, bs, useRange, unique, useRDMA, timeout)
 		shared := &readWorker{read: pr.readAt, done: func() {}}
 		setupWorker = func(int) *readWorker { return shared }
 	case "readsvc":
@@ -694,7 +713,7 @@ func runOnce(backend, addr, path string, useRange bool, length, qd, batch int, s
 	}
 	res.Errors = errs.Load()
 	if backend == "peer" {
-		res.Transport = "tcp"
+		res.Transport = map[bool]string{true: "rsocket", false: "tcp"}[useRDMA]
 	}
 	return res
 }

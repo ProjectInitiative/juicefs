@@ -306,3 +306,73 @@ func TestRangeReadSourceWithoutRange(t *testing.T) {
 		t.Fatalf("unexpected error text: %v", err)
 	}
 }
+
+// Regression (review finding 2): a locally-owned key must return
+// errSelfOwned WITHOUT contacting any peer. candidate() skips self, so the
+// ownership check has to run first or the request would be routed to a
+// non-owner peer that would fill+persist a copy belonging here (strict
+// one-copy sharding violation).
+func TestRangeReadSelfOwnedNotRoutedToNonOwner(t *testing.T) {
+	src := newFakeSource("none")
+	block := make([]byte, 1<<20)
+	key := serveRangeKey(7, 0, len(block))
+	src.blocks[key] = block
+	addr, stop := listenerWithSrc(t, src, 5*time.Second)
+	defer stop()
+
+	rc := NewRingClient(time.Second, 31, "self-test")
+	// two members: self + a live peer. Find a key whose rendezvous owner is
+	// self (deterministic search over the HRW scores).
+	members := []Member{
+		{UUID: "self-test", Addr: "127.0.0.1:1"},
+		{UUID: "peer-1", Addr: addr},
+	}
+	var selfKey string
+	for i := 0; i < 10000; i++ {
+		k := fmt.Sprintf("self-owned-%d", i)
+		if o := Owners(k, members, 1); len(o) > 0 && o[0].UUID == "self-test" {
+			selfKey = k
+			break
+		}
+	}
+	if selfKey == "" {
+		t.Fatal("no self-owned key found (impossible with 10k candidates)")
+	}
+	if _, err := rc.RangeRead(context.Background(), "g", selfKey, 0, make([]byte, 4096), members); !errors.Is(err, errSelfOwned) {
+		t.Fatalf("want errSelfOwned for locally-owned key, got %v", err)
+	}
+	// the peer must never have been contacted
+	if src.rangeCnt[selfKey] != 0 || src.fillCnt[selfKey] != 0 {
+		t.Fatalf("self-owned key was routed to a non-owner peer (rangeCnt=%d fillCnt=%d)",
+			src.rangeCnt[selfKey], src.fillCnt[selfKey])
+	}
+}
+
+// Regression (review finding 3): the cold-fill path must close the reader
+// returned by FillFromStorage, or its descriptor leaks per cold fill.
+func TestRangeReadColdFillClosesReader(t *testing.T) {
+	src := newFakeSource("none")
+	block := make([]byte, 1<<20)
+	key := serveRangeKey(8, 0, len(block))
+	src.blocks[key] = block
+	src.rangeMiss[key] = true // cold: fill required
+	addr, stop := listenerWithSrc(t, src, 5*time.Second)
+	defer stop()
+
+	rc := NewRingClient(time.Second, 31, "self-test")
+	members := []Member{{UUID: "peer-1", Addr: addr}}
+	if got := mustRangeRead(t, rc, key, 0, 4096, members); string(got) != string(block[0:4096]) {
+		t.Fatal("cold fill content mismatch")
+	}
+	if src.fillCnt[key] != 1 {
+		t.Fatalf("want 1 fill, got %d", src.fillCnt[key])
+	}
+	if src.fillCloses != 1 {
+		t.Fatalf("fill reader leaked: %d closes for 1 fill", src.fillCloses)
+	}
+	// warm re-read: no new fill, no new closes
+	_ = mustRangeRead(t, rc, key, 4096, 4096, members)
+	if src.fillCnt[key] != 1 || src.fillCloses != 1 {
+		t.Fatalf("warm read re-filled or re-closed: fills=%d closes=%d", src.fillCnt[key], src.fillCloses)
+	}
+}

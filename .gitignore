@@ -48,3 +48,6 @@ test*.bak
 dist/
 juicefs.egg-info/
 pkg/meta/jfs-load-dump/latencybench
+
+# fork build artifact (tools/latencybench)
+/latencybench

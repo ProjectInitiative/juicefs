@@ -133,6 +133,30 @@ pre-existing paths (S3 range read or full-block load). Counters: `blockcache_pee
 
 ---
 
+## 2a. Review hardening pass (external code review response)
+
+An external review of the branch found five issues. All five are fixed on this branch with
+regression tests; none required architectural changes.
+
+| # | Finding | Fix | Regression test |
+|---|---|---|---|
+| 1 | `readsvc.handleBatch` reserved `2+n*(5+MaxReadLen)` response capacity — ≈280 MiB for 70 small reads, ≈1 GiB at 256 entries | response buffer sized from the **actual** requested lengths; new `MaxBatchBytes` (32 MiB) aggregate budget enforced server- and client-side (oversized/invalid entries answer with empty error bodies) | `TestBatchAggregateBudget` (256×4 KiB works; 40×1 MiB rejected) |
+| 2 | `RangeRead` called `candidate()` (which skips self) **before** the ownership check — a locally-owned key was routed to a non-owner peer that would fill+persist a copy violating strict one-copy sharding (DEC-0050) | `Owners(key, members, 1)` self-check runs FIRST ⇒ `errSelfOwned` (caller falls back to the standard self-owned path) before any candidate selection | `TestRangeReadSelfOwnedNotRoutedToNonOwner` (multi-member; asserts the peer was never contacted) |
+| 3 | ranged cold-fill discarded `FillFromStorage`'s returned `io.ReadCloser` — fd/cache-resource leak per cold fill | reader closed immediately after the fill (the block is already persisted); `fakeSource` now counts fill-reader closes | `TestRangeReadColdFillClosesReader` (1 fill ⇒ exactly 1 close; warm reads add none) |
+| 4 | readsvc served reads as UID/GID 0 and used a global sequential handle map (cross-connection handle reference) | caller identity from **SO_PEERCRED** (linux) drives the metadata context — the mount's own permission model governs every open; non-unix/non-Linux connections are refused; handles are **per-connection** (forged ids rejected) and a disconnect closes remaining handles; reaper walks live connections | `TestHandlesScopedPerConnection`, `TestDisconnectClosesHandles` |
+| 5 | benchmark tooling: `--path` wrongly required for readsvc; no RDMA selection (standalone peer bench couldn't test rsockets); docs missing explicit `--range` runs | per-backend validation (`--sock`/`--open-path` for readsvc); new `--rdma` flag dials via the tagged rsockets transport and records `transport: "rsocket"` in results; §6.4 + `sweep.sh` now run explicit full-block vs ranged (and RDMA) matrices | build + vet; harness has no unit tests by design (measures real stack) |
+
+Note on finding 2's residual: when a key's true owner is **evicted**, both the ranged and the
+pre-existing full-block paths may de-facto populate a non-owner peer (identical placement via
+`candidate()`). That is inherent to failover — the server must fill to serve — and is
+unchanged behavior; the fix ensures healthy self-owned keys never leave the node.
+
+Deployment posture per the review: keep `--read-socket` and `--rdma-network` **disabled** and
+validate `--peer-range-read` on a disposable workload until the §6.4 hardware matrix passes.
+Both flags default off.
+
+---
+
 ## 3. Benchmark report
 
 **Environment (dev node):** NixOS, AMD Ryzen AI MAX+ 395 (32 threads), Go 1.25.14 (repo pins
@@ -209,9 +233,9 @@ the binding constraint; B2 (handshake) is secondary on loopback.**
 
 | Suite | Result |
 |---|---|
-| `go test ./pkg/gcache/...` | ok (0.7–1.3 s) — includes 8 new ranged-read tests, 4 pool tests, RDMA negative test |
+| `go test ./pkg/gcache/...` | ok (0.7–1.3 s) — includes 10 ranged-read tests (incl. ownership-routing + fill-close regressions), 4 pool tests, RDMA negative test |
 | `go test ./pkg/chunk/...` | ok (45 s) — includes 5 new peer-range integration tests |
-| `go test ./pkg/readsvc -v` | ok — protocol round-trip, batch, concurrent clients, error paths |
+| `go test ./pkg/readsvc -v` | ok — protocol round-trip, batch, concurrent clients, error paths + hardening suite (per-conn handle scoping, disconnect cleanup, aggregate budget) |
 | `go test ./pkg/gcache -race -run "Range\|Pool\|ServerClient"` | ok |
 | `go build -tags rdma ./pkg/gcache` (against rdma-core 62.0 headers) | ok |
 | `go test -tags rdma ./pkg/gcache -run TestRdmaUnavailableFailsCleanly` | ok (no device ⇒ fast clean failure) |
@@ -300,11 +324,15 @@ also runs the benchmark owner: nothing special — any member serves.
 go build -o latencybench ./tools/latencybench
 # 1) NVMe floor (once per node): fio deploy/bench/randread.fio --filename=<nvme file> --bs=4k --iodepth=1 --output=fio-4k-qd1.json --eta=never
 # 2) peer matrix, node A → node B (B: ./latencybench serve --addr 0.0.0.0:13910 --src file --file /nvme/block.bin --direct):
-./latencybench read --backend peer --addr <B>:13910 --len 4096,16384,65536,4194304 --qd 1,8,32,64,128 --secs 10 --out results-tcp.json
-# 3) same with the RDMA binary mounts + --rdma-network (transport auto-selected):
-#    (repeat step 2; transport recorded in mount logs)
+#    full-block path (pre-change baseline):
+./latencybench read --backend peer --addr <B>:13910 --len 4096,16384,65536,4194304 --qd 1,8,32,64,128 --secs 10 --out results-tcp-fullblock.json
+#    ranged path (the fast path — note --range):
+./latencybench read --backend peer --addr <B>:13910 --range --len 4096,16384,65536 --qd 1,8,32,64,128 --secs 10 --out results-tcp-range.json
+# 3) same two runs with the RDMA binary mounts + --rdma-network (and --rdma on the client; rsockets transport recorded in results):
+./latencybench read --backend peer --addr <B>:13910 --range --len 4096,16384,65536 --qd 1,8,32,64,128 --secs 10 --rdma --out results-rdma-range.json
 # 4) inference batch:
-./latencybench read --backend peer --addr <B>:13910 --len 4096 --batch 70 --secs 20 --out results-infer.json
+./latencybench read --backend peer --addr <B>:13910 --range --len 4096 --batch 70 --secs 20 --out results-infer.json
+./latencybench read --backend peer --addr <B>:13910 --len 4096 --batch 70 --secs 20 --out results-infer-fullblock.json
 # 5) end-to-end FUSE vs readsvc (same mount, same conditions):
 ./latencybench read --backend fuse --path /mnt/jfs/engram/table.bin --len 4096 --qd 8 --secs 10 --drop-cache --out results-fuse.json
 ./latencybench read --backend readsvc --sock /run/jfs-read.sock --open-path /engram/table.bin --len 4096 --qd 8 --secs 10 --out results-readsvc.json
