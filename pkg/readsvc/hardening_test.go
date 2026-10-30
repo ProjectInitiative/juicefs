@@ -18,6 +18,7 @@ package readsvc
 
 import (
 	"context"
+	"encoding/binary"
 	"net"
 	"path/filepath"
 	"sync/atomic"
@@ -193,4 +194,69 @@ func TestBatchAggregateBudget(t *testing.T) {
 			t.Fatalf("entry %d: got %d", i, got[i])
 		}
 	}
+}
+
+// Regression (review round 2, finding E): the aggregate budget counts
+// PAYLOAD bytes on both ends. An exactly-MaxBatchBytes payload must be
+// accepted (8 × MaxReadLen), and the server must reject over-budget
+// requests even when they bypass the client-side check.
+func TestBatchBudgetBoundary(t *testing.T) {
+	if testing.Short() {
+		t.Skip("32MiB working set")
+	}
+	const bs = MaxReadLen // 4 MiB per entry
+	data := make([]byte, 8*bs)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	sockPath, stop := startTestServer(t, map[string][]byte{"/f": data})
+	defer stop()
+
+	c, err := Dial(sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	h, err := c.OpenHandle("/f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// exactly 8 × 4 MiB = 32 MiB payload: the boundary must pass
+	bufs := make([][]byte, 8)
+	offs := make([]int64, 8)
+	for i := range bufs {
+		bufs[i] = make([]byte, bs)
+		offs[i] = int64(i) * bs
+	}
+	got, err := h.BatchReadAt(bufs, offs)
+	if err != nil {
+		t.Fatalf("exactly-budget batch rejected: %v", err)
+	}
+	for i := range got {
+		if got[i] != bs {
+			t.Fatalf("entry %d: got %d", i, got[i])
+		}
+	}
+
+	// server-side rejection of 9 × 4 MiB (client check would also reject;
+	// speak raw frames to reach the server path)
+	c2, err := Dial(sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	h2, err := c2.OpenHandle("/f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := make([]byte, 0, 2+9*20)
+	body = binary.LittleEndian.AppendUint16(body, 9)
+	for i := 0; i < 9; i++ {
+		body = append(body, encEntry(h2, 0, bs)...)
+	}
+	payload, err := c2.call(OpBatch, body)
+	if err == nil {
+		t.Fatal("over-budget batch must be rejected server-side")
+	}
+	_ = payload
 }

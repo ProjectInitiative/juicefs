@@ -2,6 +2,7 @@ package gcache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -44,13 +45,29 @@ const tcpEndpointDialTimeout = 2 * time.Second
 func (c *RingClient) dialFailover(ctx context.Context, m Member) (net.Conn, Transport, error) {
 	c.mu.Lock()
 	st := c.epState[m.Addr]
+	strict := c.strictRDMA
 	c.mu.Unlock()
 
-	if m.RdmaAddr != "" && !(st.rdmaDown && time.Since(st.downAt) < rdmaRetryInterval) {
+	// Strict verification mode (benchmarks/transport checks): RDMA or fail —
+	// never silently degrade to TCP (which would contaminate results).
+	if strict {
+		if c.rdma == nil {
+			return nil, nil, errors.New("strict RDMA: no RDMA transport configured")
+		}
+		if m.RdmaAddr == "" {
+			return nil, nil, fmt.Errorf("strict RDMA: peer %s advertises no RDMA endpoint", m.Addr)
+		}
+	}
+	// Guard c.rdma != nil: a TCP-only client must not panic on a member that
+	// advertises an RDMA endpoint (mixed-version rings).
+	if c.rdma != nil && m.RdmaAddr != "" && !(st.rdmaDown && time.Since(st.downAt) < rdmaRetryInterval) {
 		conn, err := c.rdma.Dial(ctx, m.RdmaAddr)
 		if err == nil {
 			c.clearRdmaDown(m.Addr)
 			return conn, c.rdma, nil
+		}
+		if strict {
+			return nil, nil, fmt.Errorf("strict RDMA: dial %s failed (no TCP fallback): %w", m.RdmaAddr, err)
 		}
 		logger.Warnf("gcache rdma dial %s (%s) failed, falling back to tcp: %v", m.RdmaAddr, c.rdma.Name(), err)
 		c.markRdmaDown(m.Addr)

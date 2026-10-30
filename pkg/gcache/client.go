@@ -43,6 +43,7 @@ type RingClient struct {
 	kick        kickFunc // optional: requests membership refresh
 	tcp         Transport
 	rdma        Transport // nil => TCP-only
+	strictRDMA  bool      // verification mode: no TCP fallback when RDMA configured
 	epState     map[string]endpointState
 	pool        *connPool
 
@@ -167,6 +168,17 @@ func (c *RingClient) SetRDMA(t Transport) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.rdma = t
+}
+
+// SetStrictRDMA disables TCP fallback while RDMA is configured: dials that
+// cannot use RDMA fail instead of silently degrading. This is a verification
+// mode for benchmarks and transport checks — production keeps fallback so
+// reads stay serviceable (review finding A: a labeled "rsocket" result must
+// not be able to hide TCP traffic).
+func (c *RingClient) SetStrictRDMA(v bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.strictRDMA = v
 }
 
 // candidate returns the best non-evicted, non-self member for key, or nil.

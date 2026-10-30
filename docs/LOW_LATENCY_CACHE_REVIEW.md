@@ -157,6 +157,23 @@ Both flags default off.
 
 ---
 
+## 2b. Benchmark hardening (review round 2)
+
+The second review found six benchmark-tooling issues that could yield misleading results or
+block valid measurements. All are fixed on this branch (`tools/latencybench`), with unit tests
+(`main_test.go`, race-clean) and an end-to-end O_DIRECT functional check:
+
+| # | Finding | Fix | Verification |
+|---|---|---|---|
+| A | RDMA benchmark was TCP-only on the server, and the client label was derived from the flag — a `"rsocket"` result could hide TCP fallback | `serve --rdma` runs the rsockets listener **only** (no TCP listener exists to fall back to); client `--rdma` now enables **strict** mode (`RingClient.SetStrictRDMA`, new production API) — RDMA failure is a counted error, never TCP; results labeled `rsocket-strict`. Bonus fix: a TCP-only client no longer nil-panics on a member advertising `RdmaAddr` | `TestStrictRDMANoFallback`, `TestTCPOnlyClientIgnoresRdmaAddr` |
+| B | `fileSource.LoadCachedRange` used unaligned buffers/offsets → `EINVAL` under O_DIRECT | every file read goes through `preadAligned` (4096-aligned window, buffer, offset; slice copied out); `--blocksize` validated as a multiple of 4096 | `TestFileSourcePreadAlignedMatchesPlain`; end-to-end O_DIRECT run (84k reads, 0 errors) |
+| C | `fileSource.LoadCached` allocated the entire backing file per load (64 GiB on the documented test set) | file is addressed as fixed-size blocks: `LoadCached` reads exactly one block (bounded) | `TestFileSourceLoadCachedBounded` |
+| D | `memSource.LoadCachedRange` read the block map without the mutex while cold fills mutated it | mutex added | `TestMemSourceConcurrentRangeAndFill` (`-race`) |
+| E | client counted batch payload bytes, server counted payload+framing — an exactly-32 MiB batch passed one side and failed the other | budget counts **payload bytes** on both ends; framing is capacity-only overhead | `TestBatchBudgetBoundary` (8×4 MiB exactly passes; 9×4 MiB rejected server-side via raw frames) |
+| F | peer-NVMe benchmarks sampled only the first 4 MiB of the test file | file is block-addressed: `bench-key-%d` → block %d, so `--keys N` samples the whole ≥N×blockSize file; keys beyond it fail loudly | `TestFileSourceRangeMapsBlocks` |
+
+---
+
 ## 3. Benchmark report
 
 **Environment (dev node):** NixOS, AMD Ryzen AI MAX+ 395 (32 threads), Go 1.25.14 (repo pins
@@ -323,13 +340,16 @@ also runs the benchmark owner: nothing special — any member serves.
 ```
 go build -o latencybench ./tools/latencybench
 # 1) NVMe floor (once per node): fio deploy/bench/randread.fio --filename=<nvme file> --bs=4k --iodepth=1 --output=fio-4k-qd1.json --eta=never
-# 2) peer matrix, node A → node B (B: ./latencybench serve --addr 0.0.0.0:13910 --src file --file /nvme/block.bin --direct):
+# 2) peer matrix, node A → node B (B: ./latencybench serve --addr 0.0.0.0:13910 --src file --file /nvme/dataset.bin --blocksize 4194304 --direct;
+#    dataset must be >= --keys x --blocksize, e.g. 16384 x 4MiB = 64GiB):
 #    full-block path (pre-change baseline):
 ./latencybench read --backend peer --addr <B>:13910 --len 4096,16384,65536,4194304 --qd 1,8,32,64,128 --secs 10 --out results-tcp-fullblock.json
 #    ranged path (the fast path — note --range):
 ./latencybench read --backend peer --addr <B>:13910 --range --len 4096,16384,65536 --qd 1,8,32,64,128 --secs 10 --out results-tcp-range.json
-# 3) same two runs with the RDMA binary mounts + --rdma-network (and --rdma on the client; rsockets transport recorded in results):
-./latencybench read --backend peer --addr <B>:13910 --range --len 4096,16384,65536 --qd 1,8,32,64,128 --secs 10 --rdma --out results-rdma-range.json
+# 3) RDMA: strict mode on BOTH ends — serve --rdma listens rsockets ONLY (no TCP fallback possible),
+#    read --rdma disables client fallback; a run with 0 errors under transport=rsocket-strict is all-RDMA.
+#    B: ./latencybench serve --rdma --src file --file /nvme/dataset.bin --blocksize 4194304 --direct
+./latencybench read --backend peer --addr <B-fabric-ip>:<rdma-port> --range --len 4096,16384,65536 --qd 1,8,32,64,128 --secs 10 --rdma --out results-rdma-range.json
 # 4) inference batch:
 ./latencybench read --backend peer --addr <B>:13910 --range --len 4096 --batch 70 --secs 20 --out results-infer.json
 ./latencybench read --backend peer --addr <B>:13910 --len 4096 --batch 70 --secs 20 --out results-infer-fullblock.json

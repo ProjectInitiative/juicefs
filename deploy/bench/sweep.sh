@@ -30,7 +30,9 @@ echo "== 3) inference workload: 70 concurrent 4 KiB reads per round =="
 $LB read --backend fuse --path "$FILE" --len 4096 --batch 70 --secs 20 --drop-cache --out "$OUT/lb-fuse-infer.json"
 
 echo "== 4) peer transport (run latencybench serve on a peer node first) =="
-# on peer: ./latencybench serve --addr 0.0.0.0:13910 --src file --file /nvme/block.bin --direct
+# on peer (TCP): ./latencybench serve --addr 0.0.0.0:13910 --src file --file /nvme/dataset.bin --blocksize 4194304 --direct
+# on peer (RDMA, strict — no TCP listener): ./latencybench serve --rdma --src file --file /nvme/dataset.bin --blocksize 4194304 --direct
+# dataset must be >= KEYS x 4MiB (e.g. --keys 16384 -> 64GiB)
 # full-block path (pre-change baseline):
 for qd in 1 8 32 64 128; do
   $LB read --backend peer --addr PEER:13910 --len 4096 --qd $qd --secs 10 --out "$OUT/lb-peer-tcp-fullblock.json"

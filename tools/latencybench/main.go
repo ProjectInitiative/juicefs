@@ -260,7 +260,11 @@ func (m *memSource) FillFromStorage(_ context.Context, key string) (io.ReadClose
 }
 
 // LoadCachedRange: positional window over the RAM block (RangeSource).
+// Holds m.mu like every other accessor — concurrent cold fills mutate the
+// map (review round 2: mixed warm/cold workloads raced here).
 func (m *memSource) LoadCachedRange(key string, off, limit int64) (io.ReadCloser, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	b, ok := m.blocks[key]
 	if !ok {
 		return nil, os.ErrNotExist
@@ -290,12 +294,49 @@ func (m *memSource) DropCached(key string) error {
 	return nil
 }
 
-// fileSource serves a real file's ranges via pread — models an owner's
-// NVMe-resident block. With O_DIRECT it is genuine device IO; otherwise the
-// kernel page cache serves (labeled in results).
+// fileSource serves a real file as FIXED-SIZE BLOCKS via pread — models an
+// owner's NVMe-resident cache. Block i lives at file offset i*blockSize, so
+// bench-key-%d addresses block %d: a --keys N run samples the WHOLE file
+// (≥ N*blockSize bytes), not merely its first block (review round 2,
+// findings B/C/F). All reads use 4096-aligned windows, buffers and offsets —
+// required by O_DIRECT (else EINVAL) and harmless for buffered fds.
 type fileSource struct {
-	f    *os.File
-	size int64
+	f         *os.File
+	size      int64
+	blockSize int64
+}
+
+const alignSize = 4096
+
+func (s *fileSource) blockCount() int64 { return (s.size + s.blockSize - 1) / s.blockSize }
+
+// blockIndex maps a key to its block. bench-key-%d keys address block %d;
+// anything else hashes stably over the block space.
+func (s *fileSource) blockIndex(key string) (int64, error) {
+	const prefix = "bench-key-"
+	if strings.HasPrefix(key, prefix) {
+		if v, err := strconv.ParseInt(key[len(prefix):], 10, 64); err == nil && v >= 0 {
+			return v, nil
+		}
+	}
+	h := uint64(14695981039346656037)
+	for _, c := range []byte(key) {
+		h = (h ^ uint64(c)) * 1099511628211
+	}
+	return int64(h % uint64(s.blockCount())), nil
+}
+
+// blockLen is the on-disk length of block idx (shorter tail block).
+func (s *fileSource) blockLen(idx int64) int64 {
+	off := idx * s.blockSize
+	if off >= s.size {
+		return 0
+	}
+	n := s.blockSize
+	if off+n > s.size {
+		n = s.size - off
+	}
+	return n
 }
 
 func (s *fileSource) preadAt(p []byte, off int64) error {
@@ -304,7 +345,7 @@ func (s *fileSource) preadAt(p []byte, off int64) error {
 		off += int64(n)
 		p = p[n:]
 		if err == io.EOF {
-			return nil
+			return nil // short read at EOF: p was larger than the file
 		}
 		if err != nil {
 			return err
@@ -312,28 +353,65 @@ func (s *fileSource) preadAt(p []byte, off int64) error {
 	}
 	return nil
 }
-func (s *fileSource) LoadCached(_ string) (io.ReadCloser, error) {
-	b := make([]byte, s.size)
-	if err := s.preadAt(b, 0); err != nil {
+
+// preadAligned reads len(dst) bytes at off via a 4096-aligned window
+// (aligned buffer, offset and length) and copies out the requested slice.
+func (s *fileSource) preadAligned(dst []byte, off int64) error {
+	if len(dst) == 0 {
+		return nil
+	}
+	start := (off / alignSize) * alignSize
+	end := ((off + int64(len(dst))) + alignSize - 1) / alignSize * alignSize
+	buf := alignedBuf(int(end - start))
+	if err := s.preadAt(buf, start); err != nil {
+		return err
+	}
+	copy(dst, buf[off-start:])
+	return nil
+}
+
+// LoadCached: ONE block (bounded), never the whole file (review round 2,
+// finding C — the old code allocated the entire backing file per load).
+func (s *fileSource) LoadCached(key string) (io.ReadCloser, error) {
+	idx, err := s.blockIndex(key)
+	if err != nil {
 		return nil, err
 	}
-	return io.NopCloser(&byteReader{b: b}), nil
+	n := s.blockLen(idx)
+	if n <= 0 {
+		return nil, fmt.Errorf("block %d of %s beyond file (%d bytes)", idx, key, s.size)
+	}
+	off := idx * s.blockSize
+	win := ((n + alignSize - 1) / alignSize) * alignSize
+	buf := alignedBuf(int(win))
+	if err := s.preadAt(buf, off); err != nil {
+		return nil, err
+	}
+	return io.NopCloser(&byteReader{b: buf[:n]}), nil
 }
 func (s *fileSource) FillFromStorage(ctx context.Context, key string) (io.ReadCloser, error) {
 	return s.LoadCached(key)
 }
 
-// LoadCachedRange: positional pread — the owner-NVMe model (RangeSource).
+// LoadCachedRange: positional pread within the key's block — the owner-NVMe
+// model (RangeSource), with O_DIRECT-safe alignment.
 func (s *fileSource) LoadCachedRange(key string, off, limit int64) (io.ReadCloser, error) {
-	if off >= s.size {
-		return nil, fmt.Errorf("offset %d past end of %s (%d bytes)", off, key, s.size)
+	idx, err := s.blockIndex(key)
+	if err != nil {
+		return nil, err
 	}
-	n := limit
-	if off+n > s.size {
-		n = s.size - off
+	n := s.blockLen(idx)
+	if n <= 0 {
+		return nil, fmt.Errorf("block %d of %s beyond file (%d bytes)", idx, key, s.size)
 	}
-	buf := make([]byte, n)
-	if err := s.preadAt(buf, off); err != nil {
+	if off >= n {
+		return nil, fmt.Errorf("offset %d past end of %s block (%d bytes)", off, key, n)
+	}
+	if off+limit > n {
+		limit = n - off
+	}
+	buf := make([]byte, limit)
+	if err := s.preadAligned(buf, idx*s.blockSize+off); err != nil {
 		return nil, err
 	}
 	return io.NopCloser(&byteReader{b: buf}), nil
@@ -348,12 +426,14 @@ func (s *fileSource) DropCached(_ string) error                { return nil }
 
 func cmdServe(args []string) {
 	fs := newFlagSet("serve")
-	addr := fs.String("addr", "127.0.0.1:0", "listen address")
+	addr := fs.String("addr", "127.0.0.1:0", "TCP listen address (ignored with --rdma)")
 	src := fs.String("src", "mem", "data source: mem | file")
-	file := fs.String("file", "", "file path for --src file (served via pread)")
-	direct := fs.Bool("direct", false, "open --file with O_DIRECT (owner-NVMe model)")
+	file := fs.String("file", "", "file path for --src file (served as blocks via pread)")
+	direct := fs.Bool("direct", false, "open --file with O_DIRECT (owner-NVMe model; reads are 4096-aligned)")
 	blocks := fs.Int("blocks", 256, "number of preloaded blocks (mem)")
-	blocksize := fs.Int("blocksize", 4<<20, "block size (mem)")
+	blocksize := fs.Int("blocksize", 4<<20, "block size in bytes (mem and file; must be a multiple of 4096 for --src file)")
+	rdma := fs.Bool("rdma", false, "listen on rsockets (RDMA) ONLY — strict benchmark mode, no TCP listener (requires -tags rdma; verify with rping first)")
+	nics := fs.String("nics", "", "comma-separated NIC list for --rdma (default: first non-loopback IPv4)")
 	_ = fs.Parse(args)
 
 	var inner gcache.ServerSource
@@ -364,6 +444,9 @@ func cmdServe(args []string) {
 	case "file":
 		if *file == "" {
 			fatalf("--src file requires --file")
+		}
+		if *blocksize <= 0 || *blocksize%4096 != 0 {
+			fatalf("--blocksize must be a positive multiple of 4096 (got %d)", *blocksize)
 		}
 		flag := os.O_RDONLY
 		if *direct {
@@ -377,8 +460,9 @@ func cmdServe(args []string) {
 		if err != nil {
 			fatalf("stat: %v", err)
 		}
-		inner = &fileSource{f: f, size: st.Size()}
-		fmt.Printf("serving %s (%d bytes, o_direct=%v) via pread\n", *file, st.Size(), *direct)
+		inner = &fileSource{f: f, size: st.Size(), blockSize: int64(*blocksize)}
+		fmt.Printf("serving %s (%d bytes) as %d blocks of %d bytes, o_direct=%v\n",
+			*file, st.Size(), (st.Size()+int64(*blocksize)-1)/int64(*blocksize), *blocksize, *direct)
 	default:
 		fatalf("unknown --src %q", *src)
 	}
@@ -392,12 +476,35 @@ func cmdServe(args []string) {
 		}
 	}()
 
+	ctx := context.Background()
+	if *rdma {
+		// Strict RDMA benchmark mode: RDMA listener ONLY. A TCP-only client
+		// cannot connect at all, so results can never silently contain TCP
+		// traffic (review round 2, finding A).
+		var nicList []string
+		for _, n := range strings.Split(*nics, ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				nicList = append(nicList, n)
+			}
+		}
+		rt, err := gcache.ListenRDMA(nicList, "")
+		if err != nil {
+			fatalf("rdma listen: %v (build latencybench with -tags rdma; verify the fabric with rping first)", err)
+		}
+		fmt.Printf("gcache peer server on %s (%s) — RDMA ONLY\n", rt.Addr(), rt.Name())
+		for {
+			conn, err := rt.Accept()
+			if err != nil {
+				return
+			}
+			go gcache.ServeConn(ctx, conn, cs, 65*time.Second)
+		}
+	}
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		fatalf("listen: %v", err)
 	}
-	fmt.Printf("gcache peer server on %s\n", ln.Addr())
-	ctx := context.Background()
+	fmt.Printf("gcache peer server on %s (tcp)\n", ln.Addr())
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -428,6 +535,9 @@ func newPeer(addr string, keys, bs int, useRange, unique, useRDMA bool, timeout 
 			fatalf("--rdma unavailable: %v (build with -tags rdma and install rdma-core)", err)
 		}
 		rc.SetRDMA(rt)
+		// Strict: an RDMA failure surfaces as an error (counted) instead of
+		// silently degrading the result to TCP (review round 2, finding A).
+		rc.SetStrictRDMA(true)
 	}
 	return &peerClient{
 		rc:       rc,
@@ -713,7 +823,8 @@ func runOnce(backend, addr, path string, useRange, useRDMA bool, length, qd, bat
 	}
 	res.Errors = errs.Load()
 	if backend == "peer" {
-		res.Transport = map[bool]string{true: "rsocket", false: "tcp"}[useRDMA]
+		// strict mode: success can ONLY have used rsockets (fallback disabled)
+		res.Transport = map[bool]string{true: "rsocket-strict", false: "tcp"}[useRDMA]
 	}
 	return res
 }

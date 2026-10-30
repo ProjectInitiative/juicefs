@@ -371,7 +371,11 @@ func (s *Server) handleBatch(cs *connState, mctx meta.Context, rid uint32, body 
 	entries := make([]entry, n)
 	// Review finding 1: size the response from the ACTUAL requested lengths
 	// (never 5+MaxReadLen per entry) and enforce an aggregate budget before
-	// touching any handle.
+	// touching any handle. The budget counts PAYLOAD bytes — exactly what the
+	// client validates against — so an exactly-MaxBatchBytes payload cannot
+	// pass on one side and fail on the other (review round 2, finding E).
+	// Framing overhead (5 bytes/entry, bounded by MaxBatchSize) is added to
+	// the buffer capacity only.
 	aggregate := 0
 	for i := 0; i < n; i++ {
 		b := body[2+i*20 : 2+(i+1)*20]
@@ -384,16 +388,12 @@ func (s *Server) handleBatch(cs *connState, mctx meta.Context, rid uint32, body 
 		if l > MaxReadLen {
 			l = 0 // oversized entries answer with an empty error body
 		}
-		if l > 0 {
-			aggregate += 5 + l
-		} else {
-			aggregate += 5
-		}
+		aggregate += l
 	}
 	if aggregate > MaxBatchBytes {
-		return errResponse(rid, 0, fmt.Sprintf("batch aggregate %d exceeds %d", aggregate, MaxBatchBytes))
+		return errResponse(rid, 0, fmt.Sprintf("batch payload %d exceeds %d", aggregate, MaxBatchBytes))
 	}
-	out := make([]byte, 2, 2+aggregate)
+	out := make([]byte, 2, 2+aggregate+5*n)
 	binary.LittleEndian.PutUint16(out[0:2], uint16(n))
 	for _, e := range entries {
 		var st byte = 0
