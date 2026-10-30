@@ -174,6 +174,29 @@ block valid measurements. All are fixed on this branch (`tools/latencybench`), w
 
 ---
 
+## 2c. RDMA connectivity hardening (review round 3)
+
+The third review confirmed the round-2 fixes and found four RDMA connection-establishment
+bugs that would have blocked the hardware benchmark regardless of fabric quality. All fixed
+on this branch:
+
+| # | Finding | Fix | Verification |
+|---|---|---|---|
+| 1 | `latencybench read --rdma` built its member without `RdmaAddr` — strict mode rejected every fetch even on a healthy fabric | `benchMember()` sets `RdmaAddr` from the new `--rdma-addr` flag, defaulting to `--addr` itself (documented as the RDMA endpoint) | `TestBenchMemberEndpointWiring` |
+| 2 | The rsockets listener always bound port 0 and advertised port 0 (or an unverified supplied port) | binds the requested port when the advertise address carries one; always discovers the ACTUAL bound port via a new `rgetsockname()` cgo shim and advertises that; a mismatch between requested and bound port is an error | compile-verified; hardware step uses `rping` first |
+| 3 | `rconnect()` built `sin_addr.s_addr` from a `BigEndian.Uint32` value — byte-swapped on little-endian hosts (10.42.1.2 → 2.1.42.10) | the C shim now takes the 4 octets and `memcpy`s them into `s_addr` (correct on any endianness); `ipv4Octets()` keeps the contract testable | `TestIPv4OctetsByteOrder` (`-tags rdma`) — pins [10,42,1,2] and the historical swap |
+| 4 | Strict mode could still reach TCP: (a) the RDMA retry backoff skipped the attempt and fell through, (b) pooled TCP connections were reused after enabling strict | strict attempts RDMA even during backoff; `SetStrictRDMA(true)` flushes the whole idle pool (the pool is keyed by peer, not transport) | `TestStrictRDMAIgnoresBackoff` (3 consecutive strict failures, never TCP), `TestSetStrictRDMAFlushesPool`, `TestConnPoolFlushClosesIdle` |
+
+Non-strict behavior is unchanged: `TestDialFailoverBackoff` / `TestDialFailoverFailback`
+still pass — production TCP fallback is preserved.
+
+**Benchmark working-set note (review round 3):** `read` defaults to `--keys 256`; at 4 MiB
+blocks that samples only 1 GiB. All peer commands below pass `--keys 16384` to exercise the
+full 64 GiB dataset (`16384 × 4 MiB`). The dataset must be ≥ keys × blocksize; larger keys
+now fail loudly instead of silently re-reading block 0.
+
+---
+
 ## 3. Benchmark report
 
 **Environment (dev node):** NixOS, AMD Ryzen AI MAX+ 395 (32 threads), Go 1.25.14 (repo pins
@@ -341,15 +364,16 @@ also runs the benchmark owner: nothing special — any member serves.
 go build -o latencybench ./tools/latencybench
 # 1) NVMe floor (once per node): fio deploy/bench/randread.fio --filename=<nvme file> --bs=4k --iodepth=1 --output=fio-4k-qd1.json --eta=never
 # 2) peer matrix, node A → node B (B: ./latencybench serve --addr 0.0.0.0:13910 --src file --file /nvme/dataset.bin --blocksize 4194304 --direct;
-#    dataset must be >= --keys x --blocksize, e.g. 16384 x 4MiB = 64GiB):
+#    --keys 16384 = the full 64GiB working set (16384 x 4MiB); dataset must be >= keys x blocksize:
 #    full-block path (pre-change baseline):
-./latencybench read --backend peer --addr <B>:13910 --len 4096,16384,65536,4194304 --qd 1,8,32,64,128 --secs 10 --out results-tcp-fullblock.json
+./latencybench read --backend peer --addr <B>:13910 --keys 16384 --len 4096,16384,65536,4194304 --qd 1,8,32,64,128 --secs 10 --out results-tcp-fullblock.json
 #    ranged path (the fast path — note --range):
-./latencybench read --backend peer --addr <B>:13910 --range --len 4096,16384,65536 --qd 1,8,32,64,128 --secs 10 --out results-tcp-range.json
+./latencybench read --backend peer --addr <B>:13910 --keys 16384 --range --len 4096,16384,65536 --qd 1,8,32,64,128 --secs 10 --out results-tcp-range.json
 # 3) RDMA: strict mode on BOTH ends — serve --rdma listens rsockets ONLY (no TCP fallback possible),
 #    read --rdma disables client fallback; a run with 0 errors under transport=rsocket-strict is all-RDMA.
 #    B: ./latencybench serve --rdma --src file --file /nvme/dataset.bin --blocksize 4194304 --direct
-./latencybench read --backend peer --addr <B-fabric-ip>:<rdma-port> --range --len 4096,16384,65536 --qd 1,8,32,64,128 --secs 10 --rdma --out results-rdma-range.json
+#    (serve prints the actual bound rsockets port; pass it as the client --addr, or override with --rdma-addr)
+./latencybench read --backend peer --addr <B-fabric-ip>:<rdma-port> --keys 16384 --range --len 4096,16384,65536 --qd 1,8,32,64,128 --secs 10 --rdma --out results-rdma-range.json
 # 4) inference batch:
 ./latencybench read --backend peer --addr <B>:13910 --range --len 4096 --batch 70 --secs 20 --out results-infer.json
 ./latencybench read --backend peer --addr <B>:13910 --len 4096 --batch 70 --secs 20 --out results-infer-fullblock.json

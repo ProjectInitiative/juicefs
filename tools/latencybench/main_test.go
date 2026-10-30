@@ -185,6 +185,23 @@ func TestMemSourceConcurrentRangeAndFill(t *testing.T) {
 	wg.Wait()
 }
 
+// Regression (review round 3, finding 1): the bench member must advertise an
+// RDMA endpoint under --rdma, or strict mode rejects every fetch.
+func TestBenchMemberEndpointWiring(t *testing.T) {
+	// no RDMA: plain member, no RdmaAddr
+	if m := benchMember("10.0.0.1:9000", "", false); m.RdmaAddr != "" || m.Addr != "10.0.0.1:9000" {
+		t.Fatalf("plain member wrong: %+v", m)
+	}
+	// --rdma without --rdma-addr: --addr IS the RDMA endpoint
+	if m := benchMember("10.42.1.2:7410", "", true); m.RdmaAddr != "10.42.1.2:7410" {
+		t.Fatalf("--rdma member missing RdmaAddr: %+v", m)
+	}
+	// --rdma with an explicit --rdma-addr
+	if m := benchMember("10.42.1.2:7410", "10.42.1.2:17410", true); m.RdmaAddr != "10.42.1.2:17410" || m.Addr != "10.42.1.2:7410" {
+		t.Fatalf("explicit --rdma-addr not honored: %+v", m)
+	}
+}
+
 // The aligned-window reader must agree with plain reads of the same region.
 func TestFileSourcePreadAlignedMatchesPlain(t *testing.T) {
 	const blockSize = 8192

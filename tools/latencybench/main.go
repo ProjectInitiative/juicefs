@@ -27,6 +27,7 @@
 // Build:  go build -o latencybench ./tools/latencybench
 // Serve:  ./latencybench serve --addr 127.0.0.1:0 --blocks 256 --blocksize 4194304
 // Read:   ./latencybench read --backend peer --addr 127.0.0.1:PORT --len 4096 --qd 8 --secs 5
+// Read (RDMA, strict): ./latencybench read --backend peer --addr <peer-fabric-ip>:<rport> --rdma --len 4096 --qd 8
 //
 // Results: JSON (--out) + human table on stdout. Never label kernel
 // page-cache results as remote-NVMe latency; see the README for the matrix.
@@ -426,7 +427,7 @@ func (s *fileSource) DropCached(_ string) error                { return nil }
 
 func cmdServe(args []string) {
 	fs := newFlagSet("serve")
-	addr := fs.String("addr", "127.0.0.1:0", "TCP listen address (ignored with --rdma)")
+	addr := fs.String("addr", "127.0.0.1:0", "listen address (host:port; with --rdma the PORT is the rsockets bind port, host ignored — the actual bound port is discovered and printed)")
 	src := fs.String("src", "mem", "data source: mem | file")
 	file := fs.String("file", "", "file path for --src file (served as blocks via pread)")
 	direct := fs.Bool("direct", false, "open --file with O_DIRECT (owner-NVMe model; reads are 4096-aligned)")
@@ -487,7 +488,15 @@ func cmdServe(args []string) {
 				nicList = append(nicList, n)
 			}
 		}
-		rt, err := gcache.ListenRDMA(nicList, "")
+		// Honor --addr's port as the rsockets bind port (":0" or no port →
+		// ephemeral, discovered via rgetsockname and printed below). The host
+		// part is ignored — the fabric IP comes from --nics discovery.
+		_, aport, _ := net.SplitHostPort(*addr)
+		adv := ""
+		if p, err := strconv.Atoi(aport); err == nil && p > 0 {
+			adv = ":" + aport
+		}
+		rt, err := gcache.ListenRDMA(nicList, adv)
 		if err != nil {
 			fatalf("rdma listen: %v (build latencybench with -tags rdma; verify the fabric with rping first)", err)
 		}
@@ -527,7 +536,23 @@ type peerClient struct {
 	uniqueN  atomic.Int64
 }
 
-func newPeer(addr string, keys, bs int, useRange, unique, useRDMA bool, timeout time.Duration) *peerClient {
+// benchMember builds the peer member for the bench client. Under --rdma the
+// member MUST advertise an RDMA endpoint — strict mode rejects a member
+// without one (review round 3, finding 1): --rdma-addr supplies it
+// explicitly; otherwise --addr itself is the RDMA endpoint (documented).
+func benchMember(addr, rdmaAddr string, useRDMA bool) gcache.Member {
+	m := gcache.Member{UUID: "peer", Addr: addr}
+	if useRDMA {
+		if rdmaAddr != "" {
+			m.RdmaAddr = rdmaAddr
+		} else {
+			m.RdmaAddr = addr
+		}
+	}
+	return m
+}
+
+func newPeer(addr, rdmaAddr string, keys, bs int, useRange, unique, useRDMA bool, timeout time.Duration) *peerClient {
 	rc := gcache.NewRingClient(timeout, 31, "latencybench")
 	if useRDMA {
 		rt, err := gcache.DialRDMA()
@@ -541,7 +566,7 @@ func newPeer(addr string, keys, bs int, useRange, unique, useRDMA bool, timeout 
 	}
 	return &peerClient{
 		rc:       rc,
-		members:  []gcache.Member{{UUID: "peer", Addr: addr}},
+		members:  []gcache.Member{benchMember(addr, rdmaAddr, useRDMA)},
 		group:    "bench",
 		keys:     keys,
 		bs:       bs,
@@ -585,15 +610,16 @@ func cmdRead(args []string) {
 	backend := fs.String("backend", "peer", "peer | fuse | nvme | readsvc")
 	sockPath := fs.String("sock", "", "readsvc unix socket (backend=readsvc)")
 	openPath := fs.String("open-path", "", "file path to open in the readsvc backend")
-	addr := fs.String("addr", "", "peer host:port (backend=peer)")
+	addr := fs.String("addr", "", "peer host:port (backend=peer; with --rdma, also the RDMA endpoint unless --rdma-addr)")
 	path := fs.String("path", "", "file path (backend=fuse|nvme)")
 	useRange := fs.Bool("range", false, "use ranged peer reads (MsgRangeReq) instead of full-block fetch")
-	useRDMA := fs.Bool("rdma", false, "peer mode: dial the peer via rsockets (requires the -tags rdma build; TCP fallback stays active on failure)")
+	useRDMA := fs.Bool("rdma", false, "peer mode: dial the peer via rsockets in STRICT mode (requires the -tags rdma build; RDMA failure is a counted error, no TCP fallback)")
+	rdmaAddr := fs.String("rdma-addr", "", "peer RDMA endpoint host:port with --rdma (default: --addr is the RDMA endpoint)")
 	lens := fs.String("len", "4096", "comma list of request sizes")
 	qds := fs.String("qd", "1", "comma list of queue depths")
 	batch := fs.Int("batch", 0, "if >0: batched rounds of this many concurrent reads instead of steady QD")
 	secs := fs.Float64("secs", 5, "seconds per configuration")
-	keys := fs.Int("keys", 256, "key space size (backend=peer)")
+	keys := fs.Int("keys", 256, "key space size (backend=peer); working set = keys × bs — e.g. --keys 16384 --bs 4194304 = 64GiB")
 	bs := fs.Int("bs", 4<<20, "block size behind each key (backend=peer)")
 	unique := fs.Bool("unique", false, "cold owner: never reuse a key (fill path)")
 	direct := fs.Bool("direct", false, "O_DIRECT (backend=nvme)")
@@ -629,7 +655,7 @@ func cmdRead(args []string) {
 
 	for _, ln := range splitInts(*lens) {
 		for _, qd := range splitInts(*qds) {
-			res := runOnce(*backend, *addr, *path, *useRange, *useRDMA, ln, qd, *batch, *secs,
+			res := runOnce(*backend, *addr, *rdmaAddr, *path, *useRange, *useRDMA, ln, qd, *batch, *secs,
 				*keys, *bs, *unique, *direct, *drop, *seed, *timeout, *sockPath, *openPath)
 			results = append(results, res)
 			printTable(res)
@@ -643,7 +669,7 @@ func cmdRead(args []string) {
 	}
 }
 
-func runOnce(backend, addr, path string, useRange, useRDMA bool, length, qd, batch int, secs float64,
+func runOnce(backend, addr, rdmaAddr, path string, useRange, useRDMA bool, length, qd, batch int, secs float64,
 	keys, bs int, unique, direct, drop bool, seed int64, timeout time.Duration,
 	sockPath, openPath string) runResult {
 
@@ -680,7 +706,7 @@ func runOnce(backend, addr, path string, useRange, useRDMA bool, length, qd, bat
 		}, done: func() {}}
 		setupWorker = func(int) *readWorker { return shared }
 	case "peer":
-		pr = newPeer(addr, keys, bs, useRange, unique, useRDMA, timeout)
+		pr = newPeer(addr, rdmaAddr, keys, bs, useRange, unique, useRDMA, timeout)
 		shared := &readWorker{read: pr.readAt, done: func() {}}
 		setupWorker = func(int) *readWorker { return shared }
 	case "readsvc":

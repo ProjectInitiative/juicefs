@@ -32,6 +32,8 @@ Runs the real `gcache.ServeConn` frame loop. Sources:
 ./latencybench serve --addr 0.0.0.0:13910 --src file --file /nvme/dataset.bin --blocksize 4194304 --direct
 # strict RDMA benchmark: RDMA listener ONLY (no TCP listener exists to fall back to):
 ./latencybench serve --rdma --src file --file /nvme/dataset.bin --blocksize 4194304 --direct
+#   (the bound rsockets port is discovered via rgetsockname and printed —
+#    pass that exact host:port to the reader, or set a fixed port in --addr)
 ```
 
 ### `read` — measured side
@@ -41,7 +43,8 @@ Runs the real `gcache.ServeConn` frame loop. Sources:
 | `--backend peer\|fuse\|nvme\|readsvc` | peer = production RingClient stack; fuse = pread through the mount; nvme = raw pread; readsvc = the mount's unix-socket read service |
 | `--addr` | peer host:port (peer mode) |
 | `--range` | use ranged reads (MsgRangeReq) — requires the ranged-read build |
-| `--rdma` | peer/serve: use rsockets. On `read` this also enables **strict** mode — RDMA failure is an error, never silent TCP fallback; results are labeled `rsocket-strict` |
+| `--rdma` | peer/serve: use rsockets. On `read` this also enables **strict** mode — RDMA failure is an error, never silent TCP fallback (pooled TCP conns are dropped and the retry backoff is bypassed); results are labeled `rsocket-strict` |
+| `--rdma-addr` | read: explicit peer RDMA endpoint `host:port`; default is `--addr` itself (documented as the RDMA endpoint) |
 | `--len 4096,16384,...` | request sizes |
 | `--qd 1,8,...` | queue depths (steady-state workers) |
 | `--batch 70` | inference workload: rounds of N concurrent reads; reports round-completion percentiles (straggler effects) |
@@ -61,7 +64,7 @@ IOPS, MiB/s, error count. JSON array per `--out` file.
 | Local JuiceFS cached read | `fuse` on a warm mounted file (after one warm pass) |
 | Page-cache excluded | add `--drop-cache` |
 | Remote peer-cache hit, full-block path (baseline) | `peer` vs `serve --src mem` (or `--src file --direct` for owner-NVMe service) |
-| Remote peer-cache hit, ranged path | same + `--range` (the whole file is the working set: `--keys` blocks × `--bs`) |
+| Remote peer-cache hit, ranged path | same + `--range --keys 16384` (whole-file working set: `--keys` blocks × `--bs`; the 256-key default samples only 1 GiB at 4 MiB blocks) |
 | Cold remote-cache miss | `peer --unique` (owner fill then serve) |
 | Inference batch (~70×4 KiB/round) | `--batch 70` on any backend |
 

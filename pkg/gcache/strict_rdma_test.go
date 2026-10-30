@@ -79,6 +79,73 @@ func TestStrictRDMANoFallback(t *testing.T) {
 	}
 }
 
+// Regression (review round 3, finding 4a): strict mode must not use the RDMA
+// retry backoff as a TCP escape hatch. After a failed RDMA attempt the
+// endpoint is marked down for rdmaRetryInterval — non-strict clients skip the
+// attempt during that window, but a strict client must still attempt (and
+// here, fail) on every fetch.
+func TestStrictRDMAIgnoresBackoff(t *testing.T) {
+	src := newFakeSource("none")
+	src.blocks["k"] = []byte("data")
+	addr, stop := listenerWithSrc(t, src, 5*time.Second)
+	defer stop()
+
+	rc := NewRingClient(time.Second, 31, "self-test")
+	rc.SetRDMA(failTransport{})
+	rc.SetStrictRDMA(true)
+	members := []Member{{UUID: "peer-1", Addr: addr, RdmaAddr: addr}}
+	for i := 0; i < 3; i++ {
+		if _, err := rc.Fetch(context.Background(), "g", "k", members); err == nil {
+			t.Fatalf("attempt %d: strict fetch succeeded — backoff skipped the RDMA attempt and served via TCP", i+1)
+		} else if !strings.Contains(err.Error(), "strict RDMA") {
+			t.Fatalf("attempt %d: want a strict-RDMA error, got: %v", i+1, err)
+		}
+	}
+}
+
+// Regression (review round 3, finding 4b): the pool is keyed by peer address,
+// not transport — SetStrictRDMA(true) must drop idle connections so stale
+// TCP conns are never reused under strict mode.
+func TestSetStrictRDMAFlushesPool(t *testing.T) {
+	src := newFakeSource("none")
+	src.blocks["k"] = []byte("pooled")
+	addr, stop := listenerWithSrc(t, src, 5*time.Second)
+	defer stop()
+
+	rc := NewRingClient(time.Second, 31, "self-test")
+	members := []Member{{UUID: "peer-1", Addr: addr}}
+	r, err := rc.Fetch(context.Background(), "g", "k", members) // populates the pool
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Close()
+	if _, _, idle := rc.pool.stats(); idle != 1 {
+		t.Fatalf("precondition: want 1 idle pooled conn, got %d", idle)
+	}
+	rc.SetStrictRDMA(true)
+	if _, _, idle := rc.pool.stats(); idle != 0 {
+		t.Fatalf("SetStrictRDMA(true) left %d idle conn(s) pooled", idle)
+	}
+}
+
+func TestConnPoolFlushClosesIdle(t *testing.T) {
+	p := newConnPool(4, time.Minute)
+	a, b := net.Pipe()
+	p.release("peer-a", a, &TCPTransport{})
+	if _, _, idle := p.stats(); idle != 1 {
+		t.Fatalf("precondition: idle=%d", idle)
+	}
+	p.flush()
+	if _, _, idle := p.stats(); idle != 0 {
+		t.Fatalf("flush left idle=%d", idle)
+	}
+	// the pooled end must be closed: a write on the far end errors
+	if _, err := b.Write([]byte{'x'}); err == nil {
+		t.Fatal("flush did not close the pooled connection")
+	}
+	_ = b.Close()
+}
+
 // Regression (mixed-version rings): a TCP-only client (no RDMA transport)
 // must not panic when a member advertises an RdmaAddr — it just uses TCP.
 func TestTCPOnlyClientIgnoresRdmaAddr(t *testing.T) {

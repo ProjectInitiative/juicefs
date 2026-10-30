@@ -50,15 +50,30 @@ static int c_rsocket(int *saved_errno) {
 	if (fd < 0) *saved_errno = errno;
 	return fd;
 }
-static int c_rconnect(int fd, unsigned int ip_be, int port, int *saved_errno) {
+// ip4 points at the 4 address octets in network order; memcpy places them
+// verbatim into sin_addr.s_addr, which is correct on any host endianness.
+// (Passing a Go binary.BigEndian.Uint32 value instead stored the octets
+// byte-swapped on little-endian hosts: 10.42.1.2 became 2.1.42.10 — review
+// round 3, finding 3.)
+static int c_rconnect(int fd, const unsigned char *ip4, int port, int *saved_errno) {
 	struct sockaddr_in sa;
 	memset(&sa, 0, sizeof sa);
 	sa.sin_family = AF_INET;
 	sa.sin_port = htons((unsigned short)port);
-	sa.sin_addr.s_addr = (unsigned int)ip_be;
+	memcpy(&sa.sin_addr.s_addr, ip4, 4);
 	int rv = rconnect(fd, (struct sockaddr *)&sa, sizeof sa);
 	if (rv < 0) *saved_errno = errno;
 	return rv;
+}
+// actual bound port (host byte order) via rgetsockname; -1 on error.
+static int c_rgetsockname_port(int fd, int *saved_errno) {
+	struct sockaddr_in sa;
+	socklen_t l = sizeof sa;
+	if (rgetsockname(fd, (struct sockaddr *)&sa, &l) < 0) {
+		*saved_errno = errno;
+		return -1;
+	}
+	return ntohs(sa.sin_port);
 }
 static int c_rbind(int fd, int port, int *saved_errno) {
 	struct sockaddr_in sa;
@@ -121,7 +136,6 @@ import "C"
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -152,6 +166,19 @@ func errOf(saved C.int) error {
 
 // ---------------------------------------------------------------- dial
 
+// ipv4Octets returns the 4 address octets in network order — exactly the
+// memory layout sockaddr_in.sin_addr expects, independent of host
+// endianness. Kept pure-Go so the byte-order contract has a regression test.
+func ipv4Octets(host string) ([4]byte, error) {
+	ip := net.ParseIP(host).To4()
+	if ip == nil {
+		return [4]byte{}, fmt.Errorf("%q is not an IPv4 address (rsockets v1)", host)
+	}
+	var out [4]byte
+	copy(out[:], ip)
+	return out, nil
+}
+
 func dialRsockets(ctx context.Context, addr string) (net.Conn, error) {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -161,11 +188,10 @@ func dialRsockets(ctx context.Context, addr string) (net.Conn, error) {
 	if err != nil || port <= 0 || port > 65535 {
 		return nil, fmt.Errorf("rsockets dial %s: bad port", addr)
 	}
-	ip := net.ParseIP(host).To4()
-	if ip == nil {
-		return nil, fmt.Errorf("rsockets dial: %q is not an IPv4 address (rsockets v1)", host)
+	oct, err := ipv4Octets(host)
+	if err != nil {
+		return nil, fmt.Errorf("rsockets dial: %w", err)
 	}
-	ipBE := binary.BigEndian.Uint32(ip)
 
 	var serr C.int
 	fd := C.c_rsocket(&serr)
@@ -174,7 +200,7 @@ func dialRsockets(ctx context.Context, addr string) (net.Conn, error) {
 	}
 	closeFD := func() { var se C.int; _ = C.c_rclose(fd, &se) }
 
-	rv := C.c_rconnect(fd, C.uint(ipBE), C.int(port), &serr)
+	rv := C.c_rconnect(fd, (*C.uchar)(unsafe.Pointer(&oct[0])), C.int(port), &serr)
 	if rv < 0 {
 		if errOf(serr) != syscall.EINPROGRESS {
 			closeFD()
@@ -254,36 +280,50 @@ func listenRsockets(nics []string, advertise string) (net.Listener, string, erro
 		return nil, "", fmt.Errorf("rsocket: %w", errOf(serr))
 	}
 	closeFD := func() { var se C.int; _ = C.c_rclose(fd, &se) }
-	if rv := C.c_rbind(fd, C.int(0), &serr); rv < 0 { // port 0: ephemeral
+
+	// Bind the requested port when the advertise address carries one;
+	// otherwise let the kernel pick an ephemeral port. Either way the ACTUAL
+	// bound port is discovered via rgetsockname and advertised (review
+	// round 3, finding 2) — advertising a port that differs from the bound
+	// socket is a guaranteed connect failure.
+	advHost, advPort, _ := net.SplitHostPort(advertise)
+	bindPort := 0
+	if advPort != "" {
+		p, err := strconv.Atoi(advPort)
+		if err != nil || p <= 0 || p > 65535 {
+			closeFD()
+			return nil, "", fmt.Errorf("rbind: bad advertise port %q", advPort)
+		}
+		bindPort = p
+	}
+	if rv := C.c_rbind(fd, C.int(bindPort), &serr); rv < 0 {
 		closeFD()
 		return nil, "", fmt.Errorf("rbind: %w", errOf(serr))
+	}
+	actual := int(C.c_rgetsockname_port(fd, &serr))
+	if actual < 0 {
+		closeFD()
+		return nil, "", fmt.Errorf("rgetsockname: %w", errOf(serr))
+	}
+	if bindPort != 0 && actual != bindPort {
+		closeFD()
+		return nil, "", fmt.Errorf("rbind: bound port %d does not match requested %d", actual, bindPort)
 	}
 	if rv := C.c_rlisten(fd, rsocketsBacklog, &serr); rv < 0 {
 		closeFD()
 		return nil, "", fmt.Errorf("rlisten: %w", errOf(serr))
 	}
 	host := ""
-	advHost, advPort, _ := net.SplitHostPort(advertise)
-	if advHost != "" {
-		host = advHost
+	if advHost != "" && advHost != "0.0.0.0" && advHost != "::" {
+		host = advHost // wildcard bind hosts are not connectable: discover instead
 	} else if h, err := firstNICIPv4(nics); err == nil {
 		host = h
 	} else {
 		host = "127.0.0.1" // loopback fallback (single-node rxe testing)
 	}
-	// The bound (ephemeral) port is unknown without an rgetsockname shim;
-	// callers that need a stable advertised port must pass it via
-	// --rdma-network's advertise (RdmaAdvertise). v1 reuses the explicit
-	// advertise port when present.
-	port := 0
-	if advPort != "" {
-		if p, err := strconv.Atoi(advPort); err == nil {
-			port = p
-		}
-	}
-	addr := &net.TCPAddr{IP: net.ParseIP(host).To4(), Port: port}
-	ln := &rsocketsListener{fd: fd, port: port, addr: addr}
-	return ln, net.JoinHostPort(host, strconv.Itoa(port)), nil
+	addr := &net.TCPAddr{IP: net.ParseIP(host).To4(), Port: actual}
+	ln := &rsocketsListener{fd: fd, port: actual, addr: addr}
+	return ln, net.JoinHostPort(host, strconv.Itoa(actual)), nil
 }
 
 // firstNICIPv4 returns the first IPv4 address of the named NICs (or any

@@ -32,20 +32,21 @@ $LB read --backend fuse --path "$FILE" --len 4096 --batch 70 --secs 20 --drop-ca
 echo "== 4) peer transport (run latencybench serve on a peer node first) =="
 # on peer (TCP): ./latencybench serve --addr 0.0.0.0:13910 --src file --file /nvme/dataset.bin --blocksize 4194304 --direct
 # on peer (RDMA, strict — no TCP listener): ./latencybench serve --rdma --src file --file /nvme/dataset.bin --blocksize 4194304 --direct
-# dataset must be >= KEYS x 4MiB (e.g. --keys 16384 -> 64GiB)
+#   (serve prints the actual bound rsockets port — rgetsockname discovery)
+# dataset must be >= KEYS x 4MiB; --keys 16384 -> the full 64GiB working set
 # full-block path (pre-change baseline):
 for qd in 1 8 32 64 128; do
-  $LB read --backend peer --addr PEER:13910 --len 4096 --qd $qd --secs 10 --out "$OUT/lb-peer-tcp-fullblock.json"
+  $LB read --backend peer --addr PEER:13910 --keys 16384 --len 4096 --qd $qd --secs 10 --out "$OUT/lb-peer-tcp-fullblock.json"
 done
-$LB read --backend peer --addr PEER:13910 --len 4096 --batch 70 --secs 20 --out "$OUT/lb-peer-infer-fullblock.json"
+$LB read --backend peer --addr PEER:13910 --keys 16384 --len 4096 --batch 70 --secs 20 --out "$OUT/lb-peer-infer-fullblock.json"
 # ranged path (--range is REQUIRED for the fast-path protocol):
 for qd in 1 8 32 64 128; do
-  $LB read --backend peer --addr PEER:13910 --range --len 4096 --qd $qd --secs 10 --out "$OUT/lb-peer-tcp-range.json"
+  $LB read --backend peer --addr PEER:13910 --keys 16384 --range --len 4096 --qd $qd --secs 10 --out "$OUT/lb-peer-tcp-range.json"
 done
-$LB read --backend peer --addr PEER:13910 --range --len 4096 --batch 70 --secs 20 --out "$OUT/lb-peer-infer-range.json"
+$LB read --backend peer --addr PEER:13910 --keys 16384 --range --len 4096 --batch 70 --secs 20 --out "$OUT/lb-peer-infer-range.json"
 # RDMA (build latencybench with: go build -tags rdma; rping must pass first):
 for qd in 1 8 32 64 128; do
-  $LB read --backend peer --addr PEER:13910 --range --len 4096 --qd $qd --secs 10 --rdma --out "$OUT/lb-peer-rdma-range.json"
+  $LB read --backend peer --addr PEER:13910 --keys 16384 --range --len 4096 --qd $qd --secs 10 --rdma --out "$OUT/lb-peer-rdma-range.json"
 done
 
 echo "Results in $OUT"

@@ -179,6 +179,12 @@ func (c *RingClient) SetStrictRDMA(v bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.strictRDMA = v
+	if v {
+		// The pool is keyed by peer address, not transport: previously pooled
+		// TCP connections must not be reused under strict mode (review round
+		// 3). Drop the whole idle inventory; fresh dials honor the new policy.
+		c.pool.flush()
+	}
 }
 
 // candidate returns the best non-evicted, non-self member for key, or nil.

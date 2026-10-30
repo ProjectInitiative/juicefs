@@ -125,6 +125,19 @@ func (p *connPool) release(peer string, conn net.Conn, tr Transport) {
 // discard closes a connection unconditionally (after any error).
 func (p *connPool) discard(conn net.Conn) { _ = conn.Close() }
 
+// flush closes every idle connection (transport-policy changes, e.g.
+// enabling strict RDMA: stale TCP conns must not be reused).
+func (p *connPool) flush() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for peer, stack := range p.idle {
+		for _, pc := range stack {
+			_ = pc.Conn.Close()
+		}
+		delete(p.idle, peer)
+	}
+}
+
 // stats exposes dial/reuse counters and the idle inventory (tests/metrics).
 func (p *connPool) stats() (dials, reuses, idle int) {
 	p.mu.Lock()

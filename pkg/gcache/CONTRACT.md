@@ -214,6 +214,12 @@ key format sample hash round-trip (§1), compressor string selection (§3),
 ServerSource satisfiable by a test adapter (§4). Run before/after upstream
 sync: `go test ./pkg/gcache/ -run TestContract`.
 
+**Strict verification mode (opt-in):** `SetStrictRDMA(true)` forbids the TCP
+fallback entirely — a member without `RdmaAddr` is an error, the RDMA retry
+backoff is bypassed (every fetch attempts the endpoint), and enabling it
+flushes the connection pool so previously pooled TCP connections are not
+reused. Production clients default to strict OFF (normal fallback chain).
+
 ## 11. RDMA transport (enterprise 5.3 parity)
 
 * Client: `Transport` interface (transport.go): `Dial(ctx, addr) (net.Conn, error)`

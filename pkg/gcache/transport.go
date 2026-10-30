@@ -59,8 +59,10 @@ func (c *RingClient) dialFailover(ctx context.Context, m Member) (net.Conn, Tran
 		}
 	}
 	// Guard c.rdma != nil: a TCP-only client must not panic on a member that
-	// advertises an RDMA endpoint (mixed-version rings).
-	if c.rdma != nil && m.RdmaAddr != "" && !(st.rdmaDown && time.Since(st.downAt) < rdmaRetryInterval) {
+	// advertises an RDMA endpoint (mixed-version rings). Strict mode attempts
+	// RDMA even during retry backoff — skipping the attempt would silently
+	// proceed to TCP (review round 3, finding 4).
+	if c.rdma != nil && m.RdmaAddr != "" && (strict || !(st.rdmaDown && time.Since(st.downAt) < rdmaRetryInterval)) {
 		conn, err := c.rdma.Dial(ctx, m.RdmaAddr)
 		if err == nil {
 			c.clearRdmaDown(m.Addr)
