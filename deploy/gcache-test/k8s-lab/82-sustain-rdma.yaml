@@ -1,0 +1,37 @@
+# Sustained low-concurrency rsockets test: QD2 x 30s and QD4 x 30s against a
+# FRESH server — is the stall concurrency-triggered or time/volume-triggered?
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-sustain-rdma
+  namespace: llm-test
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      nodeName: chronometer
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: sustain
+        image: golang:1.25-bookworm
+        securityContext: { privileged: true }
+        command: ["bash","-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
+          LBR=/var/tmp/lb-bins/latencybench-rdma
+          RAIL=172.16.5.56
+          echo "== post-stall server (not restarted): QD2 15s"
+          timeout 60 $LBR read --backend peer --addr $RAIL:13922 --rdma --keys 256 --range --verify --len 4096 --qd 2 --secs 15 --out /tmp/sust-post.json || echo "POST-STALL FAILED"
+          echo "== fresh server required for the sustained legs — see job lb-dgx-mem-rdma restart"
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: dev, mountPath: /dev }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
