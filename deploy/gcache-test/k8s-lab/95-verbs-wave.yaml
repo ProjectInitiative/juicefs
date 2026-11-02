@@ -63,6 +63,7 @@ spec:
           apt-get update -qq && apt-get install -y -qq librdmacm-dev libibverbs-dev >/dev/null
           RAIL=172.16.5.56
           export VB_SRC_IP=172.16.5.55
+          export VB_DEBUG=1
           echo "waiting for server..."; sleep 40
           echo "##### wave test: 3 waves per conns level against the SAME server process"
           for c in 8 16 32 64 128; do

@@ -53,6 +53,8 @@
 #include <unistd.h>
 
 #define SLOTS        64      /* posted receive ring per connection */
+static int dbg = 0;             /* VB_DEBUG=1: per-step data-path prints */
+#define DBG(...) do { if (dbg) fprintf(stderr, __VA_ARGS__); } while (0)
 #define MAX_MSG      65536   /* max SEND payload per WR (frame chunk) */
 #define DEF_PAYLOAD  4096
 
@@ -205,12 +207,15 @@ static int server_echo(struct vconn *c, uint8_t *frame, uint32_t total) {
         wr.opcode = IBV_WR_SEND;
         wr.send_flags = IBV_SEND_SIGNALED | (chunk <= 64 ? IBV_SEND_INLINE : 0);
         wr.sg_list = &sge; wr.num_sge = 1;
-        if (ibv_post_send(c->id->qp, &wr, &bad)) return -1;
+        int pr = ibv_post_send(c->id->qp, &wr, &bad);
+        DBG("[srv] post_send rv=%d chunk=%u\n", pr, chunk);
+        if (pr) return -1;
         /* wait for the send completion before reusing sendbuf (req 8) */
         struct ibv_wc wc; int done = 0;
         while (!done) {
             int nwc = ibv_poll_cq(c->scq, 1, &wc);
             if (nwc > 0) {
+                DBG("[srv] send WC status=%d\n", wc.status);
                 if (wc.status != IBV_WC_SUCCESS) return -1;
                 done = 1;
             } else if (nwc < 0) return -1;
@@ -230,6 +235,7 @@ static void handle_recv(struct vconn *c, struct buf *b, uint32_t n) {
         if (rv == 0) return;
         n = 0; /* consumed the whole WR payload */
         if (c->is_server) {
+            DBG("[srv] frame assembled total=%u nonce=%u\n", c->expect_total, c->expect_nonce);
             if (server_echo(c, frame, flen)) { atomic_store(&c->stop, 1); return; }
             /* re-arm for the next frame */
             c->have_hdr = 0; c->framegot = 0;
@@ -254,6 +260,7 @@ static void *recv_thread(void *arg) {
                 return NULL;
             }
             struct buf *b = (struct buf *)wc.wr_id;
+            DBG("recv WC len=%u\n", wc.byte_len);
             handle_recv(c, b, wc.byte_len);
             if (post_recv(c, b)) { atomic_store(&c->stop, 1); return NULL; }
         }
@@ -387,12 +394,17 @@ static void *cli_worker(void *arg) {
             wr.wr_id = 1; wr.opcode = IBV_WR_SEND;
             wr.send_flags = IBV_SEND_SIGNALED | (chunk <= 64 ? IBV_SEND_INLINE : 0);
             wr.sg_list = &sge; wr.num_sge = 1;
-            if (ibv_post_send(c->id->qp, &wr, &bad)) { a->err = 1; goto out; }
+            int pr = ibv_post_send(c->id->qp, &wr, &bad);
+            DBG("[cli %d] post_send rv=%d chunk=%u\n", a->idx, pr, chunk);
+            if (pr) { a->err = 1; goto out; }
             struct ibv_wc wc; int done = 0;
             while (!done) {
                 int nwc = ibv_poll_cq(c->scq, 1, &wc);
-                if (nwc > 0) { if (wc.status) { a->err = 2; goto out; } done = 1; }
-                else if (nwc < 0) { a->err = 3; goto out; }
+                if (nwc > 0) {
+                    DBG("[cli %d] send WC status=%d\n", a->idx, wc.status);
+                    if (wc.status) { a->err = 2; goto out; }
+                    done = 1;
+                } else if (nwc < 0) { a->err = 3; goto out; }
                 else sched_yield();
             }
             off += chunk; remaining -= chunk;
@@ -400,10 +412,11 @@ static void *cli_worker(void *arg) {
         /* bounded wait for the echoed frame; stall-ms = 3000 */
         double deadline = now_us() + 3e6;
         while (!atomic_load(&c->frame_done)) {
-            if (atomic_load(&c->stop)) { a->err = 4; goto out; }
-            if (now_us() >= deadline) { a->err = 5; goto out; } /* stall */
+            if (atomic_load(&c->stop)) { DBG("[cli %d] conn stopped in wait\n", a->idx); a->err = 4; goto out; }
+            if (now_us() >= deadline) { DBG("[cli %d] STALL in frame wait\n", a->idx); a->err = 5; goto out; }
             struct timespec ts = {0, 20000}; nanosleep(&ts, NULL);
         }
+        DBG("[cli %d] echo frame done (total=%u nonce=%u)\n", a->idx, c->expect_total, c->expect_nonce);
         if (c->expect_total != a->plen) { a->err = 6; goto out; }
         int bad_at = check_payload(c->frame + 8, a->plen, nonce);
         if (bad_at >= 0) { a->err = 7; goto out; } /* mismatch */
@@ -519,6 +532,7 @@ static int run_server(const char *port) {
 }
 
 int main(int argc, char **argv) {
+    dbg = getenv("VB_DEBUG") != NULL;
     if (argc < 3) {
         fprintf(stderr,
             "usage: %s server PORT\n"
