@@ -46,7 +46,11 @@ package gcache
 #endif
 
 static int c_rsocket(int *saved_errno) {
-	int fd = rsocket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	// Plain SOCK_STREAM: librdmacm's rsocket() rejects type flags —
+	// SOCK_STREAM|SOCK_NONBLOCK fails with EOPNOTSUPP (verified on the DGX
+	// fabric). The conn adapters poll readiness themselves, so a blocking
+	// fd is fine.
+	int fd = rsocket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) *saved_errno = errno;
 	return fd;
 }
