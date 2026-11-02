@@ -1,0 +1,91 @@
+# Phase-1 verbs POC: native verbs RC-QP wave test.
+# Server (sextant, rail-0 IP): vb_echo server 14090 — serves ALL waves.
+# Client (chronometer): repeated waves of 8/16/32/64/128 conns against the SAME
+# server process + a rapid connect/disconnect cycling phase, per the assignment.
+# This is the milestone test: no ghost-serve, no deadlocks, no leaks across waves.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-verbs-srv
+  namespace: llm-test
+  annotations: { lb-role: "long-running; delete the job to stop it" }
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 21600
+  template:
+    spec:
+      nodeName: sextant
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: srv
+        image: golang:1.25-bookworm
+        securityContext: { privileged: true }
+        command: ["bash","-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev libibverbs-dev >/dev/null
+          stdbuf -o0 /var/tmp/lb-bins/vb_echo server 14090 2>&1 | awk '{ print "[vb-srv] " $0; fflush(); }' &
+          sleep 5
+          echo "verbs server up (RC QPs, per-conn CQs); waiting forever"
+          sleep infinity
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: dev, mountPath: /dev }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-verbs-cli
+  namespace: llm-test
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: chronometer
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: cli
+        image: golang:1.25-bookworm
+        securityContext: { privileged: true }
+        command: ["bash","-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev libibverbs-dev >/dev/null
+          RAIL=172.16.5.56
+          echo "waiting for server..."; sleep 40
+          echo "##### wave test: 3 waves per conns level against the SAME server process"
+          for c in 8 16 32 64 128; do
+            echo "##### CONNS=$c waves=3 payload=4096"
+            timeout 300 /var/tmp/lb-bins/vb_echo client $RAIL 14090 $c 5 4096 3 3000
+            echo "exit $?"
+          done
+          echo "##### long-lived: 1 wave, 8 conns, 30s each"
+          timeout 300 /var/tmp/lb-bins/vb_echo client $RAIL 14090 8 30 4096 1 3000
+          echo "exit $?"
+          echo "##### rapid connect/disconnect: 10 waves of 8 conns x 2s"
+          timeout 600 /var/tmp/lb-bins/vb_echo client $RAIL 14090 8 2 4096 10 3000
+          echo "exit $?"
+          echo "##### payload sizes: 64KiB and 256KiB (fragmentation path)"
+          timeout 300 /var/tmp/lb-bins/vb_echo client $RAIL 14090 8 3 65536 2 3000
+          echo "exit $?"
+          timeout 300 /var/tmp/lb-bins/vb_echo client $RAIL 14090 8 3 262144 2 3000
+          echo "exit $?"
+          echo "##### verbs wave test done"
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: dev, mountPath: /dev }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
