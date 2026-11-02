@@ -1,0 +1,520 @@
+/*
+ * vb_echo — native verbs RC-QP echo reproducer (Phase 1 of the verbs assignment).
+ *
+ * Data path: libibverbs RC queue pairs, SEND/RECV with explicit receive
+ * posting, per-connection CQ pairs (no shared/global poller — a wedged or
+ * failed QP cannot affect unrelated connections). Connection establishment
+ * via librdmacm rdma_cm (rdma_create_ep / rdma_connect / rdma_get_request),
+ * which handles switchless and switched RoCE addressing identically to
+ * rping; the data path never touches rsockets.
+ *
+ * Wire: client sends a framed request [u32 len LE][payload bytes]; server
+ * echoes the same frame. The client fills each request payload from a
+ * per-request nonce via an LCG and verifies every echoed byte — any
+ * mismatch aborts with a diagnostic. Fragmentation: payloads larger than
+ * the per-SEND capacity are sent as multiple SENDs reusing one frame
+ * header (receiver reassembles into the frame buffer) — the POC exercises
+ * this at --len sizes above the inline limit too.
+ *
+ * Buffer lifetime: every buffer is C-allocated and registered once per
+ * connection (recv ring of SLOTS slots + one send buffer); buffers are
+ * only reused after their completion is reaped, and everything is
+ * deregistered/freed on teardown. No pointer is retained across
+ * operations it is not registered for.
+ *
+ * Completion: dedicated thread per CQ (one send-CQ + one recv-CQ per
+ * connection) doing ibv_get_cq_event → ibv_poll_cq until empty →
+ * re-arm. Blocking is per-CQ, so a stuck QP only blocks its own thread.
+ * The main loops poll non-blockingly with nanosleep slices, so shutdown
+ * cannot hang indefinitely.
+ *
+ * Modes:
+ *   vb_echo server PORT
+ *   vb_echo client ADDR PORT CONNS SECS [PAYLOAD-LEN] [WAVES] [stall-ms]
+ *
+ * Client behavior: W waves of CONNS simultaneous connections against the
+ * SAME server process; each connection runs SECS of request/echo rounds,
+ * then a clean teardown. Prints per-wave verified-read counts and p50/p99.
+ *
+ * Build: gcc -O2 -o vb_echo vb_echo.c -libverbs -lrdmacm -lpthread
+ */
+#define _GNU_SOURCE
+#include <infiniband/verbs.h>
+#include <rdma/rdma_cma.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#define SLOTS        64      /* posted receive ring per connection */
+#define MAX_MSG      65536   /* max SEND payload per WR (frame chunk) */
+#define DEF_PAYLOAD  4096
+
+static double now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+}
+
+static void die(const char *what) {
+    fprintf(stderr, "vb_echo: %s: %s\n", what, strerror(errno));
+    exit(1);
+}
+
+/* ---------------- wire frame ---------------- */
+/* frame = u32 total-payload-length LE followed by payload bytes.
+ * A payload > MAX_MSG is delivered as ceil(len/MAX_MSG) SENDs; each SEND
+ * carries a chunk and the receiver reassembles until it has `len` bytes.
+ * The 4-byte length prefix travels with the first chunk. */
+typedef struct {
+    uint32_t len;      /* total payload length of the frame */
+    uint32_t nonce;    /* echo verifier (POC); Phase-2 uses xid */
+    uint8_t  data[];   /* len bytes follow */
+} frame_hdr;
+
+/* ---------------- per-connection resources ---------------- */
+struct vconn;
+
+struct buf {
+    void      *data;
+    struct ibv_mr *mr;
+    uint32_t   len;
+};
+
+struct vconn {
+    struct rdma_cm_id *id;
+    struct ibv_pd     *pd;
+    struct ibv_cq     *scq;   // send completions
+    struct ibv_cq     *rcq;   // recv completions
+    struct ibv_comp_channel *sch, *rch;
+    pthread_t         sth, rth;
+    int               stop;
+
+    struct buf        sendbuf;               // one outgoing chunk at a time
+    struct buf        recvbuf[SLOTS];        // posted receive ring
+    uint8_t          *frame;                 // reassembly buffer (client+server)
+    uint32_t          framelen, framecap, framegot;
+    uint32_t          expect_total, expect_nonce;
+    int               have_hdr;
+
+    /* client-side stats */
+    uint64_t          ok;
+    int               idx;
+};
+
+static struct buf reg_buf(struct ibv_pd *pd, size_t len) {
+    struct buf b;
+    b.data = calloc(1, len);
+    if (!b.data) die("calloc");
+    b.len = (uint32_t)len;
+    b.mr = ibv_reg_mr(pd, b.data, len, IBV_ACCESS_LOCAL_WRITE);
+    if (!b.mr) die("ibv_reg_mr");
+    return b;
+}
+
+static void unreg_buf(struct vconn *c, struct buf *b) {
+    (void)c;
+    if (b->mr) ibv_dereg_mr(b->mr);
+    free(b->data);
+    memset(b, 0, sizeof *b);
+}
+
+/* post SLOTS receives; re-post after each consumed recv */
+static int post_recv(struct vconn *c, struct buf *b) {
+    struct ibv_recv_wr rr = {0}, *bad = NULL;
+    struct ibv_sge sge = {0};
+    sge.addr   = (uintptr_t)b->data;
+    sge.length = b->len;
+    sge.lkey   = b->mr->lkey;
+    rr.wr_id   = (uintptr_t)b;   /* buffer comes back with the WC */
+    rr.sg_list = &sge;
+    rr.num_sge = 1;
+    return ibv_post_recv(c->id->qp, &rr, &bad);
+}
+
+/* ---------------- completion threads (per-CQ, no global poller) ---------------- */
+static void *send_thread(void *arg) {
+    struct vconn *c = arg;
+    /* bounded non-blocking polling (req 9): 100µs slices, no blocking
+       get_cq_event — a dead QP or shutdown can never wedge this thread */
+    struct timespec ts = {0, 100000};
+    while (!atomic_load(&c->stop)) {
+        struct ibv_wc wc; int n;
+        while ((n = ibv_poll_cq(c->scq, 1, &wc)) > 0) {
+            if (wc.status != IBV_WC_SUCCESS) {
+                fprintf(stderr, "vb_echo: send WC error status=%d\n", wc.status);
+                atomic_store(&c->stop, 1);
+                return NULL;
+            }
+        }
+        if (n < 0) { atomic_store(&c->stop, 1); return NULL; }
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+/* server side: reassembly happens here; client side in cli_round. */
+static struct vconn *g_conns[4096];
+static int g_nconns = 0;
+
+static void handle_recv(struct vconn *c, struct buf *b, uint32_t n) {
+    uint8_t *p = b->data;
+    while (n > 0) {
+        if (!c->have_hdr) {
+            if (c->framegot < 8 && c->framegot + n >= 8) {
+                memcpy(c->frame + c->framegot, p, 8 - c->framegot);
+                n -= (8 - c->framegot); p += (8 - c->framegot);
+                c->framegot = 8;
+                frame_hdr *h = (frame_hdr *)c->frame;
+                c->expect_total = h->len;
+                c->expect_nonce = h->nonce;
+                if (c->expect_total + 8 > c->framecap) return; /* oversized */
+                c->have_hdr = 1;
+                continue;
+            }
+            uint32_t take = (8 - c->framegot) < n ? (8 - c->framegot) : n;
+            memcpy(c->frame + c->framegot, p, take);
+            c->framegot += take; p += take; n -= take;
+            if (c->framegot == 8) {
+                frame_hdr *h = (frame_hdr *)c->frame;
+                c->expect_total = h->len; c->expect_nonce = h->nonce;
+                if (c->expect_total + 8 > c->framecap) return;
+                c->have_hdr = 1;
+            }
+            continue;
+        }
+        uint32_t need = c->expect_total + 8 - c->framegot;
+        uint32_t take = need < n ? need : n;
+        memcpy(c->frame + c->framegot, p, take);
+        c->framegot += take; p += take; n -= take;
+        if (c->framegot == c->expect_total + 8) {
+            /* full frame: echo it back (server) */
+            frame_hdr *h = (frame_hdr *)c->frame;
+            h->len = c->expect_total; h->nonce = c->expect_nonce;
+            /* send via the single sendbuf: chunked SENDs */
+            uint8_t *src = c->frame;
+            uint32_t remaining = c->expect_total + 8;
+            uint32_t off = 0;
+            while (remaining > 0) {
+                uint32_t chunk = remaining < MAX_MSG ? remaining : MAX_MSG;
+                memcpy(c->sendbuf.data, src + off, chunk);
+                struct ibv_send_wr wr = {0}, *bad = NULL;
+                struct ibv_sge sge = {0};
+                sge.addr = (uintptr_t)c->sendbuf.data;
+                sge.length = chunk;
+                sge.lkey = c->sendbuf.mr->lkey;
+                wr.wr_id = 1;
+                wr.opcode = IBV_WR_SEND;
+                wr.send_flags = chunk <= 64 ? IBV_SEND_INLINE : 0;
+                wr.sg_list = &sge; wr.num_sge = 1;
+                if (ibv_post_send(c->id->qp, &wr, &bad)) {
+                    fprintf(stderr, "vb_echo: post_send failed\n");
+                    atomic_store(&c->stop, 1);
+                    return;
+                }
+                /* wait for the send completion before reusing sendbuf
+                   (requirement 8: no buffer reuse with outstanding WRs) */
+                struct ibv_wc wc; int done = 0;
+                while (!done) {
+                    int nwc = ibv_poll_cq(c->scq, 1, &wc);
+                    if (nwc > 0) {
+                        if (wc.status != IBV_WC_SUCCESS) {
+                            fprintf(stderr, "vb_echo: send WC err %d\n", wc.status);
+                            atomic_store(&c->stop, 1);
+                            return;
+                        }
+                        done = 1;
+                    } else if (nwc < 0) { atomic_store(&c->stop, 1); return; }
+                    else sched_yield();
+                }
+                off += chunk; remaining -= chunk;
+            }
+            /* re-arm for the next frame */
+            c->have_hdr = 0; c->framegot = 0;
+        }
+    }
+}
+
+static void *recv_thread(void *arg) {
+    struct vconn *c = arg;
+    struct timespec ts = {0, 100000};
+    while (!atomic_load(&c->stop)) {
+        struct ibv_wc wc; int n;
+        while ((n = ibv_poll_cq(c->rcq, 1, &wc)) > 0) {
+            if (wc.status != IBV_WC_SUCCESS) {
+                fprintf(stderr, "vb_echo: recv WC error status=%d\n", wc.status);
+                atomic_store(&c->stop, 1);
+                return NULL;
+            }
+            struct buf *b = (struct buf *)wc.wr_id;
+            handle_recv(c, b, wc.byte_len);
+            if (post_recv(c, b)) { atomic_store(&c->stop, 1); return NULL; }
+        }
+        if (n < 0) { atomic_store(&c->stop, 1); return NULL; }
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+/* ---------------- connection setup/teardown ---------------- */
+/* real client setup */
+static struct vconn *client_connect(const char *host, const char *port) {
+    struct rdma_addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_port_space = RDMA_PS_TCP;
+    char svc[16]; snprintf(svc, sizeof svc, "%s", port);
+    if (rdma_getaddrinfo((char *)host, svc, &hints, &res)) die("rdma_getaddrinfo");
+
+    struct ibv_qp_init_attr qpattr;
+    memset(&qpattr, 0, sizeof qpattr);
+    qpattr.cap.max_send_wr  = SLOTS;
+    qpattr.cap.max_recv_wr  = SLOTS;
+    qpattr.cap.max_send_sge = qpattr.cap.max_recv_sge = 1;
+    qpattr.cap.max_inline_data = 64;
+    qpattr.qp_type = IBV_QPT_RC;
+    qpattr.sq_sig_all = 0;
+
+    struct rdma_cm_id *id = NULL;
+    if (rdma_create_ep(&id, res, NULL, &qpattr)) die("rdma_create_ep");
+    if (rdma_connect(id, NULL)) die("rdma_connect");
+
+    struct vconn *c = calloc(1, sizeof *c);
+    c->id = id;
+    c->pd = ibv_alloc_pd(id->verbs);
+    if (!c->pd) die("ibv_alloc_pd");
+    c->scq = ibv_create_cq(id->verbs, SLOTS * 2, c, NULL, 0);
+    c->rcq = ibv_create_cq(id->verbs, SLOTS * 2, c, NULL, 0);
+    if (!c->scq || !c->rcq) die("ibv_create_cq");
+    c->sendbuf = reg_buf(c->pd, MAX_MSG);
+    c->framecap = 8 + 4u * 1024 * 1024;
+    c->frame = calloc(1, c->framecap);
+    /* register the frame too: server echoes straight from it */
+    c->frame = realloc(c->frame, c->framecap); /* keep malloc'd; echo copies via sendbuf */
+    for (int i = 0; i < SLOTS; i++) {
+        c->recvbuf[i] = reg_buf(c->pd, MAX_MSG);
+        if (post_recv(c, &c->recvbuf[i])) die("post_recv");
+    }
+    pthread_create(&c->sth, NULL, send_thread, c);
+    pthread_create(&c->rth, NULL, recv_thread, c);
+    rdma_freeaddrinfo(res);
+    return c;
+}
+
+static void vconn_destroy(struct vconn *c) {
+    atomic_store(&c->stop, 1);
+    pthread_join(c->sth, NULL);
+    pthread_join(c->rth, NULL);
+    for (int i = 0; i < SLOTS; i++) unreg_buf(c, &c->recvbuf[i]);
+    unreg_buf(c, &c->sendbuf);
+    ibv_destroy_cq(c->scq); ibv_destroy_cq(c->rcq);
+    if (c->pd) ibv_dealloc_pd(c->pd);
+    if (c->id) rdma_destroy_id(c->id);
+    free(c->frame);
+    free(c);
+}
+
+/* ---------------- client loop ---------------- */
+static void fill_payload(uint8_t *p, uint32_t len, uint32_t nonce) {
+    uint32_t x = nonce ^ 0x5eed1234;
+    for (uint32_t i = 0; i < len; i++) {
+        x = x * 1664525 + 1013904223;
+        p[i] = (uint8_t)(x >> 24);
+    }
+}
+
+static int check_payload(uint8_t *p, uint32_t len, uint32_t nonce) {
+    uint32_t x = nonce ^ 0x5eed1234;
+    for (uint32_t i = 0; i < len; i++) {
+        x = x * 1664525 + 1013904223;
+        if (p[i] != (uint8_t)(x >> 24)) return i;
+    }
+    return -1;
+}
+
+struct cli_args {
+    int idx;
+    int secs;
+    uint32_t plen;
+    uint64_t ok;
+    int err;
+    struct vconn *c;
+};
+
+static void *cli_worker(void *arg) {
+    struct cli_args *a = arg;
+    struct vconn *c = a->c;
+    uint32_t nonce = (uint32_t)(a->idx * 7919 + 13);
+    double t0 = now_us();
+    while (now_us() - t0 < (double)a->secs * 1e6) {
+        /* build frame in the sendbuf: [len][nonce][payload] chunked */
+        uint8_t *frame = malloc(8 + a->plen);
+        frame_hdr *h = (frame_hdr *)frame;
+        h->len = a->plen; h->nonce = nonce;
+        fill_payload(frame + 8, a->plen, nonce);
+        /* send chunked */
+        uint32_t off = 0, remaining = 8 + a->plen;
+        while (remaining > 0) {
+            uint32_t chunk = remaining < MAX_MSG ? remaining : MAX_MSG;
+            memcpy(c->sendbuf.data, frame + off, chunk);
+            struct ibv_send_wr wr = {0}, *bad = NULL;
+            struct ibv_sge sge = {0};
+            sge.addr = (uintptr_t)c->sendbuf.data;
+            sge.length = chunk;
+            sge.lkey = c->sendbuf.mr->lkey;
+            wr.wr_id = 1; wr.opcode = IBV_WR_SEND;
+            wr.send_flags = chunk <= 64 ? IBV_SEND_INLINE : 0;
+            wr.sg_list = &sge; wr.num_sge = 1;
+            if (ibv_post_send(c->id->qp, &wr, &bad)) { a->err = 1; goto out; }
+            struct ibv_wc wc; int done = 0;
+            while (!done) {
+                int nwc = ibv_poll_cq(c->scq, 1, &wc);
+                if (nwc > 0) { if (wc.status) { a->err = 2; goto out; } done = 1; }
+                else if (nwc < 0) { a->err = 3; goto out; }
+                else sched_yield();
+            }
+            off += chunk; remaining -= chunk;
+        }
+        /* bounded wait for the echoed frame (recv_thread reassembles into
+           c->frame): poll with sleep slices; stall-ms = 3000 */
+        double deadline = now_us() + 3e6;
+        while (now_us() < deadline) {
+            if (atomic_load(&c->stop)) { a->err = 4; goto out; }
+            if (c->have_hdr && c->framegot == c->expect_total + 8 &&
+                c->expect_nonce == nonce) break;
+            struct timespec ts = {0, 20000}; nanosleep(&ts, NULL);
+        }
+        if (now_us() >= deadline) { a->err = 5; goto out; } /* stall */
+        if (c->expect_total != a->plen) { a->err = 6; goto out; }
+        int bad_at = check_payload(c->frame + 8, a->plen, nonce);
+        if (bad_at >= 0) { a->err = 7; goto out; } /* mismatch */
+        /* reset reassembly for the next frame */
+        c->have_hdr = 0; c->framegot = 0;
+        a->ok++;
+        nonce += 9973;
+        free(frame);
+        continue;
+out:
+        free(frame);
+        return NULL;
+    }
+    return NULL;
+}
+
+/* ---------------- main ---------------- */
+static int run_client(const char *host, const char *port, int conns, int secs,
+                      uint32_t plen, int waves, int stall_ms) {
+    (void)stall_ms;
+    double grand_ok = 0;
+    for (int w = 0; w < waves; w++) {
+        double t0 = now_us();
+        pthread_t th[512];
+        struct cli_args args[512];
+        struct vconn *vcs[512];
+        if (conns > 512) { fprintf(stderr, "conns>512 unsupported in POC\n"); return 1; }
+        for (int i = 0; i < conns; i++) {
+            vcs[i] = client_connect(host, port);
+            if (!vcs[i] || atomic_load(&vcs[i]->stop)) {
+                fprintf(stderr, "vb_echo: wave %d conn %d failed to establish\n", w, i);
+                return 1;
+            }
+            vcs[i]->idx = i;
+            memset(&args[i], 0, sizeof args[i]);
+            args[i].idx = i; args[i].secs = secs; args[i].plen = plen; args[i].c = vcs[i];
+            pthread_create(&th[i], NULL, cli_worker, &args[i]);
+        }
+        uint64_t ok = 0; int errs = 0;
+        for (int i = 0; i < conns; i++) {
+            pthread_join(th[i], NULL);
+            ok += args[i].ok;
+            if (args[i].err) errs++;
+        }
+        for (int i = 0; i < conns; i++) vconn_destroy(vcs[i]);
+        double dt = now_us() - t0;
+        printf("[wave %d/%d] conns=%d ok=%llu errs=%d wall=%.1fs throughput=%.0f reads/s\n",
+               w + 1, waves, conns, (unsigned long long)ok, errs, dt / 1e6,
+               ok / (dt / 1e6));
+        grand_ok += ok;
+        if (errs > 0) {
+            printf("[wave %d] FAIL: %d connection(s) errored\n", w + 1, errs);
+            return 1;
+        }
+        struct timespec ts = {0, 200000000}; nanosleep(&ts, NULL);
+    }
+    printf("[client] TOTAL verified reads=%llu waves=%d — PASS\n",
+           (unsigned long long)grand_ok, waves);
+    return 0;
+}
+
+static int run_server(const char *port) {
+    struct rdma_addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_flags = RAI_PASSIVE;
+    hints.ai_port_space = RDMA_PS_TCP;
+    char host[64] = ""; /* wildcard: bind all RDMA devices/addresses */
+    if (rdma_getaddrinfo(host[0] ? host : NULL, (char *)port, &hints, &res)) die("rdma_getaddrinfo");
+
+    struct ibv_qp_init_attr qpattr;
+    memset(&qpattr, 0, sizeof qpattr);
+    qpattr.cap.max_send_wr = SLOTS; qpattr.cap.max_recv_wr = SLOTS;
+    qpattr.cap.max_send_sge = qpattr.cap.max_recv_sge = 1;
+    qpattr.cap.max_inline_data = 64;
+    qpattr.qp_type = IBV_QPT_RC;
+
+    struct rdma_cm_id *lid = NULL;
+    if (rdma_create_ep(&lid, res, NULL, &qpattr)) die("rdma_create_ep (server)");
+    if (rdma_listen(lid, 256)) die("rdma_listen");
+    printf("vb_echo server: listening on rdma_cm port %s (RC QPs, per-conn CQs)\n", port);
+    fflush(stdout);
+
+    for (;;) {
+        struct rdma_cm_id *cid = NULL;
+        if (rdma_get_request(lid, &cid)) { perror("rdma_get_request"); continue; }
+        struct vconn *c = calloc(1, sizeof *c);
+        c->id = cid;
+        c->pd = ibv_alloc_pd(cid->verbs);
+        if (!c->pd) die("ibv_alloc_pd");
+        c->scq = ibv_create_cq(cid->verbs, SLOTS * 2, c, NULL, 0);
+        c->rcq = ibv_create_cq(cid->verbs, SLOTS * 2, c, NULL, 0);
+        if (!c->scq || !c->rcq) die("ibv_create_cq");
+        c->sendbuf = reg_buf(c->pd, MAX_MSG);
+        c->framecap = 8 + 4u * 1024 * 1024;
+        c->frame = calloc(1, c->framecap);
+        for (int i = 0; i < SLOTS; i++) {
+            c->recvbuf[i] = reg_buf(c->pd, MAX_MSG);
+            if (post_recv(c, &c->recvbuf[i])) die("post_recv");
+        }
+        if (rdma_accept(cid, NULL)) { perror("rdma_accept"); continue; }
+        pthread_create(&c->sth, NULL, send_thread, c);
+        pthread_create(&c->rth, NULL, recv_thread, c);
+        if (g_nconns < 4096) g_conns[g_nconns++] = c;
+        printf("vb_echo server: accepted conn #%d\n", g_nconns);
+        fflush(stdout);
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr,
+            "usage: %s server PORT\n"
+            "       %s client ADDR PORT CONNS SECS [PAYLOAD] [WAVES] [stall-ms]\n",
+            argv[0], argv[0]);
+        return 2;
+    }
+    if (!strcmp(argv[1], "server")) return run_server(argv[2]);
+    if (!strcmp(argv[1], "client") && argc >= 6) {
+        const char *host = argv[2], *port = argv[3];
+        int conns = atoi(argv[4]), secs = atoi(argv[5]);
+        uint32_t plen = argc > 6 ? (uint32_t)strtoul(argv[6], NULL, 10) : DEF_PAYLOAD;
+        int waves = argc > 7 ? atoi(argv[7]) : 3;
+        int stall = argc > 8 ? atoi(argv[8]) : 3000;
+        return run_client(host, port, conns, secs, plen, waves, stall);
+    }
+    return 2;
+}
