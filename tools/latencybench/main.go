@@ -108,6 +108,7 @@ type runResult struct {
 	IOPS       float64      `json:"iops"`
 	MiBS       float64      `json:"mibs_per_s"`
 	Errors     int64        `json:"errors"`
+	FirstErr   string       `json:"first_error,omitempty"`
 	Mismatches int64        `json:"mismatches,omitempty"`
 	Verify     bool         `json:"verify,omitempty"`
 	Transport  string       `json:"transport"`
@@ -732,11 +733,14 @@ func benchMember(addr, rdmaAddr string, useRDMA bool) gcache.Member {
 	return m
 }
 
-func newPeer(addrs, rdmaAddrs []string, keys, bs int, useRange, unique, useRDMA, verify bool, timeout time.Duration) *peerClient {
+func newPeer(addrs, rdmaAddrs []string, keys, bs int, useRange, unique, useRDMA, verify bool, timeout time.Duration, maxIdle int) *peerClient {
 	if verify && bs%patPageSize != 0 {
 		fatalf("--verify requires --bs to be a multiple of %d (got %d)", patPageSize, bs)
 	}
-	rc := gcache.NewRingClient(timeout, 31, "latencybench")
+	if maxIdle < 31 {
+		maxIdle = 31
+	}
+	rc := gcache.NewRingClient(timeout, maxIdle, "latencybench")
 	if useRDMA {
 		rt, err := gcache.DialRDMA()
 		if err != nil {
@@ -942,6 +946,7 @@ func runOnce(backend string, addrs, rdmaAddrs []string, path string, useRange, u
 	lat := make([]float64, 0, 1<<20)
 	batchLat := make([]float64, 0, 1024)
 	var errs, ops, bytes atomic.Int64
+	var firstErr atomic.Value // string: first error seen (diagnostics)
 
 	var fr *fileReader
 	var pr *peerClient
@@ -966,7 +971,11 @@ func runOnce(backend string, addrs, rdmaAddrs []string, path string, useRange, u
 		}, done: func() {}}
 		setupWorker = func(int) *readWorker { return shared }
 	case "peer":
-		pr = newPeer(addrs, rdmaAddrs, keys, bs, useRange, unique, useRDMA, verify, timeout)
+		mi := qd
+		if batch > mi {
+			mi = batch
+		}
+		pr = newPeer(addrs, rdmaAddrs, keys, bs, useRange, unique, useRDMA, verify, timeout, mi)
 		shared := &readWorker{read: pr.readAt, done: func() {}}
 		setupWorker = func(int) *readWorker { return shared }
 	case "readsvc":
@@ -1037,6 +1046,9 @@ func runOnce(backend string, addrs, rdmaAddrs []string, path string, useRange, u
 					s := time.Now()
 					if err := slots[i].read(bufs[i], offs[i], rngs[i]); err != nil {
 						errs.Add(1)
+						if firstErr.Load() == nil {
+							firstErr.Store(err.Error())
+						}
 					} else {
 						d := float64(time.Since(s).Microseconds())
 						mu.Lock()
@@ -1087,6 +1099,9 @@ func runOnce(backend string, addrs, rdmaAddrs []string, path string, useRange, u
 					d := float64(time.Since(start).Microseconds())
 					if err != nil {
 						errs.Add(1)
+						if firstErr.Load() == nil {
+							firstErr.Store(err.Error())
+						}
 					} else {
 						mu.Lock()
 						lat = append(lat, d)
@@ -1108,6 +1123,9 @@ func runOnce(backend string, addrs, rdmaAddrs []string, path string, useRange, u
 		res.MiBS = float64(bytes.Load()) / (1 << 20) / secs
 	}
 	res.Errors = errs.Load()
+	if v := firstErr.Load(); v != nil {
+		res.FirstErr = v.(string)
+	}
 	if pr != nil {
 		res.Mismatches = pr.mismatch.Load()
 	}
@@ -1142,6 +1160,9 @@ func printTable(r runResult) {
 	fmt.Printf("  iops=%.0f mibs=%.1f errors=%d transport=%s", r.IOPS, r.MiBS, r.Errors, r.Transport)
 	if r.Verify {
 		fmt.Printf(" mismatches=%d", r.Mismatches)
+	}
+	if r.FirstErr != "" {
+		fmt.Printf("\n          first-err: %s", r.FirstErr)
 	}
 	fmt.Println()
 }

@@ -227,11 +227,15 @@ spec:
           echo "--- C4 mem rsockets"
           $LBR read --backend peer --addr $RAIL:13922 --rdma --keys 256 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-mem-rdma.json
           echo "DGX_MATRIX_DONE"
+        securityContext: { privileged: true }
         volumeMounts:
         - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
         - { name: data, mountPath: /var/tmp/lb-data }
+        - { name: dev, mountPath: /dev }
       volumes:
       - name: bins
         hostPath: { path: /var/tmp/lb-bins, type: Directory }
       - name: data
         hostPath: { path: /var/tmp/lb-data, type: DirectoryOrCreate }
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
