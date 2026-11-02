@@ -44,9 +44,17 @@ const tcpEndpointDialTimeout = 2 * time.Second
 // backoff the backoff persists (failback is periodic, not per-dial).
 func (c *RingClient) dialFailover(ctx context.Context, m Member) (net.Conn, Transport, error) {
 	c.mu.Lock()
-	st := c.epState[m.Addr]
 	strict := c.strictRDMA
 	c.mu.Unlock()
+
+	// All advertised RDMA endpoints for this member: link-specific lists
+	// (switchless rings) plus the single legacy field. Order: RdmaAddr
+	// first (explicit config), then RdmaAddrs.
+	var rdmaEndpoints []string
+	if m.RdmaAddr != "" {
+		rdmaEndpoints = append(rdmaEndpoints, m.RdmaAddr)
+	}
+	rdmaEndpoints = append(rdmaEndpoints, m.RdmaAddrs...)
 
 	// Strict verification mode (benchmarks/transport checks): RDMA or fail —
 	// never silently degrade to TCP (which would contaminate results).
@@ -54,7 +62,7 @@ func (c *RingClient) dialFailover(ctx context.Context, m Member) (net.Conn, Tran
 		if c.rdma == nil {
 			return nil, nil, errors.New("strict RDMA: no RDMA transport configured")
 		}
-		if m.RdmaAddr == "" {
+		if len(rdmaEndpoints) == 0 {
 			return nil, nil, fmt.Errorf("strict RDMA: peer %s advertises no RDMA endpoint", m.Addr)
 		}
 	}
@@ -62,17 +70,37 @@ func (c *RingClient) dialFailover(ctx context.Context, m Member) (net.Conn, Tran
 	// advertises an RDMA endpoint (mixed-version rings). Strict mode attempts
 	// RDMA even during retry backoff — skipping the attempt would silently
 	// proceed to TCP (review round 3, finding 4).
-	if c.rdma != nil && m.RdmaAddr != "" && (strict || !(st.rdmaDown && time.Since(st.downAt) < rdmaRetryInterval)) {
-		conn, err := c.rdma.Dial(ctx, m.RdmaAddr)
-		if err == nil {
-			c.clearRdmaDown(m.Addr)
-			return conn, c.rdma, nil
+	if c.rdma != nil && len(rdmaEndpoints) > 0 {
+		var lastErr error
+		tried := 0
+		for _, ep := range rdmaEndpoints {
+			c.mu.Lock()
+			epSt := c.epState[ep] // per-ENDPOINT backoff: one dead rail must
+			c.mu.Unlock()         // not take down the other rails of a pair
+			if !strict && epSt.rdmaDown && time.Since(epSt.downAt) < rdmaRetryInterval {
+				continue
+			}
+			tried++
+			conn, err := c.rdma.Dial(ctx, ep)
+			if err == nil {
+				c.clearRdmaDown(ep)
+				c.setLastEndpoint(ep)
+				return conn, c.rdma, nil
+			}
+			lastErr = err
+			if strict {
+				continue // strict: report every endpoint before failing
+			}
+			logger.Warnf("gcache rdma dial %s (%s) failed, trying next endpoint/tcp: %v", ep, c.rdma.Name(), err)
+			c.markRdmaDown(ep)
 		}
 		if strict {
-			return nil, nil, fmt.Errorf("strict RDMA: dial %s failed (no TCP fallback): %w", m.RdmaAddr, err)
+			return nil, nil, fmt.Errorf("strict RDMA: dial failed for %d endpoint(s) of %s (no TCP fallback): %w",
+				tried, m.Addr, lastErr)
 		}
-		logger.Warnf("gcache rdma dial %s (%s) failed, falling back to tcp: %v", m.RdmaAddr, c.rdma.Name(), err)
-		c.markRdmaDown(m.Addr)
+		if tried > 0 {
+			logger.Warnf("gcache rdma: all %d endpoint(s) of %s failed, falling back to tcp", tried, m.Addr)
+		}
 	}
 	// Multi-endpoint members (direct-ring fabrics expose one subnet per
 	// peer pair): try every advertised address in order. Addrs falls back
@@ -88,6 +116,7 @@ func (c *RingClient) dialFailover(ctx context.Context, m Member) (net.Conn, Tran
 		conn, err = c.tcp.Dial(endpointCtx, a)
 		cancel()
 		if err == nil {
+			c.setLastEndpoint(a)
 			return conn, c.tcp, nil
 		}
 		if ctx.Err() != nil {
@@ -95,6 +124,20 @@ func (c *RingClient) dialFailover(ctx context.Context, m Member) (net.Conn, Tran
 		}
 	}
 	return nil, nil, err
+}
+
+// setLastEndpoint records the endpoint of the most recent successful dial
+// (transport/hop reporting in benchmark results).
+func (c *RingClient) setLastEndpoint(ep string) {
+	c.lastEndpoint.Store(ep)
+}
+
+// LastEndpoint returns the endpoint of the most recent successful dial.
+func (c *RingClient) LastEndpoint() string {
+	if v := c.lastEndpoint.Load(); v != nil {
+		return v.(string)
+	}
+	return ""
 }
 
 func (c *RingClient) markRdmaDown(addr string) {

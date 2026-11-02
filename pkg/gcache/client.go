@@ -25,6 +25,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -46,6 +47,7 @@ type RingClient struct {
 	strictRDMA  bool      // verification mode: no TCP fallback when RDMA configured
 	epState     map[string]endpointState
 	pool        *connPool
+	lastEndpoint atomic.Value // string: endpoint of the last successful dial
 
 	mu      sync.Mutex
 	failCnt map[string]int    // peer addr -> consecutive failures

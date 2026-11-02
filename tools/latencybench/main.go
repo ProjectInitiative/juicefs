@@ -108,6 +108,9 @@ type runResult struct {
 	IOPS       float64      `json:"iops"`
 	MiBS       float64      `json:"mibs_per_s"`
 	Errors     int64        `json:"errors"`
+	Endpoint   string       `json:"endpoint,omitempty"` // last successful dial endpoint
+	Class      string       `json:"class,omitempty"`    // direct-rdma | routed-rdma | tcp
+	Hops       int          `json:"hops,omitempty"`     // 0 direct, >=1 routed
 	FirstErr   string       `json:"first_error,omitempty"`
 	Mismatches int64        `json:"mismatches,omitempty"`
 	Verify     bool         `json:"verify,omitempty"`
@@ -1128,6 +1131,10 @@ func runOnce(backend string, addrs, rdmaAddrs []string, path string, useRange, u
 		res.FirstErr = v.(string)
 	}
 	if pr != nil {
+		res.Endpoint = pr.rc.LastEndpoint()
+		res.Class, res.Hops = gcache.EndpointClassOf(res.Endpoint)
+	}
+	if pr != nil {
 		res.Mismatches = pr.mismatch.Load()
 	}
 	if backend == "peer" {
@@ -1161,6 +1168,9 @@ func printTable(r runResult) {
 	fmt.Printf("  iops=%.0f mibs=%.1f errors=%d transport=%s", r.IOPS, r.MiBS, r.Errors, r.Transport)
 	if r.Verify {
 		fmt.Printf(" mismatches=%d", r.Mismatches)
+	}
+	if r.Endpoint != "" {
+		fmt.Printf("\n          endpoint=%s class=%s hops=%d", r.Endpoint, r.Class, r.Hops)
 	}
 	if r.FirstErr != "" {
 		fmt.Printf("\n          first-err: %s", r.FirstErr)
@@ -1228,6 +1238,66 @@ func newFlagSet(name string) *flag.FlagSet {
 	return fs
 }
 
+// ---------------------------------------------------------------- topo
+
+// topo probes the connectivity graph: for every peer endpoint, classify
+// direct-rdma / routed-rdma / unavailable / tcp, with latency and (for
+// direct links) hop count. Endpoints come from --addr/--rdma-addr lists or
+// a DGX rdma-fabric.json inventory (--fabric), which yields per-pair rail
+// endpoints automatically.
+func cmdTopo(args []string) {
+	fs := newFlagSet("topo")
+	addr := fs.String("addr", "", "comma-separated peer TCP endpoints")
+	rdmaAddrs := fs.String("rdma-addr", "", "comma-separated RDMA endpoints (parallel to --addr; prefix - to skip TCP classify)")
+	fabric := fs.String("fabric", "", "path to a dgx rdma-fabric.json inventory (yields per-peer rail endpoints)")
+	self := fs.String("self", "", "self node name override for --fabric")
+	rdmaPort := fs.Int("rdma-port", 13912, "peer RDMA listener port for --fabric")
+	tcpPort := fs.Int("tcp-port", 13910, "peer TCP listener port for --fabric")
+	timeout := fs.Duration("timeout", 3*time.Second, "per-endpoint probe timeout")
+	_ = fs.Parse(args)
+
+	var members []gcache.Member
+	if *fabric != "" {
+		data, err := os.ReadFile(*fabric)
+		if err != nil {
+			fatalf("read %s: %v", *fabric, err)
+		}
+		selfNode, peers, err := gcache.MembersFromFabric(data, *self, *rdmaPort, *tcpPort)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		fmt.Printf("fabric inventory: self=%s, %d peer(s)\n", selfNode, len(peers))
+		members = peers
+	}
+	if *addr != "" {
+		addrs := splitCSV(*addr)
+		ra := splitCSV(*rdmaAddrs)
+		for i, a := range addrs {
+			m := gcache.Member{UUID: fmt.Sprintf("peer-%d", i), Addr: a}
+			if i < len(ra) && ra[i] != "" {
+				if strings.HasPrefix(ra[i], "-") { // "-" = TCP-only entry
+					ra[i] = ""
+				} else {
+					m.RdmaAddr = ra[i]
+				}
+			}
+			members = append(members, m)
+		}
+	}
+	if len(members) == 0 {
+		fatalf("nothing to probe: --addr or --fabric required")
+	}
+
+	rc := gcache.NewRingClient(*timeout, 31, "latencybench-topo")
+	if rt, err := gcache.DialRDMA(); err == nil {
+		rc.SetRDMA(rt)
+	} else {
+		fmt.Printf("(no RDMA transport: %v — RDMA endpoints will fail)\n", err)
+	}
+	graph := rc.ProbeTopology(members, *timeout)
+	fmt.Print(gcache.FormatTopology(graph))
+}
+
 // ---------------------------------------------------------------- gen
 
 func cmdGen(args []string) {
@@ -1257,6 +1327,8 @@ func main() {
 		cmdRead(os.Args[2:])
 	case "gen":
 		cmdGen(os.Args[2:])
+	case "topo":
+		cmdTopo(os.Args[2:])
 	default:
 		fmt.Fprintln(os.Stderr, "unknown command:", os.Args[1])
 		os.Exit(2)

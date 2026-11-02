@@ -32,6 +32,12 @@ type Member struct {
 	Addr     string   `json:"addr"`               // primary host:port for the peer RPC listener (TCP)
 	Addrs    []string `json:"addrs,omitempty"`    // all dialable endpoints (direct-ring fabrics; Addr is element 0)
 	RdmaAddr string   `json:"rdmaAddr,omitempty"` // host:port for the RDMA listener ("" = TCP-only member)
+	// RdmaAddrs holds link-specific RDMA endpoints: switchless rings expose
+	// one isolated subnet PER PEER PAIR, so a node's reachable RDMA address
+	// differs per peer (chronometer is 172.16.5.55 toward sextant but
+	// 172.16.7.55 toward octant). Clients try each in order; RdmaAddr (when
+	// set) is tried first. Switched fabrics usually need only one.
+	RdmaAddrs []string `json:"rdmaAddrs,omitempty"`
 	Weight   int      `json:"weight"`             // relative cache capacity (default 1)
 	Version  string   `json:"version"`            // juicefs version, informational
 	TS       int64    `json:"ts"`                 // unix seconds of last heartbeat

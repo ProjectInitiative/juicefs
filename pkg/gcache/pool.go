@@ -64,6 +64,9 @@ type poolConn struct {
 	net.Conn
 	tr         Transport
 	releasedAt time.Time
+	// Endpoint is the peer endpoint address this conn dialed (link-specific
+	// on switchless rings); "" for conns created outside dialFailover.
+	Endpoint string
 }
 
 func newConnPool(maxIdle int, ttl time.Duration) *connPool {
