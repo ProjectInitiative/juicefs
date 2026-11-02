@@ -2,12 +2,13 @@
 # point-to-point rail (172.16.5.0/24 = chronometer-sextant-0, fabric JSON).
 # TCP and rsockets run over the SAME physical link — the decisive comparison.
 #
-#   sextant: 4 servers — file TCP :13911, file RDMA-only :13912,
+#   sextant: 4 server Deployments — file TCP :13911, file RDMA-only :13912,
 #            mem TCP :13921, mem RDMA-only :13922 (transport-only control)
 #   chronometer: client matrix job (verify + QD sweep + batch-70, all 4)
 #
 # Dataset: 16GiB (4096 keys x 4MiB) on the spark root NVMe; server reads are
-# O_DIRECT so page cache never answers.
+# O_DIRECT so page cache never answers. RDMA servers mount /dev + /sys and
+# run privileged (rsockets needs the rdma_cm device + mlx5 uverbs).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -34,116 +35,139 @@ spec:
       - name: data
         hostPath: { path: /var/tmp/lb-data, type: DirectoryOrCreate }
 ---
-# file TCP server (rail)
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: lb-dgx-file-tcp
   namespace: llm-test
   labels: { app: lb-dgx, mode: file-tcp }
 spec:
-  nodeName: sextant
-  restartPolicy: Always
-  hostNetwork: true
-  dnsPolicy: ClusterFirstWithHostNet
-  containers:
-  - name: serve
-    image: golang:1.25-bookworm
-    command: ["/var/tmp/lb-bins/latencybench","serve","--addr","0.0.0.0:13911","--src","file","--file","/var/tmp/lb-data/bench.bin","--blocksize","4194304","--direct"]
-    volumeMounts:
-    - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
-    - { name: data, mountPath: /var/tmp/lb-data, readOnly: true }
-  volumes:
-  - name: bins
-    hostPath: { path: /var/tmp/lb-bins, type: Directory }
-  - name: data
-    hostPath: { path: /var/tmp/lb-data, type: Directory }
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: lb-dgx, mode: file-tcp }
+  template:
+    metadata:
+      labels: { app: lb-dgx, mode: file-tcp }
+    spec:
+      nodeName: sextant
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: serve
+        image: golang:1.25-bookworm
+        command: ["/var/tmp/lb-bins/latencybench","serve","--addr","0.0.0.0:13911","--src","file","--file","/var/tmp/lb-data/bench.bin","--blocksize","4194304","--direct"]
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: data, mountPath: /var/tmp/lb-data, readOnly: true }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: data
+        hostPath: { path: /var/tmp/lb-data, type: Directory }
 ---
-# file RDMA-ONLY server (rail) — needs the HCA: /dev + /sys hostPath, privileged
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: lb-dgx-file-rdma
   namespace: llm-test
   labels: { app: lb-dgx, mode: file-rdma }
 spec:
-  nodeName: sextant
-  restartPolicy: Always
-  hostNetwork: true
-  dnsPolicy: ClusterFirstWithHostNet
-  containers:
-  - name: serve
-    image: golang:1.25-bookworm
-    command: ["bash","-c"]
-    args:
-    - |
-      apt-get update -qq && apt-get install -y -qq librdmacm3 >/dev/null
-      exec /var/tmp/lb-bins/latencybench-rdma serve --rdma --addr :13912 --nics enp1s0f1np1 \
-           --src file --file /var/tmp/lb-data/bench.bin --blocksize 4194304 --direct
-    securityContext: { privileged: true }
-    volumeMounts:
-    - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
-    - { name: data, mountPath: /var/tmp/lb-data, readOnly: true }
-    - { name: dev, mountPath: /dev }
-    - { name: sys, mountPath: /host-sys, readOnly: true }
-  volumes:
-  - name: bins
-    hostPath: { path: /var/tmp/lb-bins, type: Directory }
-  - name: data
-    hostPath: { path: /var/tmp/lb-data, type: Directory }
-  - name: dev
-    hostPath: { path: /dev, type: Directory }
-  - name: sys
-    hostPath: { path: /sys, type: Directory }
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: lb-dgx, mode: file-rdma }
+  template:
+    metadata:
+      labels: { app: lb-dgx, mode: file-rdma }
+    spec:
+      nodeName: sextant
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: serve
+        image: golang:1.25-bookworm
+        command: ["bash","-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq librdmacm3 >/dev/null
+          exec /var/tmp/lb-bins/latencybench-rdma serve --rdma --addr :13912 --nics enp1s0f1np1 \
+               --src file --file /var/tmp/lb-data/bench.bin --blocksize 4194304 --direct
+        securityContext: { privileged: true }
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: data, mountPath: /var/tmp/lb-data, readOnly: true }
+        - { name: dev, mountPath: /dev }
+        - { name: sys, mountPath: /host-sys, readOnly: true }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: data
+        hostPath: { path: /var/tmp/lb-data, type: Directory }
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
+      - name: sys
+        hostPath: { path: /sys, type: Directory }
 ---
-# mem TCP server (transport-only control)
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: lb-dgx-mem-tcp
   namespace: llm-test
   labels: { app: lb-dgx, mode: mem-tcp }
 spec:
-  nodeName: sextant
-  restartPolicy: Always
-  hostNetwork: true
-  dnsPolicy: ClusterFirstWithHostNet
-  containers:
-  - name: serve
-    image: golang:1.25-bookworm
-    command: ["/var/tmp/lb-bins/latencybench","serve","--addr","0.0.0.0:13921","--src","mem","--blocks","4096","--blocksize","4194304"]
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: lb-dgx, mode: mem-tcp }
+  template:
+    metadata:
+      labels: { app: lb-dgx, mode: mem-tcp }
+    spec:
+      nodeName: sextant
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: serve
+        image: golang:1.25-bookworm
+        command: ["/var/tmp/lb-bins/latencybench","serve","--addr","0.0.0.0:13921","--src","mem","--blocks","4096","--blocksize","4194304"]
 ---
-# mem RDMA-ONLY server (transport-only control)
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: lb-dgx-mem-rdma
   namespace: llm-test
   labels: { app: lb-dgx, mode: mem-rdma }
 spec:
-  nodeName: sextant
-  restartPolicy: Always
-  hostNetwork: true
-  dnsPolicy: ClusterFirstWithHostNet
-  containers:
-  - name: serve
-    image: golang:1.25-bookworm
-    command: ["bash","-c"]
-    args:
-    - |
-      apt-get update -qq && apt-get install -y -qq librdmacm3 >/dev/null
-      exec /var/tmp/lb-bins/latencybench-rdma serve --rdma --addr :13922 --nics enp1s0f1np1 --src mem --blocks 4096 --blocksize 4194304
-    securityContext: { privileged: true }
-    volumeMounts:
-    - { name: dev, mountPath: /dev }
-    - { name: sys, mountPath: /host-sys, readOnly: true }
-  volumes:
-  - name: dev
-    hostPath: { path: /dev, type: Directory }
-  - name: sys
-    hostPath: { path: /sys, type: Directory }
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: lb-dgx, mode: mem-rdma }
+  template:
+    metadata:
+      labels: { app: lb-dgx, mode: mem-rdma }
+    spec:
+      nodeName: sextant
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: serve
+        image: golang:1.25-bookworm
+        command: ["bash","-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq librdmacm3 >/dev/null
+          exec /var/tmp/lb-bins/latencybench-rdma serve --rdma --addr :13922 --nics enp1s0f1np1 --src mem --blocks 4096 --blocksize 4194304
+        securityContext: { privileged: true }
+        volumeMounts:
+        - { name: dev, mountPath: /dev }
+        - { name: sys, mountPath: /host-sys, readOnly: true }
+      volumes:
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
+      - name: sys
+        hostPath: { path: /sys, type: Directory }
 ---
-# client matrix on chronometer — all four endpoints; JSON to /var/tmp/lb-data/results
 apiVersion: batch/v1
 kind: Job
 metadata:

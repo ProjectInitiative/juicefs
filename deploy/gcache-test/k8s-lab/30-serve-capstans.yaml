@@ -1,44 +1,59 @@
 # gcache latencybench — stage 3 (capstans): peer servers over the bonded
 # 2x10GbE k8s network (hostNetwork -> node IPs 172.16.4.52/.53), serving the
 # patterned 64GiB dataset with genuine O_DIRECT preads (owner-NVMe model).
-apiVersion: v1
-kind: Pod
+# Deployments (the MCP SA may not create bare Pods; the RS controller can).
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: lb-serve-capstan2
   namespace: llm-test
   labels: { app: lb-serve, node: capstan2 }
 spec:
-  nodeName: capstan2
-  restartPolicy: Always
-  hostNetwork: true
-  dnsPolicy: ClusterFirstWithHostNet
-  containers:
-  - name: serve
-    image: golang:1.25-bookworm
-    command: ["/mnt/jfs-cache/bin/latencybench","serve","--addr","0.0.0.0:13910","--src","file","--file","/mnt/jfs-cache/bench.bin","--blocksize","4194304","--direct"]
-    volumeMounts:
-    - { name: nvme, mountPath: /mnt/jfs-cache, readOnly: true }
-  volumes:
-  - name: nvme
-    hostPath: { path: /mnt/jfs-cache, type: Directory }
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: lb-serve, node: capstan2 }
+  template:
+    metadata:
+      labels: { app: lb-serve, node: capstan2 }
+    spec:
+      nodeName: capstan2
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: serve
+        image: golang:1.25-bookworm
+        command: ["/mnt/jfs-cache/bin/latencybench","serve","--addr","0.0.0.0:13910","--src","file","--file","/mnt/jfs-cache/bench.bin","--blocksize","4194304","--direct"]
+        volumeMounts:
+        - { name: nvme, mountPath: /mnt/jfs-cache, readOnly: true }
+      volumes:
+      - name: nvme
+        hostPath: { path: /mnt/jfs-cache, type: Directory }
 ---
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: lb-serve-capstan3
   namespace: llm-test
   labels: { app: lb-serve, node: capstan3 }
 spec:
-  nodeName: capstan3
-  restartPolicy: Always
-  hostNetwork: true
-  dnsPolicy: ClusterFirstWithHostNet
-  containers:
-  - name: serve
-    image: golang:1.25-bookworm
-    command: ["/mnt/jfs-cache/bin/latencybench","serve","--addr","0.0.0.0:13910","--src","file","--file","/mnt/jfs-cache/bench.bin","--blocksize","4194304","--direct"]
-    volumeMounts:
-    - { name: nvme, mountPath: /mnt/jfs-cache, readOnly: true }
-  volumes:
-  - name: nvme
-    hostPath: { path: /mnt/jfs-cache, type: Directory }
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: lb-serve, node: capstan3 }
+  template:
+    metadata:
+      labels: { app: lb-serve, node: capstan3 }
+    spec:
+      nodeName: capstan3
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: serve
+        image: golang:1.25-bookworm
+        command: ["/mnt/jfs-cache/bin/latencybench","serve","--addr","0.0.0.0:13910","--src","file","--file","/mnt/jfs-cache/bench.bin","--blocksize","4194304","--direct"]
+        volumeMounts:
+        - { name: nvme, mountPath: /mnt/jfs-cache, readOnly: true }
+      volumes:
+      - name: nvme
+        hostPath: { path: /mnt/jfs-cache, type: Directory }
