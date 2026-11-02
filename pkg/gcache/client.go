@@ -170,6 +170,20 @@ func (c *RingClient) SetRDMA(t Transport) {
 	c.rdma = t
 }
 
+// SetPoolMaxIdle raises the per-peer idle-connection cap (default 16).
+// High-concurrency readers (e.g. 70-way inference batches) must raise it to
+// their worker count, or every excess read dials a fresh connection and
+// discards it — thousands of dials per second exhaust ephemeral ports
+// (EADDRNOTAVAIL, observed on the DGX rail).
+func (c *RingClient) SetPoolMaxIdle(n int) {
+	if n <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pool = newConnPool(n, 0)
+}
+
 // SetStrictRDMA disables TCP fallback while RDMA is configured: dials that
 // cannot use RDMA fail instead of silently degrading. This is a verification
 // mode for benchmarks and transport checks — production keeps fallback so

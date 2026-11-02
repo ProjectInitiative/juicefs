@@ -737,10 +737,11 @@ func newPeer(addrs, rdmaAddrs []string, keys, bs int, useRange, unique, useRDMA,
 	if verify && bs%patPageSize != 0 {
 		fatalf("--verify requires --bs to be a multiple of %d (got %d)", patPageSize, bs)
 	}
-	if maxIdle < 31 {
-		maxIdle = 31
+	if maxIdle < 16 {
+		maxIdle = 16
 	}
-	rc := gcache.NewRingClient(timeout, maxIdle, "latencybench")
+	rc := gcache.NewRingClient(timeout, 31, "latencybench") // 31 = maxFailures, NOT pool size
+	rc.SetPoolMaxIdle(maxIdle)
 	if useRDMA {
 		rt, err := gcache.DialRDMA()
 		if err != nil {
