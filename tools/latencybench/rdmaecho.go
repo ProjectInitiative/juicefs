@@ -161,16 +161,10 @@ func readFull(c net.Conn, buf []byte) error {
 
 func rdmaEchoClient(host string, port, conns, secs, stallMS int) {
 	target := net.JoinHostPort(host, strconv.Itoa(port))
-	// warm sanity dial
 	tr, err := gcache.DialRDMA()
 	if err != nil {
 		fatalf("--rdma unavailable: %v", err)
 	}
-	c0, err := tr.Dial(context.Background(), target)
-	if err != nil {
-		fatalf("dial %s: %v", target, err)
-	}
-	_ = c0.Close()
 
 	var ok, timeouts, errs atomic.Int64
 	var stallsMu sync.Mutex
@@ -184,12 +178,14 @@ func rdmaEchoClient(host string, port, conns, secs, stallMS int) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
+			dialT0 := time.Now()
 			conn, err := tr.Dial(context.Background(), target)
 			if err != nil {
 				errs.Add(1)
-				fmt.Printf("[cli %d] dial: %v\n", idx, err)
+				fmt.Printf("[cli %d] dial after %s: %v\n", idx, time.Since(dialT0), err)
 				return
 			}
+			fmt.Printf("[cli %d] dialed in %s\n", idx, time.Since(dialT0))
 			defer conn.Close()
 			req := make([]byte, 8)
 			in := make([]byte, echoPay)
