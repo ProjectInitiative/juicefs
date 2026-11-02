@@ -49,7 +49,6 @@ spec:
         volumeMounts:
         - { name: dev, mountPath: /dev }
         - { name: sw, mountPath: /host-lib, readOnly: true }
-        - { name: devinclude, mountPath: /host-dev, readOnly: true }
       volumes:
       - name: dev
         hostPath: { path: /dev, type: Directory }
