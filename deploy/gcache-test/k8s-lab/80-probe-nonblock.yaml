@@ -1,0 +1,57 @@
+# Does librdmacm accept SOCK_NONBLOCK? Compare Debian's 48 vs the host's 62.0.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-probe-nonblock
+  namespace: llm-test
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      nodeName: sextant
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: probe
+        image: golang:1.25-bookworm
+        command: ["bash","-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
+          cat > /tmp/t.c <<'EOF'
+          #include <rdma/rsocket.h>
+          #include <errno.h>
+          #include <stdio.h>
+          #include <string.h>
+          int main() {
+            errno = 0;
+            int fd = rsocket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+            printf("  rsocket(SOCK_STREAM|SOCK_NONBLOCK)=%d errno=%d (%s)\n",
+                   fd, errno, fd < 0 ? strerror(errno) : "ok");
+            if (fd >= 0) rclose(fd);
+            errno = 0;
+            fd = rsocket(AF_INET, SOCK_STREAM, 0);
+            printf("  rsocket(SOCK_STREAM)=%d errno=%d\n", fd, errno);
+            if (fd >= 0) rclose(fd);
+            return 0;
+          }
+          EOF
+          gcc /tmp/t.c -o /tmp/t48 -lrdmacm
+          echo "== Debian librdmacm (bookworm, $(dpkg -s librdmacm1 2>/dev/null | grep Version)):"
+          /tmp/t48
+          echo "== Host NixOS librdmacm 62.0 (/run/current-system/sw/lib):"
+          gcc /tmp/t.c -o /tmp/t62 -lrdmacm   # apt headers; ABI-stable rsocket()
+          LD_LIBRARY_PATH=/host-lib /tmp/t62
+          ls /host-lib/librdmacm.so.1*
+        securityContext: { privileged: true }
+        volumeMounts:
+        - { name: dev, mountPath: /dev }
+        - { name: sw, mountPath: /host-lib, readOnly: true }
+        - { name: devinclude, mountPath: /host-dev, readOnly: true }
+      volumes:
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
+      - name: sw
+        hostPath: { path: /run/current-system/sw/lib, type: Directory }
