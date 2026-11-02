@@ -6,7 +6,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: lb-gen-capstan2
-  namespace: agent-sandbox
+  namespace: llm-test
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 7200
@@ -28,7 +28,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: lb-gen-capstan3
-  namespace: agent-sandbox
+  namespace: llm-test
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 7200

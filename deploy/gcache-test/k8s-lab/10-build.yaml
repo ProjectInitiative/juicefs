@@ -10,9 +10,10 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: lb-build-capstan1
-  namespace: agent-sandbox
+  namespace: llm-test
 spec:
   backoffLimit: 0
+  activeDeadlineSeconds: 900
   ttlSecondsAfterFinished: 7200
   template:
     spec:
@@ -43,9 +44,10 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: lb-build-capstan2
-  namespace: agent-sandbox
+  namespace: llm-test
 spec:
   backoffLimit: 0
+  activeDeadlineSeconds: 900
   ttlSecondsAfterFinished: 7200
   template:
     spec:
@@ -75,9 +77,10 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: lb-build-capstan3
-  namespace: agent-sandbox
+  namespace: llm-test
 spec:
   backoffLimit: 0
+  activeDeadlineSeconds: 900
   ttlSecondsAfterFinished: 7200
   template:
     spec:
@@ -107,9 +110,10 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: lb-build-chronometer
-  namespace: agent-sandbox
+  namespace: llm-test
 spec:
   backoffLimit: 0
+  activeDeadlineSeconds: 900
   ttlSecondsAfterFinished: 7200
   template:
     spec:
@@ -140,9 +144,10 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: lb-build-sextant
-  namespace: agent-sandbox
+  namespace: llm-test
 spec:
   backoffLimit: 0
+  activeDeadlineSeconds: 900
   ttlSecondsAfterFinished: 7200
   template:
     spec:

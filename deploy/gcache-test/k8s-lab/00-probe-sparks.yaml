@@ -6,7 +6,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: lb-probe-chronometer
-  namespace: agent-sandbox
+  namespace: llm-test
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 3600
@@ -37,7 +37,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: lb-probe-sextant
-  namespace: agent-sandbox
+  namespace: llm-test
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 3600
