@@ -1,0 +1,33 @@
+# one-shot diagnostic: are the RDMA device nodes present and visible?
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-diag-rdma
+  namespace: llm-test
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 1800
+  template:
+    spec:
+      nodeName: sextant
+      restartPolicy: Never
+      containers:
+      - name: diag
+        image: golang:1.25-bookworm
+        command: ["bash","-c"]
+        args:
+        - |
+          echo "== /dev/infiniband on host:"; ls -la /dev/infiniband/ 2>&1
+          echo "== uverbs count:"; ls /dev/infiniband/uverbs* 2>/dev/null | wc -l
+          echo "== rdma_cm node:"; ls -la /dev/infiniband/rdma_cm 2>&1
+          echo "== mlx5 ports state:"; for d in /sys/class/infiniband/mlx5_*; do echo -n "$d: "; cat $d/ports/1/state 2>/dev/null || echo "-"; done
+          echo "== rdma class:"; ls /sys/class/infiniband/ 2>&1
+        securityContext: { privileged: true }
+        volumeMounts:
+        - { name: dev, mountPath: /dev }
+        - { name: sys, mountPath: /host-sys, readOnly: true }
+      volumes:
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
+      - name: sys
+        hostPath: { path: /sys, type: Directory }
