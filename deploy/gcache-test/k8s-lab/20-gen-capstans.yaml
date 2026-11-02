@@ -16,7 +16,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: gen
-        image: busybox:1.36
+        image: golang:1.25-bookworm
         command: ["/mnt/jfs-cache/bin/latencybench","gen","--file","/mnt/jfs-cache/bench.bin","--keys","16384","--blocksize","4194304"]
         volumeMounts:
         - { name: nvme, mountPath: /mnt/jfs-cache }
@@ -38,7 +38,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: gen
-        image: busybox:1.36
+        image: golang:1.25-bookworm
         command: ["/mnt/jfs-cache/bin/latencybench","gen","--file","/mnt/jfs-cache/bench.bin","--keys","16384","--blocksize","4194304"]
         volumeMounts:
         - { name: nvme, mountPath: /mnt/jfs-cache }

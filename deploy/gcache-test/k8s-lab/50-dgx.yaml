@@ -1,0 +1,205 @@
+# gcache latencybench — stage 5 (DGX): chronometer <-> sextant over the CX7
+# point-to-point rail (172.16.5.0/24 = chronometer-sextant-0, fabric JSON).
+# TCP and rsockets run over the SAME physical link — the decisive comparison.
+#
+#   sextant: 4 servers — file TCP :13911, file RDMA-only :13912,
+#            mem TCP :13921, mem RDMA-only :13922 (transport-only control)
+#   chronometer: client matrix job (verify + QD sweep + batch-70, all 4)
+#
+# Dataset: 16GiB (4096 keys x 4MiB) on the spark root NVMe; server reads are
+# O_DIRECT so page cache never answers.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-gen-sextant
+  namespace: llm-test
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: sextant
+      restartPolicy: Never
+      containers:
+      - name: gen
+        image: golang:1.25-bookworm
+        command: ["/var/tmp/lb-bins/latencybench","gen","--file","/var/tmp/lb-data/bench.bin","--keys","4096","--blocksize","4194304","--force"]
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: data, mountPath: /var/tmp/lb-data }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: DirectoryOrCreate }
+      - name: data
+        hostPath: { path: /var/tmp/lb-data, type: DirectoryOrCreate }
+---
+# file TCP server (rail)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lb-dgx-file-tcp
+  namespace: llm-test
+  labels: { app: lb-dgx, mode: file-tcp }
+spec:
+  nodeName: sextant
+  restartPolicy: Always
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  containers:
+  - name: serve
+    image: golang:1.25-bookworm
+    command: ["/var/tmp/lb-bins/latencybench","serve","--addr","0.0.0.0:13911","--src","file","--file","/var/tmp/lb-data/bench.bin","--blocksize","4194304","--direct"]
+    volumeMounts:
+    - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+    - { name: data, mountPath: /var/tmp/lb-data, readOnly: true }
+  volumes:
+  - name: bins
+    hostPath: { path: /var/tmp/lb-bins, type: Directory }
+  - name: data
+    hostPath: { path: /var/tmp/lb-data, type: Directory }
+---
+# file RDMA-ONLY server (rail) — needs the HCA: /dev + /sys hostPath, privileged
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lb-dgx-file-rdma
+  namespace: llm-test
+  labels: { app: lb-dgx, mode: file-rdma }
+spec:
+  nodeName: sextant
+  restartPolicy: Always
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  containers:
+  - name: serve
+    image: golang:1.25-bookworm
+    command: ["bash","-c"]
+    args:
+    - |
+      apt-get update -qq && apt-get install -y -qq librdmacm3 >/dev/null
+      exec /var/tmp/lb-bins/latencybench-rdma serve --rdma --addr :13912 --nics enp1s0f1np1 \
+           --src file --file /var/tmp/lb-data/bench.bin --blocksize 4194304 --direct
+    securityContext: { privileged: true }
+    volumeMounts:
+    - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+    - { name: data, mountPath: /var/tmp/lb-data, readOnly: true }
+    - { name: dev, mountPath: /dev }
+    - { name: sys, mountPath: /host-sys, readOnly: true }
+  volumes:
+  - name: bins
+    hostPath: { path: /var/tmp/lb-bins, type: Directory }
+  - name: data
+    hostPath: { path: /var/tmp/lb-data, type: Directory }
+  - name: dev
+    hostPath: { path: /dev, type: Directory }
+  - name: sys
+    hostPath: { path: /sys, type: Directory }
+---
+# mem TCP server (transport-only control)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lb-dgx-mem-tcp
+  namespace: llm-test
+  labels: { app: lb-dgx, mode: mem-tcp }
+spec:
+  nodeName: sextant
+  restartPolicy: Always
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  containers:
+  - name: serve
+    image: golang:1.25-bookworm
+    command: ["/var/tmp/lb-bins/latencybench","serve","--addr","0.0.0.0:13921","--src","mem","--blocks","4096","--blocksize","4194304"]
+---
+# mem RDMA-ONLY server (transport-only control)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lb-dgx-mem-rdma
+  namespace: llm-test
+  labels: { app: lb-dgx, mode: mem-rdma }
+spec:
+  nodeName: sextant
+  restartPolicy: Always
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  containers:
+  - name: serve
+    image: golang:1.25-bookworm
+    command: ["bash","-c"]
+    args:
+    - |
+      apt-get update -qq && apt-get install -y -qq librdmacm3 >/dev/null
+      exec /var/tmp/lb-bins/latencybench-rdma serve --rdma --addr :13922 --nics enp1s0f1np1 --src mem --blocks 4096 --blocksize 4194304
+    securityContext: { privileged: true }
+    volumeMounts:
+    - { name: dev, mountPath: /dev }
+    - { name: sys, mountPath: /host-sys, readOnly: true }
+  volumes:
+  - name: dev
+    hostPath: { path: /dev, type: Directory }
+  - name: sys
+    hostPath: { path: /sys, type: Directory }
+---
+# client matrix on chronometer — all four endpoints; JSON to /var/tmp/lb-data/results
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-dgx-client
+  namespace: llm-test
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: chronometer
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: matrix
+        image: golang:1.25-bookworm
+        command: ["bash","-c"]
+        args:
+        - |
+          set -e
+          LB=/var/tmp/lb-bins/latencybench
+          LBR=/var/tmp/lb-bins/latencybench-rdma
+          OUT=/var/tmp/lb-data/results
+          mkdir -p $OUT
+          RAIL=172.16.5.56   # sextant rail-0 (chronometer-sextant-0)
+
+          echo "##### A) mem source: pure transport (no NVMe in the way)"
+          echo "--- A1 tcp"
+          $LB  read --backend peer --addr $RAIL:13921 --keys 4096 --range --verify --len 4096 --qd 1,8,64 --secs 8 --out $OUT/dgx-mem-tcp.json
+          echo "--- A2 rsockets strict"
+          apt-get update -qq && apt-get install -y -qq librdmacm3 >/dev/null
+          $LBR read --backend peer --addr $RAIL:13922 --rdma --keys 4096 --range --verify --len 4096 --qd 1,8,64 --secs 8 --out $OUT/dgx-mem-rdma.json
+
+          echo "##### B) file source (O_DIRECT NVMe): the owner-NVMe model"
+          echo "--- B1 tcp"
+          $LB  read --backend peer --addr $RAIL:13911 --keys 4096 --range --verify --len 4096 --qd 1,8,64 --secs 8 --out $OUT/dgx-file-tcp.json
+          echo "--- B2 rsockets strict"
+          $LBR read --backend peer --addr $RAIL:13912 --rdma --keys 4096 --range --verify --len 4096 --qd 1,8,64 --secs 8 --out $OUT/dgx-file-rdma.json
+
+          echo "##### C) batch-70 — THE inference metric (batch completion p99)"
+          echo "--- C1 file tcp"
+          $LB  read --backend peer --addr $RAIL:13911 --keys 4096 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-file-tcp.json
+          echo "--- C2 file rsockets"
+          $LBR read --backend peer --addr $RAIL:13912 --rdma --keys 4096 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-file-rdma.json
+          echo "--- C3 mem tcp"
+          $LB  read --backend peer --addr $RAIL:13921 --keys 4096 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-mem-tcp.json
+          echo "--- C4 mem rsockets"
+          $LBR read --backend peer --addr $RAIL:13922 --rdma --keys 4096 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-mem-rdma.json
+          echo "DGX_MATRIX_DONE"
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: data, mountPath: /var/tmp/lb-data }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: data
+        hostPath: { path: /var/tmp/lb-data, type: DirectoryOrCreate }

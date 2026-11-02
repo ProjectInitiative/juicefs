@@ -14,7 +14,7 @@ spec:
   dnsPolicy: ClusterFirstWithHostNet
   containers:
   - name: serve
-    image: busybox:1.36
+    image: golang:1.25-bookworm
     command: ["/mnt/jfs-cache/bin/latencybench","serve","--addr","0.0.0.0:13910","--src","file","--file","/mnt/jfs-cache/bench.bin","--blocksize","4194304","--direct"]
     volumeMounts:
     - { name: nvme, mountPath: /mnt/jfs-cache, readOnly: true }
@@ -35,7 +35,7 @@ spec:
   dnsPolicy: ClusterFirstWithHostNet
   containers:
   - name: serve
-    image: busybox:1.36
+    image: golang:1.25-bookworm
     command: ["/mnt/jfs-cache/bin/latencybench","serve","--addr","0.0.0.0:13910","--src","file","--file","/mnt/jfs-cache/bench.bin","--blocksize","4194304","--direct"]
     volumeMounts:
     - { name: nvme, mountPath: /mnt/jfs-cache, readOnly: true }
