@@ -263,13 +263,23 @@ static void *recv_thread(void *arg) {
 }
 
 /* ---------------- connection setup/teardown ---------------- */
-/* real client setup */
-static struct vconn *client_connect(const char *host, const char *port) {
+/* real client setup; src_ip may be NULL (let the CM route resolve) */
+static struct vconn *client_connect(const char *src_ip, const char *host, const char *port) {
     struct rdma_addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof hints);
     hints.ai_port_space = RDMA_PS_TCP;
     char svc[16]; snprintf(svc, sizeof svc, "%s", port);
     if (rdma_getaddrinfo((char *)host, svc, &hints, &res)) die("rdma_getaddrinfo");
+    if (src_ip && *src_ip) {
+        /* bind the source to the rail IP so the CM picks the mlx5 device on
+           that rail (the mgmt NIC has no RDMA device; an unrouted CM REQ
+           hangs rather than failing fast) */
+        struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_src_addr;
+        memset(res->ai_src_addr, 0, res->ai_src_len);
+        sin->sin_family = AF_INET;
+        if (inet_pton(AF_INET, src_ip, &sin->sin_addr) != 1) die("src ip");
+    }
+    fprintf(stderr, "vb_echo: resolving route %s:%s (src %s)\n", host, port, src_ip ? src_ip : "any");
 
     struct ibv_qp_init_attr qpattr;
     memset(&qpattr, 0, sizeof qpattr);
@@ -282,7 +292,9 @@ static struct vconn *client_connect(const char *host, const char *port) {
 
     struct rdma_cm_id *id = NULL;
     if (rdma_create_ep(&id, res, NULL, &qpattr)) die("rdma_create_ep");
+    fprintf(stderr, "vb_echo: rdma_connect...\n");
     if (rdma_connect(id, NULL)) die("rdma_connect");
+    fprintf(stderr, "vb_echo: connected; allocating PD/CQs...\n");
 
     struct vconn *c = calloc(1, sizeof *c);
     c->id = id;
@@ -300,6 +312,7 @@ static struct vconn *client_connect(const char *host, const char *port) {
         c->recvbuf[i] = reg_buf(c->pd, MAX_MSG);
         if (post_recv(c, &c->recvbuf[i])) die("post_recv");
     }
+    fprintf(stderr, "vb_echo: conn ready (PD/CQs/recvs posted)\n");
     pthread_create(&c->sth, NULL, send_thread, c);
     pthread_create(&c->rth, NULL, recv_thread, c);
     rdma_freeaddrinfo(res);
@@ -407,7 +420,7 @@ out:
 }
 
 /* ---------------- main ---------------- */
-static int run_client(const char *host, const char *port, int conns, int secs,
+static int run_client(const char *src_ip, const char *host, const char *port, int conns, int secs,
                       uint32_t plen, int waves, int stall_ms) {
     (void)stall_ms;
     double grand_ok = 0;
@@ -418,7 +431,7 @@ static int run_client(const char *host, const char *port, int conns, int secs,
         struct vconn *vcs[512];
         if (conns > 512) { fprintf(stderr, "conns>512 unsupported in POC\n"); return 1; }
         for (int i = 0; i < conns; i++) {
-            vcs[i] = client_connect(host, port);
+            vcs[i] = client_connect(src_ip, host, port);
             if (!vcs[i] || atomic_load(&vcs[i]->stop)) {
                 fprintf(stderr, "vb_echo: wave %d conn %d failed to establish\n", w, i);
                 return 1;
@@ -474,7 +487,8 @@ static int run_server(const char *port) {
 
     for (;;) {
         struct rdma_cm_id *cid = NULL;
-        if (rdma_get_request(lid, &cid)) { perror("rdma_get_request"); continue; }
+        if (rdma_get_request(lid, &cid)) { fprintf(stderr, "vb_echo: rdma_get_request: %s\n", strerror(errno)); continue; }
+        fprintf(stderr, "vb_echo: server got request; allocating resources\n");
         struct vconn *c = calloc(1, sizeof *c);
         c->id = cid;
         c->pd = ibv_alloc_pd(cid->verbs);
@@ -489,7 +503,8 @@ static int run_server(const char *port) {
             c->recvbuf[i] = reg_buf(c->pd, MAX_MSG);
             if (post_recv(c, &c->recvbuf[i])) die("post_recv");
         }
-        if (rdma_accept(cid, NULL)) { perror("rdma_accept"); continue; }
+        if (rdma_accept(cid, NULL)) { fprintf(stderr, "vb_echo: rdma_accept: %s\n", strerror(errno)); continue; }
+        fprintf(stderr, "vb_echo: server conn established\n");
         pthread_create(&c->sth, NULL, send_thread, c);
         pthread_create(&c->rth, NULL, recv_thread, c);
         if (g_nconns < 4096) g_conns[g_nconns++] = c;
@@ -503,18 +518,19 @@ int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr,
             "usage: %s server PORT\n"
-            "       %s client ADDR PORT CONNS SECS [PAYLOAD] [WAVES] [stall-ms]\n",
+            "       %s client ADDR PORT CONNS SECS [PAYLOAD] [WAVES] [stall-ms]  (VB_SRC_IP env = source rail IP)\n",
             argv[0], argv[0]);
         return 2;
     }
     if (!strcmp(argv[1], "server")) return run_server(argv[2]);
     if (!strcmp(argv[1], "client") && argc >= 6) {
         const char *host = argv[2], *port = argv[3];
+        const char *src = getenv("VB_SRC_IP");
         int conns = atoi(argv[4]), secs = atoi(argv[5]);
         uint32_t plen = argc > 6 ? (uint32_t)strtoul(argv[6], NULL, 10) : DEF_PAYLOAD;
         int waves = argc > 7 ? atoi(argv[7]) : 3;
         int stall = argc > 8 ? atoi(argv[8]) : 3000;
-        return run_client(host, port, conns, secs, plen, waves, stall);
+        return run_client(src, host, port, conns, secs, plen, waves, stall);
     }
     return 2;
 }
