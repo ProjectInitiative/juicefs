@@ -95,7 +95,7 @@ struct vconn {
     struct ibv_cq     *scq;   // send completions
     struct ibv_cq     *rcq;   // recv completions
     struct ibv_comp_channel *sch, *rch;
-    pthread_t         sth, rth;
+    pthread_t         rth;
     int               stop;
 
     struct buf        sendbuf;               // one outgoing chunk at a time
@@ -141,6 +141,11 @@ static int post_recv(struct vconn *c, struct buf *b) {
 }
 
 /* ---------------- completion threads (per-CQ, no global poller) ---------------- */
+/* NOTE: there is deliberately NO background send-completion thread: send WCs
+   are consumed inline by whoever posted the send (client worker / server
+   echo). A second poller on the same CQ would steal WCs and starve the
+   poster's wait (this exact race hung the first POC run). The only
+   background poller is the recv thread, which owns the recv CQ exclusively. */
 static struct vconn *g_conns[4096];
 static int g_nconns = 0;
 
@@ -237,26 +242,6 @@ static void handle_recv(struct vconn *c, struct buf *b, uint32_t n) {
 }
 
 
-static void *send_thread(void *arg) {
-    struct vconn *c = arg;
-    /* bounded non-blocking polling (req 9): 100µs slices, no blocking
-       get_cq_event — a dead QP or shutdown can never wedge this thread */
-    struct timespec ts = {0, 100000};
-    while (!atomic_load(&c->stop)) {
-        struct ibv_wc wc; int n;
-        while ((n = ibv_poll_cq(c->scq, 1, &wc)) > 0) {
-            if (wc.status != IBV_WC_SUCCESS) {
-                fprintf(stderr, "vb_echo: send WC error status=%d\n", wc.status);
-                atomic_store(&c->stop, 1);
-                return NULL;
-            }
-        }
-        if (n < 0) { atomic_store(&c->stop, 1); return NULL; }
-        nanosleep(&ts, NULL);
-    }
-    return NULL;
-}
-
 static void *recv_thread(void *arg) {
     struct vconn *c = arg;
     struct timespec ts = {0, 100000};
@@ -334,7 +319,6 @@ static struct vconn *client_connect(const char *src_ip, const char *host, const 
         if (post_recv(c, &c->recvbuf[i])) die("post_recv");
     }
     fprintf(stderr, "vb_echo: conn ready (PD/CQs/recvs posted)\n");
-    pthread_create(&c->sth, NULL, send_thread, c);
     pthread_create(&c->rth, NULL, recv_thread, c);
     rdma_freeaddrinfo(res);
     return c;
@@ -342,7 +326,6 @@ static struct vconn *client_connect(const char *src_ip, const char *host, const 
 
 static void vconn_destroy(struct vconn *c) {
     atomic_store(&c->stop, 1);
-    pthread_join(c->sth, NULL);
     pthread_join(c->rth, NULL);
     for (int i = 0; i < SLOTS; i++) unreg_buf(c, &c->recvbuf[i]);
     unreg_buf(c, &c->sendbuf);
@@ -432,6 +415,8 @@ static void *cli_worker(void *arg) {
         free(frame);
         continue;
 out:
+        fprintf(stderr, "vb_echo: [cli %d] worker exit err=%d nonce=%u after %.1fs\n",
+                a->idx, a->err, nonce, (now_us() - t0) / 1e6);
         free(frame);
         return NULL;
     }
@@ -525,7 +510,6 @@ static int run_server(const char *port) {
         }
         if (rdma_accept(cid, NULL)) { fprintf(stderr, "vb_echo: rdma_accept: %s\n", strerror(errno)); continue; }
         fprintf(stderr, "vb_echo: server conn established\n");
-        pthread_create(&c->sth, NULL, send_thread, c);
         pthread_create(&c->rth, NULL, recv_thread, c);
         if (g_nconns < 4096) g_conns[g_nconns++] = c;
         printf("vb_echo server: accepted conn #%d\n", g_nconns);
