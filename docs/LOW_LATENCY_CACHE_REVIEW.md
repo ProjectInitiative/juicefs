@@ -464,6 +464,19 @@ design unchanged from §8 item 2, now mandatory rather than optional.
 Production guidance: TCP for cache-group traffic until the RC-QP transport
 ships; rsockets lab-only.
 
+### Native verbs RC-QP POC — Phase-1 milestone MET (2026-11-03)
+
+`deploy/gcache-test/RESULTS-verbs-poc.md` + `deploy/gcache-test/verbstest/vb_echo.c`
+(commits d4d819c6..05b2bf89): a standalone libibverbs RC-QP client/server (rdma_cm for
+connection establishment only) survived **32 connection waves against the same server
+process** — 8/16/32/64/128 conns × 3 waves, 8-conn × 30 s long-lived, 10 rapid
+connect/disconnect waves, and 64 KiB/256 KiB fragmented frames — with **4,517,030
+byte-verified reads, zero errors, zero ghost-serve**. The rsockets defect is not a fabric
+or device property; a verbs data path does not exhibit it. Five POC bugs were fixed and
+re-verified on hardware (QP/CQ ordering vs librdmacm internal CQs, unsignaled sends, a
+WC-stealing race, a client echo loop, and rail-IP CM binding) — each documented in the
+results file, each a lesson the Phase-2 transport must respect.
+
 ---
 
 ## 7. Phase 5 — Approach comparison: app-level RDMA cache vs NVMe-oF
@@ -540,6 +553,7 @@ c730b33a..dd4e16fe k8s lab + DGX rail hardware runs (native arm64 builds, O_DIRE
 abd051e5 docs: topology hardware validation
 0e531acd..9dd8437b phase-1 stall root cause: rs_echo/rdmaecho reproducer, 32-leg matrix, reconnect discriminator
 e5491cce gcache: rsockets fd watchdog (bound every op; rclose at deadline)
+d4d819c6..05b2bf89 phase-1 verbs POC: vb_echo reproducer, k8s wave harness, 5 hardware-verified fixes, milestone MET (4.5M verified reads, 32 waves, 0 errors)
 ```
 
 Base: `gcache-strict-sharding` @ `d369102a` (PR #3). Push as
