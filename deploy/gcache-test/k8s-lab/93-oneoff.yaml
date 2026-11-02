@@ -1,0 +1,72 @@
+# Phase-1 one-off discriminator: fresh single servers, minimal legs, server counters visible.
+#   C  server: 14050   Go server: 14150  (sextant)
+#   cli legs (chronometer): C->C, Go->Go, C->Go(after go), Go->C — 1 conn, 5s each, 3s stall deadline.
+apiVersion: batch/v1
+kind: Job
+metadata: { name: lb-oneoff-srv, namespace: llm-test, annotations: { lb-role: long-running } }
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: sextant
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: servers
+        image: golang:1.25-bookworm
+        securityContext: { privileged: true }
+        command: ["bash","-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
+          /var/tmp/lb-bins/rs_echo server 14050 2>&1 | sed 's/^/[srv-c] /' &
+          /var/tmp/lb-bins/latencybench-rdma rdmaecho --mode server --port 14150 2>&1 | sed 's/^/[srv-go] /' &
+          sleep 5
+          echo "oneoff servers up; waiting forever"
+          sleep infinity
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: dev, mountPath: /dev }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: lb-oneoff-cli, namespace: llm-test }
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: chronometer
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: cli
+        image: golang:1.25-bookworm
+        securityContext: { privileged: true }
+        command: ["bash","-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
+          RAIL=172.16.5.56
+          echo "waiting for servers..."; sleep 40
+          echo "##### 1. C-cli -> C-srv (control)";       timeout 60 /var/tmp/lb-bins/rs_echo client $RAIL 14050 1 5 3000; echo "exit $?"
+          echo "##### 2. Go-cli -> Go-srv (the failing quadrant, isolated)"; timeout 60 /var/tmp/lb-bins/latencybench-rdma rdmaecho --mode client --addr $RAIL --port 14150 --conns 1 --secs 5 --stall-ms 3000; echo "exit $?"
+          echo "##### 3. C-cli -> Go-srv (did the Go client wedge the shared poller?)"; timeout 60 /var/tmp/lb-bins/rs_echo client $RAIL 14150 1 5 3000; echo "exit $?"
+          echo "##### 4. Go-cli -> C-srv"; timeout 60 /var/tmp/lb-bins/latencybench-rdma rdmaecho --mode client --addr $RAIL --port 14050 --conns 1 --secs 5 --stall-ms 3000; echo "exit $?"
+          echo "##### done"
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: dev, mountPath: /dev }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
