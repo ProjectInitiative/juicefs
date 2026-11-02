@@ -88,6 +88,8 @@ struct buf {
 };
 
 struct vconn {
+    int is_server;
+    atomic_int frame_done;   /* client: a full echo frame is assembled */
     struct rdma_cm_id *id;
     struct ibv_pd     *pd;
     struct ibv_cq     *scq;   // send completions
@@ -139,6 +141,102 @@ static int post_recv(struct vconn *c, struct buf *b) {
 }
 
 /* ---------------- completion threads (per-CQ, no global poller) ---------------- */
+static struct vconn *g_conns[4096];
+static int g_nconns = 0;
+
+/* reassemble chunks into c->frame; returns 1 when a full frame is ready */
+static int reassemble(struct vconn *c, uint8_t **out, uint32_t *out_len, uint32_t n, uint8_t **p_in) {
+    uint8_t *p = *p_in;
+    while (n > 0) {
+        if (!c->have_hdr) {
+            if (c->framegot < 8 && c->framegot + n >= 8) {
+                memcpy(c->frame + c->framegot, p, 8 - c->framegot);
+                n -= (8 - c->framegot); p += (8 - c->framegot);
+                c->framegot = 8;
+                frame_hdr *h = (frame_hdr *)c->frame;
+                c->expect_total = h->len;
+                c->expect_nonce = h->nonce;
+                if (c->expect_total + 8 > c->framecap) return -1;
+                c->have_hdr = 1;
+                continue;
+            }
+            uint32_t take = (8 - c->framegot) < n ? (8 - c->framegot) : n;
+            memcpy(c->frame + c->framegot, p, take);
+            c->framegot += take; p += take; n -= take;
+            if (c->framegot == 8) {
+                frame_hdr *h = (frame_hdr *)c->frame;
+                c->expect_total = h->len; c->expect_nonce = h->nonce;
+                if (c->expect_total + 8 > c->framecap) return -1;
+                c->have_hdr = 1;
+            }
+            continue;
+        }
+        uint32_t need = c->expect_total + 8 - c->framegot;
+        uint32_t take = need < n ? need : n;
+        memcpy(c->frame + c->framegot, p, take);
+        c->framegot += take; p += take; n -= take;
+        if (c->framegot == c->expect_total + 8) {
+            *out = c->frame; *out_len = c->expect_total + 8;
+            *p_in = p;
+            return 1;
+        }
+    }
+    *p_in = p;
+    return 0;
+}
+
+/* server: echo the completed frame back in chunked SENDs */
+static int server_echo(struct vconn *c, uint8_t *frame, uint32_t total) {
+    uint32_t remaining = total, off = 0;
+    while (remaining > 0) {
+        uint32_t chunk = remaining < MAX_MSG ? remaining : MAX_MSG;
+        memcpy(c->sendbuf.data, frame + off, chunk);
+        struct ibv_send_wr wr = {0}, *bad = NULL;
+        struct ibv_sge sge = {0};
+        sge.addr = (uintptr_t)c->sendbuf.data;
+        sge.length = chunk;
+        sge.lkey = c->sendbuf.mr->lkey;
+        wr.wr_id = 1;
+        wr.opcode = IBV_WR_SEND;
+        wr.send_flags = chunk <= 64 ? IBV_SEND_INLINE : 0;
+        wr.sg_list = &sge; wr.num_sge = 1;
+        if (ibv_post_send(c->id->qp, &wr, &bad)) return -1;
+        /* wait for the send completion before reusing sendbuf (req 8) */
+        struct ibv_wc wc; int done = 0;
+        while (!done) {
+            int nwc = ibv_poll_cq(c->scq, 1, &wc);
+            if (nwc > 0) {
+                if (wc.status != IBV_WC_SUCCESS) return -1;
+                done = 1;
+            } else if (nwc < 0) return -1;
+            else sched_yield();
+        }
+        off += chunk; remaining -= chunk;
+    }
+    return 0;
+}
+
+static void handle_recv(struct vconn *c, struct buf *b, uint32_t n) {
+    uint8_t *p = b->data;
+    for (;;) {
+        uint8_t *frame = NULL; uint32_t flen = 0;
+        int rv = reassemble(c, &frame, &flen, n, &p);
+        if (rv < 0) { atomic_store(&c->stop, 1); return; }
+        if (rv == 0) return;
+        n = 0; /* consumed the whole WR payload */
+        if (c->is_server) {
+            if (server_echo(c, frame, flen)) { atomic_store(&c->stop, 1); return; }
+            /* re-arm for the next frame */
+            c->have_hdr = 0; c->framegot = 0;
+        } else {
+            /* client: hand the frame to the worker via frame_done */
+            atomic_store(&c->frame_done, 1);
+            return; /* worker resets reassembly after consuming */
+        }
+    }
+}
+
+
 static void *send_thread(void *arg) {
     struct vconn *c = arg;
     /* bounded non-blocking polling (req 9): 100µs slices, no blocking
@@ -157,88 +255,6 @@ static void *send_thread(void *arg) {
         nanosleep(&ts, NULL);
     }
     return NULL;
-}
-
-/* server side: reassembly happens here; client side in cli_round. */
-static struct vconn *g_conns[4096];
-static int g_nconns = 0;
-
-static void handle_recv(struct vconn *c, struct buf *b, uint32_t n) {
-    uint8_t *p = b->data;
-    while (n > 0) {
-        if (!c->have_hdr) {
-            if (c->framegot < 8 && c->framegot + n >= 8) {
-                memcpy(c->frame + c->framegot, p, 8 - c->framegot);
-                n -= (8 - c->framegot); p += (8 - c->framegot);
-                c->framegot = 8;
-                frame_hdr *h = (frame_hdr *)c->frame;
-                c->expect_total = h->len;
-                c->expect_nonce = h->nonce;
-                if (c->expect_total + 8 > c->framecap) return; /* oversized */
-                c->have_hdr = 1;
-                continue;
-            }
-            uint32_t take = (8 - c->framegot) < n ? (8 - c->framegot) : n;
-            memcpy(c->frame + c->framegot, p, take);
-            c->framegot += take; p += take; n -= take;
-            if (c->framegot == 8) {
-                frame_hdr *h = (frame_hdr *)c->frame;
-                c->expect_total = h->len; c->expect_nonce = h->nonce;
-                if (c->expect_total + 8 > c->framecap) return;
-                c->have_hdr = 1;
-            }
-            continue;
-        }
-        uint32_t need = c->expect_total + 8 - c->framegot;
-        uint32_t take = need < n ? need : n;
-        memcpy(c->frame + c->framegot, p, take);
-        c->framegot += take; p += take; n -= take;
-        if (c->framegot == c->expect_total + 8) {
-            /* full frame: echo it back (server) */
-            frame_hdr *h = (frame_hdr *)c->frame;
-            h->len = c->expect_total; h->nonce = c->expect_nonce;
-            /* send via the single sendbuf: chunked SENDs */
-            uint8_t *src = c->frame;
-            uint32_t remaining = c->expect_total + 8;
-            uint32_t off = 0;
-            while (remaining > 0) {
-                uint32_t chunk = remaining < MAX_MSG ? remaining : MAX_MSG;
-                memcpy(c->sendbuf.data, src + off, chunk);
-                struct ibv_send_wr wr = {0}, *bad = NULL;
-                struct ibv_sge sge = {0};
-                sge.addr = (uintptr_t)c->sendbuf.data;
-                sge.length = chunk;
-                sge.lkey = c->sendbuf.mr->lkey;
-                wr.wr_id = 1;
-                wr.opcode = IBV_WR_SEND;
-                wr.send_flags = chunk <= 64 ? IBV_SEND_INLINE : 0;
-                wr.sg_list = &sge; wr.num_sge = 1;
-                if (ibv_post_send(c->id->qp, &wr, &bad)) {
-                    fprintf(stderr, "vb_echo: post_send failed\n");
-                    atomic_store(&c->stop, 1);
-                    return;
-                }
-                /* wait for the send completion before reusing sendbuf
-                   (requirement 8: no buffer reuse with outstanding WRs) */
-                struct ibv_wc wc; int done = 0;
-                while (!done) {
-                    int nwc = ibv_poll_cq(c->scq, 1, &wc);
-                    if (nwc > 0) {
-                        if (wc.status != IBV_WC_SUCCESS) {
-                            fprintf(stderr, "vb_echo: send WC err %d\n", wc.status);
-                            atomic_store(&c->stop, 1);
-                            return;
-                        }
-                        done = 1;
-                    } else if (nwc < 0) { atomic_store(&c->stop, 1); return; }
-                    else sched_yield();
-                }
-                off += chunk; remaining -= chunk;
-            }
-            /* re-arm for the next frame */
-            c->have_hdr = 0; c->framegot = 0;
-        }
-    }
 }
 
 static void *recv_thread(void *arg) {
@@ -300,6 +316,7 @@ static struct vconn *client_connect(const char *src_ip, const char *host, const 
     fprintf(stderr, "vb_echo: connected; allocating PD/CQs...\n");
 
     struct vconn *c = calloc(1, sizeof *c);
+    c->is_server = 0;
     c->id = id;
     c->pd = ibv_alloc_pd(id->verbs);
     if (!c->pd) die("ibv_alloc_pd");
@@ -396,21 +413,19 @@ static void *cli_worker(void *arg) {
             }
             off += chunk; remaining -= chunk;
         }
-        /* bounded wait for the echoed frame (recv_thread reassembles into
-           c->frame): poll with sleep slices; stall-ms = 3000 */
+        /* bounded wait for the echoed frame; stall-ms = 3000 */
         double deadline = now_us() + 3e6;
-        while (now_us() < deadline) {
+        while (!atomic_load(&c->frame_done)) {
             if (atomic_load(&c->stop)) { a->err = 4; goto out; }
-            if (c->have_hdr && c->framegot == c->expect_total + 8 &&
-                c->expect_nonce == nonce) break;
+            if (now_us() >= deadline) { a->err = 5; goto out; } /* stall */
             struct timespec ts = {0, 20000}; nanosleep(&ts, NULL);
         }
-        if (now_us() >= deadline) { a->err = 5; goto out; } /* stall */
         if (c->expect_total != a->plen) { a->err = 6; goto out; }
         int bad_at = check_payload(c->frame + 8, a->plen, nonce);
         if (bad_at >= 0) { a->err = 7; goto out; } /* mismatch */
         /* reset reassembly for the next frame */
         c->have_hdr = 0; c->framegot = 0;
+        atomic_store(&c->frame_done, 0);
         a->ok++;
         nonce += 9973;
         free(frame);
@@ -493,6 +508,7 @@ static int run_server(const char *port) {
         if (rdma_get_request(lid, &cid)) { fprintf(stderr, "vb_echo: rdma_get_request: %s\n", strerror(errno)); continue; }
         fprintf(stderr, "vb_echo: server got request; allocating resources\n");
         struct vconn *c = calloc(1, sizeof *c);
+        c->is_server = 1;
         c->id = cid;
         c->pd = ibv_alloc_pd(cid->verbs);
         if (!c->pd) die("ibv_alloc_pd");
