@@ -165,9 +165,12 @@ spec:
           exec /var/tmp/lb-bins/latencybench-rdma serve --rdma --addr :13922 --nics enp1s0f1np1 --src mem --blocks 256 --blocksize 4194304
         securityContext: { privileged: true }
         volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
         - { name: dev, mountPath: /dev }
         - { name: sys, mountPath: /host-sys, readOnly: true }
       volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
       - name: dev
         hostPath: { path: /dev, type: Directory }
       - name: sys
