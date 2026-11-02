@@ -2,22 +2,22 @@
 # 2x10GbE k8s network (hostNetwork -> node IPs 172.16.4.52/.53), serving the
 # patterned 64GiB dataset with genuine O_DIRECT preads (owner-NVMe model).
 # Deployments (the MCP SA may not create bare Pods; the RS controller can).
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: batch/v1
+kind: Job
 metadata:
   name: lb-serve-capstan2
   namespace: llm-test
   labels: { app: lb-serve, node: capstan2 }
+  annotations: { lb-role: "long-running server; delete the job to stop it" }
 spec:
-  replicas: 1
-  strategy: { type: Recreate }
-  selector:
-    matchLabels: { app: lb-serve, node: capstan2 }
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
   template:
     metadata:
       labels: { app: lb-serve, node: capstan2 }
     spec:
       nodeName: capstan2
+      restartPolicy: Never
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:
@@ -30,22 +30,22 @@ spec:
       - name: nvme
         hostPath: { path: /mnt/jfs-cache, type: Directory }
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: batch/v1
+kind: Job
 metadata:
   name: lb-serve-capstan3
   namespace: llm-test
   labels: { app: lb-serve, node: capstan3 }
+  annotations: { lb-role: "long-running server; delete the job to stop it" }
 spec:
-  replicas: 1
-  strategy: { type: Recreate }
-  selector:
-    matchLabels: { app: lb-serve, node: capstan3 }
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
   template:
     metadata:
       labels: { app: lb-serve, node: capstan3 }
     spec:
       nodeName: capstan3
+      restartPolicy: Never
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:

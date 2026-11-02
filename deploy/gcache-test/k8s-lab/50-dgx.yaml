@@ -35,22 +35,22 @@ spec:
       - name: data
         hostPath: { path: /var/tmp/lb-data, type: DirectoryOrCreate }
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: batch/v1
+kind: Job
 metadata:
   name: lb-dgx-file-tcp
   namespace: llm-test
   labels: { app: lb-dgx, mode: file-tcp }
+  annotations: { lb-role: "long-running server; delete the job to stop it" }
 spec:
-  replicas: 1
-  strategy: { type: Recreate }
-  selector:
-    matchLabels: { app: lb-dgx, mode: file-tcp }
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
   template:
     metadata:
       labels: { app: lb-dgx, mode: file-tcp }
     spec:
       nodeName: sextant
+      restartPolicy: Never
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:
@@ -66,22 +66,22 @@ spec:
       - name: data
         hostPath: { path: /var/tmp/lb-data, type: Directory }
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: batch/v1
+kind: Job
 metadata:
   name: lb-dgx-file-rdma
   namespace: llm-test
   labels: { app: lb-dgx, mode: file-rdma }
+  annotations: { lb-role: "long-running server; delete the job to stop it" }
 spec:
-  replicas: 1
-  strategy: { type: Recreate }
-  selector:
-    matchLabels: { app: lb-dgx, mode: file-rdma }
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
   template:
     metadata:
       labels: { app: lb-dgx, mode: file-rdma }
     spec:
       nodeName: sextant
+      restartPolicy: Never
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:
@@ -109,22 +109,22 @@ spec:
       - name: sys
         hostPath: { path: /sys, type: Directory }
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: batch/v1
+kind: Job
 metadata:
   name: lb-dgx-mem-tcp
   namespace: llm-test
   labels: { app: lb-dgx, mode: mem-tcp }
+  annotations: { lb-role: "long-running server; delete the job to stop it" }
 spec:
-  replicas: 1
-  strategy: { type: Recreate }
-  selector:
-    matchLabels: { app: lb-dgx, mode: mem-tcp }
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
   template:
     metadata:
       labels: { app: lb-dgx, mode: mem-tcp }
     spec:
       nodeName: sextant
+      restartPolicy: Never
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:
@@ -132,22 +132,22 @@ spec:
         image: golang:1.25-bookworm
         command: ["/var/tmp/lb-bins/latencybench","serve","--addr","0.0.0.0:13921","--src","mem","--blocks","4096","--blocksize","4194304"]
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: batch/v1
+kind: Job
 metadata:
   name: lb-dgx-mem-rdma
   namespace: llm-test
   labels: { app: lb-dgx, mode: mem-rdma }
+  annotations: { lb-role: "long-running server; delete the job to stop it" }
 spec:
-  replicas: 1
-  strategy: { type: Recreate }
-  selector:
-    matchLabels: { app: lb-dgx, mode: mem-rdma }
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
   template:
     metadata:
       labels: { app: lb-dgx, mode: mem-rdma }
     spec:
       nodeName: sextant
+      restartPolicy: Never
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:
