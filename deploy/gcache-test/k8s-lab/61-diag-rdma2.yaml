@@ -1,8 +1,8 @@
-# deep RDMA diagnostic: verbs level (ibv_devinfo) vs rsockets level (C probe)
+# deep RDMA diagnostic v2: WITH hostNetwork — netdev view + full rbind/rlisten
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: lb-diag-rdma2
+  name: lb-diag-rdma3
   namespace: llm-test
 spec:
   backoffLimit: 0
@@ -11,40 +11,49 @@ spec:
     spec:
       nodeName: sextant
       restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: diag
         image: golang:1.25-bookworm
         command: ["bash","-c"]
         args:
         - |
-          set -x
+          set -e
           apt-get update -qq && apt-get install -y -qq librdmacm-dev ibverbs-utils strace >/dev/null
-          ibv_devinfo 2>&1 | head -30
-          echo "=== netdev<->ib mapping ==="
+          echo "=== /sys/class/net (hostNetwork): ==="
           ls /sys/class/net/
-          for n in /sys/class/net/*; do echo -n "$n device: "; readlink $n/device 2>/dev/null || echo "-"; done
-          echo "=== minimal rsocket() probe ==="
+          echo "=== netdev<->ib mapping: ==="
+          for n in /sys/class/net/*; do echo -n "$(basename $n) device: "; readlink $n/device 2>/dev/null || echo "-"; done
+          echo "=== minimal rsocket probe ==="
           cat > /tmp/t.c <<'EOF'
           #include <rdma/rsocket.h>
+          #include <netinet/in.h>
+          #include <arpa/inet.h>
           #include <errno.h>
           #include <stdio.h>
           #include <string.h>
           int main() {
-            int fd = rsocket();
+            errno = 0;
+            int fd = rsocket(AF_INET, SOCK_STREAM, 0);
             printf("rsocket()=%d errno=%d (%s)\n", fd, errno, fd < 0 ? strerror(errno) : "ok");
+            if (fd < 0) return 1;
+            struct sockaddr_in sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sin_family = AF_INET;
+            sa.sin_port = htons(13999);
+            inet_pton(AF_INET, "172.16.5.56", &sa.sin_addr);
+            if (rbind(fd, (struct sockaddr *)&sa, sizeof sa) < 0) { printf("rbind: %s\n", strerror(errno)); return 1; }
+            if (rlisten(fd, 16) < 0) { printf("rlisten: %s\n", strerror(errno)); return 1; }
+            printf("rbind+rlisten on 172.16.5.56:13999 OK\n");
             return 0;
           }
           EOF
           gcc /tmp/t.c -o /tmp/t -lrdmacm
-          /tmp/t
-          echo "=== strace tail of the probe ==="
-          strace -f -e trace=openat,ioctl /tmp/t 2>&1 | tail -15
+          /tmp/t || { echo "=== probe failed, strace: ==="; strace -f -e trace=socket,bind,listen,openat /tmp/t 2>&1 | tail -25; }
         securityContext: { privileged: true }
         volumeMounts:
         - { name: dev, mountPath: /dev }
-        - { name: sys, mountPath: /host-sys, readOnly: true }
       volumes:
       - name: dev
         hostPath: { path: /dev, type: Directory }
-      - name: sys
-        hostPath: { path: /sys, type: Directory }
