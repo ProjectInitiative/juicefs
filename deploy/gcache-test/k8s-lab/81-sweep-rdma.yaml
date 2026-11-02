@@ -18,6 +18,7 @@ spec:
       containers:
       - name: sweep
         image: golang:1.25-bookworm
+        securityContext: { privileged: true }
         command: ["bash","-c"]
         args:
         - |
@@ -32,9 +33,12 @@ spec:
           echo "SWEEP_DONE"
         volumeMounts:
         - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: dev, mountPath: /dev }
       volumes:
       - name: bins
         hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
 ---
 # a second client to probe the server DURING any stall window is not needed
 # if the sweep itself serializes; instead the server's ranges counter is
