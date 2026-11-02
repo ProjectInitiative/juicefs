@@ -18,6 +18,9 @@ package main
 
 import "fmt"
 
-func cmdRdmaEchoStub(args []string) {
+// rdmaEchoAvailable is false in non-RDMA builds; the rdma build sets it true.
+var rdmaEchoAvailable = false
+
+var rdmaEchoCmd = func(args []string) {
 	fmt.Println("rdmaecho requires the -tags rdma build (rsockets adapter)")
 }

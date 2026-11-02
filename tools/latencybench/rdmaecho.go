@@ -60,6 +60,11 @@ func echoFill(p []byte, nonce uint32) {
 	binary.LittleEndian.PutUint32(p, nonce)
 }
 
+func init() {
+	rdmaEchoAvailable = true
+	rdmaEchoCmd = cmdRdmaEcho
+}
+
 func cmdRdmaEcho(args []string) {
 	fs := newFlagSet("rdmaecho")
 	mode := fs.String("mode", "client", "server | client")

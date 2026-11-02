@@ -1342,7 +1342,7 @@ func main() {
 	case "gen":
 		cmdGen(os.Args[2:])
 	case "rdmaecho":
-		cmdRdmaEchoStub(os.Args[2:])
+		rdmaEchoCmd(os.Args[2:])
 	case "topo":
 		cmdTopo(os.Args[2:])
 	default:
