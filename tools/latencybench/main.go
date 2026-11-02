@@ -28,12 +28,15 @@
 // Serve:  ./latencybench serve --addr 127.0.0.1:0 --blocks 256 --blocksize 4194304
 // Read:   ./latencybench read --backend peer --addr 127.0.0.1:PORT --len 4096 --qd 8 --secs 5
 // Read (RDMA, strict): ./latencybench read --backend peer --addr <peer-fabric-ip>:<rport> --rdma --len 4096 --qd 8
+// Sharded ring:        ./latencybench read --backend peer --addr peerA:13910,peerB:13910 --range --verify --keys 16384 --qd 8
+// Gen dataset:         ./latencybench gen --file /mnt/jfs-cache/bench.bin --keys 16384 --blocksize 4194304
 //
 // Results: JSON (--out) + human table on stdout. Never label kernel
 // page-cache results as remote-NVMe latency; see the README for the matrix.
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -105,6 +108,8 @@ type runResult struct {
 	IOPS       float64      `json:"iops"`
 	MiBS       float64      `json:"mibs_per_s"`
 	Errors     int64        `json:"errors"`
+	Mismatches int64        `json:"mismatches,omitempty"`
+	Verify     bool         `json:"verify,omitempty"`
 	Transport  string       `json:"transport"`
 }
 
@@ -141,21 +146,174 @@ func alignedBuf(n int) []byte {
 	return b[addr-base : addr-base+n]
 }
 
+// ---------------------------------------------------------------- bench pattern
+
+// patPageSize is the unit of the deterministic dataset pattern. Every page is
+// filled from an LCG stream seeded by fnv1a32("jfs-bench-page" + global page
+// index) — global page = blockIndex*(blockSize/4096) + pageInBlock. gen,
+// serve (mem) and read --verify all share it, so any node can independently
+// recompute the expected bytes for a (key, offset, length) window: a verify
+// run proves the SHARDED ring returned the right payload from the right
+// owner, not just "no error". All of gen --blocksize / serve --blocksize /
+// read --bs must agree.
+const patPageSize = 4096
+
+func patPageSeed(globalPage int64) uint32 {
+	h := uint32(2166136261)
+	for _, c := range []byte("jfs-bench-page") {
+		h = (h ^ uint32(c)) * 16777619
+	}
+	p := uint64(globalPage)
+	for i := 0; i < 8; i++ {
+		h = (h ^ uint32(p&0xff)) * 16777619
+		p >>= 8
+	}
+	return h
+}
+
+func patFillPage(seed uint32, buf []byte) {
+	x := seed
+	for i := range buf {
+		x = x*1664525 + 1013904223
+		buf[i] = byte(x >> 24)
+	}
+}
+
+// patWindow recomputes the expected bytes for block blockIdx,
+// [off, off+n) — the client side of --verify.
+func patWindow(blockIdx, off, n, blockSize int64) ([]byte, error) {
+	if blockSize%patPageSize != 0 {
+		return nil, fmt.Errorf("pattern requires blockSize %% %d == 0 (got %d)", patPageSize, blockSize)
+	}
+	pagesPerBlock := blockSize / patPageSize
+	out := make([]byte, n)
+	page := make([]byte, patPageSize)
+	for i := int64(0); i < n; {
+		abs := off + i
+		within := abs % patPageSize
+		chunk := int64(patPageSize) - within
+		if chunk > n-i {
+			chunk = n - i
+		}
+		patFillPage(patPageSeed(blockIdx*pagesPerBlock + abs/patPageSize), page)
+		copy(out[i:i+chunk], page[within:within+chunk])
+		i += chunk
+	}
+	return out, nil
+}
+
+// benchKeyIndex parses "bench-key-%d" into its block index.
+func benchKeyIndex(key string) (int64, error) {
+	s, ok := strings.CutPrefix(key, "bench-key-")
+	if !ok {
+		return 0, fmt.Errorf("not a bench key: %q", key)
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("not a bench key: %q", key)
+	}
+	return v, nil
+}
+
+// genDataset writes the pattern dataset: keys*blockSize bytes, block k at
+// offset k*blockSize. Parallel page fills; pwrite per block.
+func genDataset(path string, keys, blockSize int, force bool) error {
+	size := int64(keys) * int64(blockSize)
+	if blockSize%patPageSize != 0 {
+		return fmt.Errorf("--blocksize must be a multiple of %d for the patterned dataset", patPageSize)
+	}
+	if st, err := os.Stat(path); err == nil && !force {
+		if st.Size() == size {
+			fmt.Printf("%s already exists at the expected size (%d bytes); nothing to do\n", path, size)
+			return nil
+		}
+		return fmt.Errorf("%s exists with size %d, want %d (use --force to overwrite)", path, st.Size(), size)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	workers := 8
+	if keys < workers {
+		workers = keys
+	}
+	idx := make(chan int)
+	var wg sync.WaitGroup
+	var genErr error
+	var errMu sync.Mutex
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, blockSize)
+			for b := range idx {
+				for i := int64(0); i < int64(blockSize); i += patPageSize {
+					patFillPage(patPageSeed(int64(b)*(int64(blockSize)/patPageSize)+i/patPageSize), buf[i:i+patPageSize])
+				}
+				if _, err := f.WriteAt(buf, int64(b)*int64(blockSize)); err != nil {
+					errMu.Lock()
+					if genErr == nil {
+						genErr = err
+					}
+					errMu.Unlock()
+					return
+				}
+			}
+		}()
+	}
+	for b := 0; b < keys; b++ {
+		idx <- b
+	}
+	close(idx)
+	wg.Wait()
+	if genErr != nil {
+		return genErr
+	}
+	fmt.Printf("generated %s: %d blocks x %d bytes = %.1f GiB\n", path, keys, blockSize, float64(size)/(1<<30))
+	return nil
+}
+
 // ---------------------------------------------------------------- sources
 
 // countSource wraps a ServerSource with warm/cold counters for periodic logs.
 type countSource struct {
-	inner gcache.ServerSource
-	load  atomic.Int64 // LoadCached hits (warm)
-	fill  atomic.Int64 // FillFromStorage (cold: owner had to fetch)
+	inner   gcache.ServerSource
+	load    atomic.Int64 // LoadCached hits (warm)
+	fill    atomic.Int64 // FillFromStorage (cold: owner had to fetch)
+	ranges  atomic.Int64 // LoadCachedRange serves
+	seenMu  sync.Mutex
+	seen    map[int64]bool // distinct bench-key indexes requested of THIS server
+}
+
+func newCountSource(inner gcache.ServerSource) *countSource {
+	return &countSource{inner: inner, seen: make(map[int64]bool)}
+}
+
+func (c *countSource) note(key string) {
+	if idx, err := benchKeyIndex(key); err == nil {
+		c.seenMu.Lock()
+		c.seen[idx] = true
+		c.seenMu.Unlock()
+	}
+}
+
+// distinct returns how many distinct bench keys this server was asked for —
+// with N peers a healthy sharded ring asks each server for ~keys/N of them.
+func (c *countSource) distinct() int {
+	c.seenMu.Lock()
+	defer c.seenMu.Unlock()
+	return len(c.seen)
 }
 
 func (c *countSource) LoadCached(key string) (io.ReadCloser, error) {
 	c.load.Add(1)
+	c.note(key)
 	return c.inner.LoadCached(key)
 }
 func (c *countSource) FillFromStorage(ctx context.Context, key string) (io.ReadCloser, error) {
 	c.fill.Add(1)
+	c.note(key)
 	return c.inner.FillFromStorage(ctx, key)
 }
 func (c *countSource) CompressAlgo() string                     { return c.inner.CompressAlgo() }
@@ -170,6 +328,8 @@ func (c *countSource) DropCached(key string) error { return c.inner.DropCached(k
 // implements it; otherwise the ranged request is answered "not cached" and
 // the owner-side fill path applies.
 func (c *countSource) LoadCachedRange(key string, off, limit int64) (io.ReadCloser, error) {
+	c.ranges.Add(1)
+	c.note(key)
 	rs, ok := c.inner.(interface {
 		LoadCachedRange(string, int64, int64) (io.ReadCloser, error)
 	})
@@ -197,6 +357,7 @@ type memSource struct {
 	mu        sync.Mutex
 	blocks    map[string][]byte
 	algo      string
+	blockSize int
 	preloaded map[string]bool
 	order     []string // fill order, for eviction
 	cap       int
@@ -206,14 +367,22 @@ func newMemSource(blocks, blocksize int) *memSource {
 	m := &memSource{
 		blocks:    make(map[string][]byte, blocks),
 		algo:      "none",
+		blockSize: blocksize,
 		preloaded: make(map[string]bool, blocks),
 		cap:       blocks * 2,
 	}
 	for i := 0; i < blocks; i++ {
 		key := fmt.Sprintf("bench-key-%d", i)
 		b := make([]byte, blocksize)
-		for j := range b {
-			b[j] = byte(i + j) // non-degenerate content
+		if blocksize%patPageSize == 0 {
+			// bench pattern: read --verify can check payloads against it
+			for j := int64(0); j < int64(blocksize); j += patPageSize {
+				patFillPage(patPageSeed(int64(i)*(int64(blocksize)/patPageSize)+j/patPageSize), b[j:j+patPageSize])
+			}
+		} else {
+			for j := range b {
+				b[j] = byte(i + j) // non-degenerate content
+			}
 		}
 		m.blocks[key] = b
 		m.preloaded[key] = true
@@ -237,14 +406,22 @@ func (m *memSource) FillFromStorage(_ context.Context, key string) (io.ReadClose
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.blocks[key]; !ok {
-		b := make([]byte, 4<<20)
-		h := uint64(14695981039346656037)
-		for _, c := range []byte(key) {
-			h = (h ^ uint64(c)) * 1099511628211
+		b := make([]byte, m.blockSize)
+		// Same bench pattern as gen/mem preload so --verify holds for
+		// cold-filled keys too (unique mode included).
+		patterned := false
+		if m.blockSize%patPageSize == 0 {
+			if idx, err := benchKeyIndex(key); err == nil {
+				patterned = true
+				for j := int64(0); j < int64(m.blockSize); j += patPageSize {
+					patFillPage(patPageSeed(idx*(int64(m.blockSize)/patPageSize)+j/patPageSize), b[j:j+patPageSize])
+				}
+			}
 		}
-		for i := range b {
-			h = h*6364136223846793005 + 1442695040888963407
-			b[i] = byte(h >> 33)
+		if !patterned { // non-bench keys: non-degenerate filler
+			for i := range b {
+				b[i] = byte(i)
+			}
 		}
 		m.blocks[key] = b
 		m.order = append(m.order, key)
@@ -468,12 +645,13 @@ func cmdServe(args []string) {
 		fatalf("unknown --src %q", *src)
 	}
 
-	cs := &countSource{inner: inner}
+	cs := newCountSource(inner)
 	go func() {
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
 		for range t.C {
-			fmt.Printf("[serve] warm loads=%d cold fills=%d\n", cs.load.Load(), cs.fill.Load())
+			fmt.Printf("[serve] warm loads=%d cold fills=%d ranges=%d distinct-keys=%d\n",
+				cs.load.Load(), cs.fill.Load(), cs.ranges.Load(), cs.distinct())
 		}
 	}()
 
@@ -533,6 +711,8 @@ type peerClient struct {
 	bs       int
 	useRange bool
 	unique   bool
+	verify   bool
+	mismatch atomic.Int64
 	uniqueN  atomic.Int64
 }
 
@@ -552,7 +732,10 @@ func benchMember(addr, rdmaAddr string, useRDMA bool) gcache.Member {
 	return m
 }
 
-func newPeer(addr, rdmaAddr string, keys, bs int, useRange, unique, useRDMA bool, timeout time.Duration) *peerClient {
+func newPeer(addrs, rdmaAddrs []string, keys, bs int, useRange, unique, useRDMA, verify bool, timeout time.Duration) *peerClient {
+	if verify && bs%patPageSize != 0 {
+		fatalf("--verify requires --bs to be a multiple of %d (got %d)", patPageSize, bs)
+	}
 	rc := gcache.NewRingClient(timeout, 31, "latencybench")
 	if useRDMA {
 		rt, err := gcache.DialRDMA()
@@ -564,15 +747,54 @@ func newPeer(addr, rdmaAddr string, keys, bs int, useRange, unique, useRDMA bool
 		// silently degrading the result to TCP (review round 2, finding A).
 		rc.SetStrictRDMA(true)
 	}
+	members := make([]gcache.Member, 0, len(addrs))
+	for i, a := range addrs {
+		ra := a // default: --addr is the RDMA endpoint
+		if i < len(rdmaAddrs) && rdmaAddrs[i] != "" {
+			ra = rdmaAddrs[i]
+		}
+		m := benchMember(a, ra, useRDMA)
+		m.UUID = fmt.Sprintf("peer-%d", i)
+		members = append(members, m)
+	}
+	if len(members) > 1 {
+		fmt.Printf("peer ring: %d members — sharded owner selection active\n", len(members))
+	}
 	return &peerClient{
 		rc:       rc,
-		members:  []gcache.Member{benchMember(addr, rdmaAddr, useRDMA)},
+		members:  members,
 		group:    "bench",
 		keys:     keys,
 		bs:       bs,
 		useRange: useRange,
 		unique:   unique,
+		verify:   verify,
 	}
+}
+
+// checkPayload recomputes the bench pattern for (key, off, len(buf)) and
+// compares — the --verify correctness gate over the sharded ring.
+func (p *peerClient) checkPayload(key string, off int64, buf []byte) error {
+	idx, err := benchKeyIndex(key)
+	if err != nil {
+		return err
+	}
+	exp, err := patWindow(idx, off, int64(len(buf)), int64(p.bs))
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(exp, buf) {
+		d := -1
+		for i := range buf {
+			if exp[i] != buf[i] {
+				d = i
+				break
+			}
+		}
+		p.mismatch.Add(1)
+		return fmt.Errorf("VERIFY MISMATCH key=%s off=%d len=%d first-diff@%d", key, off, len(buf), d)
+	}
+	return nil
 }
 
 func (p *peerClient) readAt(buf []byte, off int64, rnd *rand.Rand) error {
@@ -595,11 +817,17 @@ func (p *peerClient) readAt(buf []byte, off int64, rnd *rand.Rand) error {
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return err
 	}
+	if p.verify {
+		return p.checkPayload(key, off, buf)
+	}
 	return nil
 }
 
 func (p *peerClient) rangeAt(key string, off int64, buf []byte) error {
 	_, err := p.rc.RangeRead(context.Background(), p.group, key, off, buf, p.members)
+	if err == nil && p.verify {
+		return p.checkPayload(key, off, buf)
+	}
 	return err
 }
 
@@ -610,11 +838,11 @@ func cmdRead(args []string) {
 	backend := fs.String("backend", "peer", "peer | fuse | nvme | readsvc")
 	sockPath := fs.String("sock", "", "readsvc unix socket (backend=readsvc)")
 	openPath := fs.String("open-path", "", "file path to open in the readsvc backend")
-	addr := fs.String("addr", "", "peer host:port (backend=peer; with --rdma, also the RDMA endpoint unless --rdma-addr)")
+	addr := fs.String("addr", "", "peer host:port (backend=peer). COMMA-SEPARATED LIST = a sharded ring: owner selection across 2-3 servers (e.g. --addr capstan2:13910,capstan3:13910). With --rdma, also the RDMA endpoint unless --rdma-addr")
 	path := fs.String("path", "", "file path (backend=fuse|nvme)")
 	useRange := fs.Bool("range", false, "use ranged peer reads (MsgRangeReq) instead of full-block fetch")
 	useRDMA := fs.Bool("rdma", false, "peer mode: dial the peer via rsockets in STRICT mode (requires the -tags rdma build; RDMA failure is a counted error, no TCP fallback)")
-	rdmaAddr := fs.String("rdma-addr", "", "peer RDMA endpoint host:port with --rdma (default: --addr is the RDMA endpoint)")
+	rdmaAddr := fs.String("rdma-addr", "", "peer RDMA endpoint(s) with --rdma — comma list parallel to --addr (default: --addr is the RDMA endpoint)")
 	lens := fs.String("len", "4096", "comma list of request sizes")
 	qds := fs.String("qd", "1", "comma list of queue depths")
 	batch := fs.Int("batch", 0, "if >0: batched rounds of this many concurrent reads instead of steady QD")
@@ -627,6 +855,7 @@ func cmdRead(args []string) {
 	out := fs.String("out", "", "JSON results file (replaces; prior content is loaded then re-saved)")
 	seed := fs.Int64("seed", 42, "rng seed")
 	timeout := fs.Duration("timeout", 10*time.Second, "peer request timeout")
+	verify := fs.Bool("verify", false, "verify every payload against the bench pattern (correctness gate; requires --bs multiple of 4096 matching the server dataset — gen --blocksize / serve --blocksize / --bs must agree)")
 	_ = fs.Parse(args)
 
 	switch *backend {
@@ -646,6 +875,12 @@ func cmdRead(args []string) {
 		fatalf("unknown backend %q", *backend)
 	}
 
+	addrs := splitCSV(*addr)
+	rdmaAddrs := splitCSV(*rdmaAddr)
+	if rdmaAddrs != nil && len(rdmaAddrs) != len(addrs) {
+		fatalf("--rdma-addr must be empty or a comma list parallel to --addr (%d entries, want %d)", len(rdmaAddrs), len(addrs))
+	}
+
 	var results []runResult
 	if *out != "" {
 		if b, err := os.ReadFile(*out); err == nil {
@@ -655,7 +890,7 @@ func cmdRead(args []string) {
 
 	for _, ln := range splitInts(*lens) {
 		for _, qd := range splitInts(*qds) {
-			res := runOnce(*backend, *addr, *rdmaAddr, *path, *useRange, *useRDMA, ln, qd, *batch, *secs,
+			res := runOnce(*backend, addrs, rdmaAddrs, *path, *useRange, *useRDMA, *verify, ln, qd, *batch, *secs,
 				*keys, *bs, *unique, *direct, *drop, *seed, *timeout, *sockPath, *openPath)
 			results = append(results, res)
 			printTable(res)
@@ -667,15 +902,40 @@ func cmdRead(args []string) {
 			}
 		}
 	}
+	if *verify {
+		var bad int64
+		for _, r := range results {
+			bad += r.Mismatches
+		}
+		if bad > 0 {
+			fatalf("CORRECTNESS FAILURE: %d payload mismatch(es) — the sharded ring returned wrong bytes", bad)
+		}
+		fmt.Println("verify: all payloads correct")
+	}
 }
 
-func runOnce(backend, addr, rdmaAddr, path string, useRange, useRDMA bool, length, qd, batch int, secs float64,
+// splitCSV splits a comma-separated flag value; nil for empty input.
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	for _, f := range strings.Split(s, ",") {
+		f = strings.TrimSpace(f)
+		if f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func runOnce(backend string, addrs, rdmaAddrs []string, path string, useRange, useRDMA, verify bool, length, qd, batch int, secs float64,
 	keys, bs int, unique, direct, drop bool, seed int64, timeout time.Duration,
 	sockPath, openPath string) runResult {
 
 	res := runResult{
-		Backend: backend, Addr: addr, Path: path, Range: useRange, Len: length, QD: qd,
-		Batch: batch, Seconds: secs, Direct: direct, Dropped: drop, UniqueKeys: unique,
+		Backend: backend, Addr: strings.Join(addrs, ","), Path: path, Range: useRange, Len: length, QD: qd,
+		Batch: batch, Seconds: secs, Direct: direct, Dropped: drop, UniqueKeys: unique, Verify: verify,
 	}
 
 	var mu sync.Mutex
@@ -706,7 +966,7 @@ func runOnce(backend, addr, rdmaAddr, path string, useRange, useRDMA bool, lengt
 		}, done: func() {}}
 		setupWorker = func(int) *readWorker { return shared }
 	case "peer":
-		pr = newPeer(addr, rdmaAddr, keys, bs, useRange, unique, useRDMA, timeout)
+		pr = newPeer(addrs, rdmaAddrs, keys, bs, useRange, unique, useRDMA, verify, timeout)
 		shared := &readWorker{read: pr.readAt, done: func() {}}
 		setupWorker = func(int) *readWorker { return shared }
 	case "readsvc":
@@ -848,6 +1108,9 @@ func runOnce(backend, addr, rdmaAddr, path string, useRange, useRDMA bool, lengt
 		res.MiBS = float64(bytes.Load()) / (1 << 20) / secs
 	}
 	res.Errors = errs.Load()
+	if pr != nil {
+		res.Mismatches = pr.mismatch.Load()
+	}
 	if backend == "peer" {
 		// strict mode: success can ONLY have used rsockets (fallback disabled)
 		res.Transport = map[bool]string{true: "rsocket-strict", false: "tcp"}[useRDMA]
@@ -876,7 +1139,11 @@ func printTable(r runResult) {
 		fmt.Printf("  batch : p50=%8.1f p95=%8.1f p99=%8.1f us (n=%d rounds)\n",
 			r.BatchDone.P50, r.BatchDone.P95, r.BatchDone.P99, r.BatchDone.N)
 	}
-	fmt.Printf("  iops=%.0f mibs=%.1f errors=%d transport=%s\n", r.IOPS, r.MiBS, r.Errors, r.Transport)
+	fmt.Printf("  iops=%.0f mibs=%.1f errors=%d transport=%s", r.IOPS, r.MiBS, r.Errors, r.Transport)
+	if r.Verify {
+		fmt.Printf(" mismatches=%d", r.Mismatches)
+	}
+	fmt.Println()
 }
 
 // ---------------------------------------------------------------- pread
@@ -939,6 +1206,23 @@ func newFlagSet(name string) *flag.FlagSet {
 	return fs
 }
 
+// ---------------------------------------------------------------- gen
+
+func cmdGen(args []string) {
+	fs := newFlagSet("gen")
+	file := fs.String("file", "", "output dataset path (required)")
+	keys := fs.Int("keys", 16384, "number of blocks (= read --keys)")
+	blocksize := fs.Int("blocksize", 4<<20, "block size in bytes (= serve --blocksize / read --bs; multiple of 4096)")
+	force := fs.Bool("force", false, "overwrite an existing dataset of the wrong size")
+	_ = fs.Parse(args)
+	if *file == "" {
+		fatalf("--file required")
+	}
+	if err := genDataset(*file, *keys, *blocksize, *force); err != nil {
+		fatalf("%v", err)
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: latencybench serve|read ...")
@@ -949,6 +1233,8 @@ func main() {
 		cmdServe(os.Args[2:])
 	case "read":
 		cmdRead(os.Args[2:])
+	case "gen":
+		cmdGen(os.Args[2:])
 	default:
 		fmt.Fprintln(os.Stderr, "unknown command:", os.Args[1])
 		os.Exit(2)

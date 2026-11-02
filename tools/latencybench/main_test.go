@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -183,6 +184,116 @@ func TestMemSourceConcurrentRangeAndFill(t *testing.T) {
 		}(w)
 	}
 	wg.Wait()
+}
+
+// The bench pattern must round-trip through gen -> file -> fileSource ->
+// patWindow: the exact chain a --verify run depends on across nodes.
+func TestGenDatasetVerifyRoundtrip(t *testing.T) {
+	const bs = 8192
+	path := filepath.Join(t.TempDir(), "bench.bin")
+	if err := genDataset(path, 4, bs, false); err != nil {
+		t.Fatal(err)
+	}
+	// idempotent rerun at the right size
+	if err := genDataset(path, 4, bs, false); err != nil {
+		t.Fatalf("regen at correct size should be a no-op: %v", err)
+	}
+	// wrong size without --force must be refused
+	if err := genDataset(path, 5, bs, false); err == nil {
+		t.Fatal("regen at wrong size must be refused without --force")
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	st, _ := f.Stat()
+	s := &fileSource{f: f, size: st.Size(), blockSize: bs}
+
+	for _, idx := range []int64{0, 1, 2, 3} {
+		// unaligned windows across page boundaries
+		for _, w := range [][2]int64{{0, 100}, {4090, 12}, {5000, 3000}, {bs - 4096, 4096}} {
+			r, err := s.LoadCachedRange(fmt.Sprintf("bench-key-%d", idx), w[0], w[1])
+			if err != nil {
+				t.Fatalf("block %d window %v: %v", idx, w, err)
+			}
+			got := readAllSrc(t, r)
+			exp, err := patWindow(idx, w[0], w[1], bs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, exp) {
+				t.Fatalf("block %d window %v: served bytes != pattern", idx, w)
+			}
+		}
+	}
+}
+
+// --verify must catch a corrupted payload (wrong bytes, right size).
+func TestVerifyDetectsCorruption(t *testing.T) {
+	pc := &peerClient{bs: 8192, verify: true}
+	buf, err := patWindow(3, 100, 500, 8192)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pc.checkPayload("bench-key-3", 100, buf); err != nil {
+		t.Fatalf("clean payload flagged: %v", err)
+	}
+	buf[7] ^= 0xff
+	err = pc.checkPayload("bench-key-3", 100, buf)
+	if err == nil {
+		t.Fatal("corrupted payload not detected")
+	}
+	if !strings.Contains(err.Error(), "VERIFY MISMATCH") || !strings.Contains(err.Error(), "first-diff@7") {
+		t.Fatalf("mismatch diagnostic wrong: %v", err)
+	}
+	// off-by-one-block payload (the wrong-owner bug shape)
+	wrong, _ := patWindow(4, 100, 500, 8192)
+	if err := pc.checkPayload("bench-key-3", 100, wrong); err == nil {
+		t.Fatal("wrong-block payload not detected")
+	}
+}
+
+// memSource must serve the same pattern as gen'd files (verify over mem servers).
+func TestMemSourcePatternContent(t *testing.T) {
+	m := newMemSource(3, 8192)
+	for _, idx := range []int{0, 1, 2} {
+		r, err := m.LoadCachedRange(fmt.Sprintf("bench-key-%d", idx), 4096, 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := readAllSrc(t, r)
+		exp, _ := patWindow(int64(idx), 4096, 1000, 8192)
+		if !bytes.Equal(got, exp) {
+			t.Fatalf("mem block %d content != pattern", idx)
+		}
+	}
+	// cold fill (unique path) also pattern-consistent
+	r, err := m.FillFromStorage(context.Background(), "bench-key-9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Close()
+	r2, err := m.LoadCachedRange("bench-key-9", 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := readAllSrc(t, r2)
+	exp, _ := patWindow(9, 0, 1000, 8192)
+	if !bytes.Equal(got, exp) {
+		t.Fatal("cold-filled mem block content != pattern")
+	}
+}
+
+// Multi-peer flag parsing: --addr a,b -> 2 members; --rdma-addr parallel list.
+func TestSplitCSVAndMembers(t *testing.T) {
+	if got := splitCSV(""); got != nil {
+		t.Fatalf("empty: %v", got)
+	}
+	if got := splitCSV("a:1, b:2 ,c:3"); len(got) != 3 || got[1] != "b:2" {
+		t.Fatalf("splitCSV: %v", got)
+	}
 }
 
 // Regression (review round 3, finding 1): the bench member must advertise an
