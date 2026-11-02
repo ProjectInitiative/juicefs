@@ -26,7 +26,8 @@ spec:
         args:
         - |
           apt-get update -qq && apt-get install -y -qq librdmacm-dev libibverbs-dev >/dev/null
-          stdbuf -o0 /var/tmp/lb-bins/vb_echo server 14090 2>&1 | awk '{ print "[vb-srv] " $0; fflush(); }' &
+          export VB_DEBUG=1
+          stdbuf -o0 /var/tmp/lb-bins/vb_echo server 14090 2>&1 &
           sleep 5
           echo "verbs server up (RC QPs, per-conn CQs); waiting forever"
           sleep infinity
