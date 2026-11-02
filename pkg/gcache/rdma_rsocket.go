@@ -160,6 +160,9 @@ func init() {
 
 const rsocketsBacklog = 128
 
+// dialTimeout bounds the blocking rconnect CM exchange (see dialRsockets).
+const dialTimeout = 5 * time.Second
+
 // errOf converts a saved errno into an error (nil when 0).
 func errOf(saved C.int) error {
 	if saved == 0 {
@@ -204,16 +207,33 @@ func dialRsockets(ctx context.Context, addr string) (net.Conn, error) {
 	}
 	closeFD := func() { var se C.int; _ = C.c_rclose(fd, &se) }
 
-	rv := C.c_rconnect(fd, (*C.uchar)(unsafe.Pointer(&oct[0])), C.int(port), &serr)
-	if rv < 0 {
-		if errOf(serr) != syscall.EINPROGRESS {
-			closeFD()
-			return nil, fmt.Errorf("rconnect %s: %w", addr, errOf(serr))
-		}
+	// The fd is blocking (librdmacm 48 rejects SOCK_NONBLOCK with
+	// EOPNOTSUPP), so rconnect blocks until the CM exchange completes —
+	// potentially forever if the responder's CM stalls (observed on the
+	// DGX fabric after a QD64 wedge). Run it on a worker and bound the
+	// wait; on timeout, close the fd to abort the stuck connect.
+	type dialRet struct {
+		rv  C.int
+		se  C.int
 	}
-	if err := waitWritable(fd, ctx, 10*time.Second); err != nil {
+	ch := make(chan dialRet, 1)
+	go func() {
+		var se C.int
+		rv := C.c_rconnect(fd, (*C.uchar)(unsafe.Pointer(&oct[0])), C.int(port), &se)
+		ch <- dialRet{rv, se}
+	}()
+	var dr dialRet
+	t := time.NewTimer(dialTimeout)
+	select {
+	case dr = <-ch:
+		t.Stop()
+	case <-t.C:
 		closeFD()
-		return nil, fmt.Errorf("rconnect %s: %w", addr, err)
+		return nil, fmt.Errorf("rconnect %s: timed out after %s (CM did not complete)", addr, dialTimeout)
+	}
+	if dr.rv < 0 {
+		closeFD()
+		return nil, fmt.Errorf("rconnect %s: %w", addr, errOf(dr.se))
 	}
 	var soerr C.int
 	if C.c_rsoerror(fd, &soerr, &serr) < 0 {
