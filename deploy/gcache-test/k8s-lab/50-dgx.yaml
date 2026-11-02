@@ -90,7 +90,7 @@ spec:
         command: ["bash","-c"]
         args:
         - |
-          apt-get update -qq && apt-get install -y -qq librdmacm3 >/dev/null
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
           exec /var/tmp/lb-bins/latencybench-rdma serve --rdma --addr :13912 --nics enp1s0f1np1 \
                --src file --file /var/tmp/lb-data/bench.bin --blocksize 4194304 --direct
         securityContext: { privileged: true }
@@ -131,6 +131,11 @@ spec:
       - name: serve
         image: golang:1.25-bookworm
         command: ["/var/tmp/lb-bins/latencybench","serve","--addr","0.0.0.0:13921","--src","mem","--blocks","4096","--blocksize","4194304"]
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
 ---
 apiVersion: batch/v1
 kind: Job
@@ -156,7 +161,7 @@ spec:
         command: ["bash","-c"]
         args:
         - |
-          apt-get update -qq && apt-get install -y -qq librdmacm3 >/dev/null
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
           exec /var/tmp/lb-bins/latencybench-rdma serve --rdma --addr :13922 --nics enp1s0f1np1 --src mem --blocks 4096 --blocksize 4194304
         securityContext: { privileged: true }
         volumeMounts:
@@ -200,7 +205,7 @@ spec:
           echo "--- A1 tcp"
           $LB  read --backend peer --addr $RAIL:13921 --keys 4096 --range --verify --len 4096 --qd 1,8,64 --secs 8 --out $OUT/dgx-mem-tcp.json
           echo "--- A2 rsockets strict"
-          apt-get update -qq && apt-get install -y -qq librdmacm3 >/dev/null
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
           $LBR read --backend peer --addr $RAIL:13922 --rdma --keys 4096 --range --verify --len 4096 --qd 1,8,64 --secs 8 --out $OUT/dgx-mem-rdma.json
 
           echo "##### B) file source (O_DIRECT NVMe): the owner-NVMe model"
