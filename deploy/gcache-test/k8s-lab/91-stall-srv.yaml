@@ -24,6 +24,7 @@ spec:
         command: ["bash","-c"]
         args:
         - |
+          export RAIL_IP=172.16.5.56
           apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
           echo "starting fresh echo servers (one per conns level)"
           i=0
