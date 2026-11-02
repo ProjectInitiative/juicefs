@@ -197,35 +197,36 @@ spec:
         command: ["bash","-c"]
         args:
         - |
-          set -e
+          set +e
           LB=/var/tmp/lb-bins/latencybench
           LBR=/var/tmp/lb-bins/latencybench-rdma
           OUT=/var/tmp/lb-data/results
           mkdir -p $OUT
           RAIL=172.16.5.56   # sextant rail-0 (chronometer-sextant-0)
-
-          echo "##### A) mem source: pure transport (no NVMe in the way)"
-          echo "--- A1 tcp"
-          timeout 120 $LB  read --backend peer --addr $RAIL:13921 --keys 256 --range --verify --len 4096 --qd 1,8,64 --secs 8 --out $OUT/dgx-mem-tcp.json
-          echo "--- A2 rsockets strict"
+          # rsockets client: needs the rdma device nodes (hostNetwork pod)
           apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
-          timeout 120 $LBR read --backend peer --addr $RAIL:13922 --rdma --keys 256 --range --verify --len 4096 --qd 1,8 --secs 8 --out $OUT/dgx-mem-rdma.json
 
-          echo "##### B) file source (O_DIRECT NVMe): the owner-NVMe model"
-          echo "--- B1 tcp"
-          timeout 120 $LB  read --backend peer --addr $RAIL:13911 --keys 4096 --range --verify --len 4096 --qd 1,8,64 --secs 8 --out $OUT/dgx-file-tcp.json
-          echo "--- B2 rsockets strict"
-          timeout 120 $LBR read --backend peer --addr $RAIL:13912 --rdma --keys 4096 --range --verify --len 4096 --qd 1,8 --secs 8 --out $OUT/dgx-file-rdma.json
-
-          echo "##### C) batch-70 — THE inference metric (batch completion p99)"
+          echo "##### C) batch-70 — THE inference metric (run FIRST; rsockets high-QD sweeps can stall)"
           echo "--- C1 file tcp"
-          timeout 120 $LB  read --backend peer --addr $RAIL:13911 --keys 4096 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-file-tcp.json
+          timeout 120 $LB  read --backend peer --addr $RAIL:13911 --keys 4096 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-file-tcp.json || echo "C1 FAILED"
           echo "--- C2 file rsockets"
-          timeout 120 $LBR read --backend peer --addr $RAIL:13912 --rdma --keys 4096 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-file-rdma.json
+          timeout 120 $LBR read --backend peer --addr $RAIL:13912 --rdma --keys 4096 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-file-rdma.json || echo "C2 FAILED"
           echo "--- C3 mem tcp"
-          timeout 120 $LB  read --backend peer --addr $RAIL:13921 --keys 256 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-mem-tcp.json
+          timeout 120 $LB  read --backend peer --addr $RAIL:13921 --keys 256 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-mem-tcp.json || echo "C3 FAILED"
           echo "--- C4 mem rsockets"
-          timeout 120 $LBR read --backend peer --addr $RAIL:13922 --rdma --keys 256 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-mem-rdma.json
+          timeout 120 $LBR read --backend peer --addr $RAIL:13922 --rdma --keys 256 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-mem-rdma.json || echo "C4 FAILED"
+
+          echo "##### A) mem transport control (QD1/QD8 only — QD64 rsockets stalls, tracked separately)"
+          echo "--- A1 tcp"
+          timeout 120 $LB  read --backend peer --addr $RAIL:13921 --keys 256 --range --verify --len 4096 --qd 1,8 --secs 8 --out $OUT/dgx-mem-tcp.json || echo "A1 FAILED"
+          echo "--- A2 rsockets strict"
+          timeout 120 $LBR read --backend peer --addr $RAIL:13922 --rdma --keys 256 --range --verify --len 4096 --qd 1,8 --secs 8 --out $OUT/dgx-mem-rdma.json || echo "A2 FAILED"
+
+          echo "##### B) file O_DIRECT (QD1/QD8)"
+          echo "--- B1 tcp"
+          timeout 120 $LB  read --backend peer --addr $RAIL:13911 --keys 4096 --range --verify --len 4096 --qd 1,8 --secs 8 --out $OUT/dgx-file-tcp.json || echo "B1 FAILED"
+          echo "--- B2 rsockets strict"
+          timeout 120 $LBR read --backend peer --addr $RAIL:13912 --rdma --keys 4096 --range --verify --len 4096 --qd 1,8 --secs 8 --out $OUT/dgx-file-rdma.json || echo "B2 FAILED"
           echo "DGX_MATRIX_DONE"
         securityContext: { privileged: true }
         volumeMounts:
