@@ -40,13 +40,19 @@ dataset (4096 × 4 MiB) on sextant's root NVMe, served with `--direct`
    milliseconds.
 3. **TCP batch-70 is healthy** with a correctly sized pool: batch p99 2.3 ms
    (mem) / 5.9 ms (O_DIRECT NVMe), 0 errors across 1.2 M reads.
-4. **KNOWN ISSUE — rsockets high concurrency**: at ≥~64 simultaneous
-   connections the datapath stalls (client reads hang; server goes quiet), and
-   the server needs a restart afterwards. Root cause is in the rsockets
-   buffer/credit path or our poll loop at scale, NOT the wire protocol — the
-   same code moves 138K IOPS at QD8. Tracked as follow-up work; until fixed,
-   keep rsockets concurrency ≤8 connections per peer (or pipeline requests
-   over fewer connections).
+4. **ROOT-CAUSED — rsockets connection-lifecycle wedge (librdmacm)**: the
+   "stall at high concurrency" was root-caused by a minimal reproducer
+   (rs_echo C + rdmaecho Go, same wire), a 32-leg matrix and a reconnect
+   discriminator — full data in `RESULTS-stall-matrix.md`. Verdict: a virgin
+   server + the FIRST connection wave is perfect in every stack quadrant
+   (p50 10µs, 2.2-2.5M reads in 5-8s at 8-128 conns), but after a wave
+   disconnects the server ghosts all NEW connections (accepts complete,
+   requests written, zero responses) — stack-independent — and under load
+   blocking rsockets syscalls (rpoll/rread) in a wedged process ignore
+   deadlines forever. Concurrency is not the trigger; connection churn is.
+   rsockets is therefore safe only for one connection wave per process; the
+   durable fix is a verbs RC-QP transport, with an fd-watchdog (rclose at
+   deadline, commit e5491cce) as the interim client bound.
 5. **Connection churn is fatal at 70-way concurrency**: with the default
    16-conn/peer pool, batch-70 dialed ~54 fresh connections per round →
    EADDRNOTAVAIL (ephemeral-port exhaustion) and "31 failures in a row"
@@ -97,8 +103,10 @@ peer 172.16.4.57:13910:            # octant (no cache server deployed)
   61,208 ranges across all 4096 keys at ~12K IOPS) while client reads time
   out — responses land in the peer's rsockets buffer but never surface to
   the application. Recovery requires a server restart. This pins the defect
-  INSIDE librdmacm's rsockets layer (buffer credits / deferred-work), not in
-  our poll/deadline logic, which is fully bounded on both sides.
+  INSIDE librdmacm's rsockets layer, not in our poll/deadline logic, which is
+  fully bounded on both sides. **Root cause + evidence chain:
+  `RESULTS-stall-matrix.md` (2026-11-02)** — librdmacm rsockets wedges its
+  internal poller across connection waves; first wave is always clean.
 
 ### Concurrent-NCCL benchmark
 

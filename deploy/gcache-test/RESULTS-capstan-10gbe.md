@@ -65,6 +65,15 @@ with batch p99 6.5 ms (below).
 The 10GbE bond + older NVMe + sharded-ring dial costs ~1.9× vs the CX7
 rail; rsockets on CX7 remains the path to the 150 µs target.
 
+## rsockets status (2026-11-02 update)
+
+All capstan runs above are TCP (the 10GbE bond has no RoCE). The rsockets
+transport was subsequently root-caused on the DGX rails: librdmacm's rsockets
+layer wedges its internal poller across connection waves — the first wave is
+perfect, later waves ghost-serve (see `RESULTS-stall-matrix.md`). Capstan
+results are unaffected (TCP is not touched); production guidance is to prefer
+TCP until the verbs RC-QP transport lands.
+
 ## Not yet run on capstans
 
 - rsockets (capstans' NICs are standard Ethernet — no RDMA device).

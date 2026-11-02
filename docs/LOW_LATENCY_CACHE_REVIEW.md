@@ -407,6 +407,65 @@ stale silent data beyond those windows. No POSIX promises beyond that.
 
 ---
 
+## 6a. Hardware validation: DGX CX7 rails, capstan 10GbE, and the rsockets root cause (2026-11-02)
+
+Raw data: `deploy/gcache-test/RESULTS-dgx-rail.md`, `RESULTS-capstan-10gbe.md`,
+`RESULTS-stall-matrix.md`. K8s manifests: `deploy/gcache-test/k8s-lab/`
+(00-94, all runs via Jobs in namespace `llm-test`, SHA-pinned raw URLs).
+
+### Headline numbers (chronometer ⇄ sextant, ConnectX-7 rail-0, verified payloads)
+
+| Scenario | TCP p50 | rsockets p50 | factor |
+|---|---|---|---|
+| 4 KiB ranged, mem owner, QD1 | 271 µs | **31 µs** | ~10× |
+| 4 KiB ranged, O_DIRECT NVMe, QD1 | 657 µs | **218 µs** | ~3× |
+| batch-70, mem owner (batch p50) | 1.05 ms | — (see root cause) | |
+| batch-70, O_DIRECT NVMe (batch p50) | 3.65 ms | — | |
+
+All 1.26M+ rsocket reads and 2.5M+ TCP reads: 0 errors, 0 byte mismatches.
+Capstan 10GbE (2-peer ring, TCP): sharding proven 8064/8320 split, no overlap;
+ranged 28-37× over whole-block at QD1; 64 KiB aggregate 966 MiB/s ≈ line rate.
+
+### Topology validation (hardware)
+
+Fabric JSON graph built correctly from `/var/lib/dgx-spark/rdma-fabric.json`
+(sextant 2 rails direct-rdma hops=0 ok; octant cleanly refused). Dead-rail
+failover proven: dead IP failed bounded, client served from rail-1, strict
+mode, no TCP. `Member.RdmaAddrs`, per-endpoint backoff, `ProbeTopology`,
+`latencybench topo` — all hardware-validated (commits 3b4ba08b, abd051e5).
+
+### ROOT CAUSE — the rsockets stall (Phase 1 of the stabilization assignment)
+
+Method: minimal C reproducer (`rs_echo`) + Go adapter (`rdmaecho`), identical
+wire protocol, 32-leg matrix (conns 8-128 × server-stack × client-stack) and a
+reconnect discriminator, on the DGX rails. Full data:
+`deploy/gcache-test/RESULTS-stall-matrix.md`.
+
+1. **First connection wave is perfect in every quadrant.** Virgin server, any
+   client stack, any conns level 8-128: p50 10 µs, 2.2-2.5M reads in 5-8 s.
+2. **After a client wave disconnects, the server ghosts all new connections:**
+   accepts complete (client dials succeed in ms), requests are written, zero
+   responses ever surface. Stack-INDEPENDENT (C client stalls against a
+   Go-wave server and vice versa). Recovery requires a server restart.
+3. **Client-side mirror under load:** blocking rsockets syscalls (rpoll/rread)
+   in a wedged process block FOREVER ignoring deadlines (leg E: 5 of 8
+   workers parked past their 3 s rpoll deadlines).
+4. Verdict: **librdmacm rsockets internal poller wedges across connection
+   waves** (rdma-core 62, bookworm container on NixOS arm64, CX7 RoCE). Not
+   our wire protocol, not the CX7 device, not concurrency per se.
+
+**Consequence:** rsockets cannot back a long-lived peer cache server; it is
+only safe for one connection wave per process. Interim mitigation landed:
+rsockets fd watchdog — every op bounded, fd closed at deadline
+(commit e5491cce; workers return ErrDeadlineExceeded instead of parking).
+Durable fix: **verbs RC-QP transport** behind the existing `Transport`
+interface (registered memory, persistent QPs, no shared epoll thread) —
+design unchanged from §8 item 2, now mandatory rather than optional.
+Production guidance: TCP for cache-group traffic until the RC-QP transport
+ships; rsockets lab-only.
+
+---
+
 ## 7. Phase 5 — Approach comparison: app-level RDMA cache vs NVMe-oF
 
 | Dimension | A: gcache ring + ranged reads (implemented) | B: NVMe-oF (evaluated, not implemented) |
@@ -439,10 +498,13 @@ branch.
 1. **Cluster measurements (highest value):** §3.5 list — TCP-vs-rsockets on ConnectX-7,
    end-to-end FUSE/readsvc before/after, cold-fill distribution on real object storage. All
    harnesses are ready; nothing needs code changes.
-2. **rsockets runtime validation:** compile-verified against rdma-core 62.0; needs a real
-   device + `rping` pass. If rsockets per-op overhead disappoints (< target), the design
-   already isolates the next step: a verbs RC-QP transport implementing `Transport` +
-   listener (registered memory + persistent QPs), or io_uring on the TCP path (kernel ≥5.1).
+2. **rsockets verdict (hardware-validated, 2026-11-02):** latency is superb
+   (31 µs p50 vs 271 µs TCP for 4 KiB ranged) but librdmacm's rsockets layer
+   wedges across connection waves (§6a) — one clean wave per process, then
+   ghost-serve. The verbs RC-QP transport (`Transport` + listener, registered
+   memory, persistent QPs) is the durable fix; an fd-watchdog bounding every
+   rsockets op is already in (e5491cce). io_uring on the TCP path remains the
+   no-RDMA fallback option.
 3. **Batched range requests** (one frame carrying N ranges) would cut per-read framing at
    QD≥32; deferred until cluster data shows it matters.
 4. **readsvc per-handle serialization** (fs.File.Pread lock): fine for one-handle-per-worker
@@ -469,6 +531,15 @@ c6c66af5 gcache: ranged peer reads (MsgRangeReq) — sub-block remote-cache hits
 ebc12c5d gcache: real rsockets (RDMA) transport behind -tags rdma
 5ab33390 readsvc: opt-in FUSE-bypassing read service (prototype)
 4b4caed4 docs: CONTRACT.md — ranged-read protocol extension (6a), new flags, rsockets notes
+... (review rounds 1-3: 55a77ced..4b4caed4 base; see git log) ...
+fc58a55d bench: sharded-ring multi-peer harness (--addr list, --verify, gen)
+c730b33a..dd4e16fe k8s lab + DGX rail hardware runs (native arm64 builds, O_DIRECT datasets)
+02b728ac..719d18b5 pool sizing (SetPoolMaxIdle), diagnostics, dial watchdog
+6034cfde gcache: SetPoolMaxIdle — batch-70 pool sizing fix
+3b4ba08b gcache: topology awareness (RdmaAddrs, per-endpoint backoff, ProbeTopology, fabric JSON)
+abd051e5 docs: topology hardware validation
+0e531acd..9dd8437b phase-1 stall root cause: rs_echo/rdmaecho reproducer, 32-leg matrix, reconnect discriminator
+e5491cce gcache: rsockets fd watchdog (bound every op; rclose at deadline)
 ```
 
 Base: `gcache-strict-sharding` @ `d369102a` (PR #3). Push as
