@@ -757,12 +757,21 @@ func newPeer(addrs, rdmaAddrs []string, keys, bs int, useRange, unique, useRDMA,
 	}
 	members := make([]gcache.Member, 0, len(addrs))
 	for i, a := range addrs {
-		ra := a // default: --addr is the RDMA endpoint
-		if i < len(rdmaAddrs) && rdmaAddrs[i] != "" {
-			ra = rdmaAddrs[i]
+		m := gcache.Member{UUID: fmt.Sprintf("peer-%d", i), Addr: a}
+		if len(addrs) == 1 && len(rdmaAddrs) > 1 {
+			// single --addr with N RDMA endpoints: the multi-rail failover
+			// shape (all endpoints attach to the one member)
+			m.RdmaAddrs = rdmaAddrs
+			if useRDMA {
+				m.RdmaAddr = rdmaAddrs[0]
+			}
+		} else if useRDMA {
+			ra := a // default: --addr is the RDMA endpoint
+			if i < len(rdmaAddrs) && rdmaAddrs[i] != "" {
+				ra = rdmaAddrs[i]
+			}
+			m.RdmaAddr = ra
 		}
-		m := benchMember(a, ra, useRDMA)
-		m.UUID = fmt.Sprintf("peer-%d", i)
 		members = append(members, m)
 	}
 	if len(members) > 1 {
