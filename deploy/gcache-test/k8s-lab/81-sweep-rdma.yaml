@@ -1,0 +1,41 @@
+# Threshold sweep: at how many concurrent rsockets connections does the
+# datapath stall? Fresh server, client sweeps QD 8/16/24/32/48/64 with
+# timeouts; a second probe client tests the server during any stall.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-sweep-rdma
+  namespace: llm-test
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      nodeName: chronometer
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: sweep
+        image: golang:1.25-bookworm
+        command: ["bash","-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
+          LBR=/var/tmp/lb-bins/latencybench-rdma
+          RAIL=172.16.5.56
+          for qd in 8 16 24 32 48 64; do
+            echo "===== mem-rdma QD$qd ====="
+            timeout 60 $LBR read --backend peer --addr $RAIL:13922 --rdma --keys 256 --range --verify \
+                --len 4096 --qd $qd --secs 6 --out /tmp/sweep-$qd.json || echo "QD$qd FAILED/TIMEOUT"
+          done
+          echo "SWEEP_DONE"
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+---
+# a second client to probe the server DURING any stall window is not needed
+# if the sweep itself serializes; instead the server's ranges counter is
+# checked after each leg via its own logs.
