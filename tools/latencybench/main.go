@@ -885,8 +885,13 @@ func cmdRead(args []string) {
 
 	addrs := splitCSV(*addr)
 	rdmaAddrs := splitCSV(*rdmaAddr)
-	if rdmaAddrs != nil && len(rdmaAddrs) != len(addrs) {
-		fatalf("--rdma-addr must be empty or a comma list parallel to --addr (%d entries, want %d)", len(rdmaAddrs), len(addrs))
+	// Allowed shapes: no --rdma-addr; one entry per --addr (parallel lists);
+	// or a single --addr with N RDMA endpoints (the multi-rail failover case).
+	if rdmaAddrs != nil && len(addrs) > 1 && len(rdmaAddrs) != len(addrs) {
+		fatalf("--rdma-addr must be empty, parallel to --addr (%d entries, want %d), or a single --addr with N endpoints", len(rdmaAddrs), len(addrs))
+	}
+	if rdmaAddrs != nil && len(addrs) == 1 && len(rdmaAddrs) > 0 {
+		addrs = []string{*addr} // keep --addr; endpoints attach to it below
 	}
 
 	var results []runResult
