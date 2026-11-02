@@ -98,13 +98,7 @@ static int srv_run(int port) {
     int lfd = rsocket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) { perror("rsocket"); return 1; }
     struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET; sa.sin_port = htons(port);
-    const char *rail = getenv("RAIL_IP");
-    if (rail && *rail) {
-        if (inet_pton(AF_INET, rail, &sa.sin_addr) != 1) { fprintf(stderr, "bad RAIL_IP %s\n", rail); return 1; }
-    } else {
-        sa.sin_addr.s_addr = INADDR_ANY;
-    }
+    sa.sin_family = AF_INET; sa.sin_port = htons(port); sa.sin_addr.s_addr = INADDR_ANY;
     if (rbind(lfd, (struct sockaddr *)&sa, sizeof sa) < 0) { perror("rbind"); return 1; }
     if (rlisten(lfd, 256) < 0) { perror("rlisten"); return 1; }
     struct sockaddr_in la; socklen_t ll = sizeof la;
