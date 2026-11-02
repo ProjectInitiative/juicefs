@@ -1,0 +1,52 @@
+# gcache latencybench — stage 4 (capstans): the 10GbE client matrix on
+# capstan1 against the sharded 2-peer ring. Every stage is logged; results
+# also land as JSON under /mnt/jfs-cache/results/.
+#
+#   1. correctness : 2-peer sharded ring, ranged 4K, EVERY payload verified
+#   2. ranged perf : 4K/16K/64K x QD1..128 (the fast path)
+#   3. full-block  : pre-change baseline for comparison
+#   4. batch-70    : the inference metric (batch completion p99)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-client-capstan1
+  namespace: agent-sandbox
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  activeDeadlineSeconds: 1800
+  template:
+    spec:
+      nodeName: capstan1
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: matrix
+        image: busybox:1.36
+        command: ["sh","-c"]
+        args:
+        - |
+          LB=/mnt/jfs-cache/bin/latencybench
+          PEERS=172.16.4.52:13910,172.16.4.53:13910
+          OUT=/mnt/jfs-cache/results
+          mkdir -p $OUT
+          echo "### 1) sharded correctness: verify EVERY ranged 4K payload"
+          $LB read --backend peer --addr $PEERS --keys 16384 --range --verify \
+              --len 4096 --qd 4 --secs 10 --out $OUT/tcp-verify-range.json || exit 1
+          echo "### 2) ranged perf matrix (fast path)"
+          $LB read --backend peer --addr $PEERS --keys 16384 --range \
+              --len 4096,16384,65536 --qd 1,8,32,64,128 --secs 8 \
+              --out $OUT/tcp-range.json
+          echo "### 3) full-block baseline (pre-change path)"
+          $LB read --backend peer --addr $PEERS --keys 16384 \
+              --len 4096 --qd 1,8,32 --secs 8 --out $OUT/tcp-fullblock.json
+          echo "### 4) batch-70 (inference round metric)"
+          $LB read --backend peer --addr $PEERS --keys 16384 --range \
+              --len 4096 --batch 70 --secs 15 --out $OUT/tcp-batch70.json
+          echo "MATRIX_DONE"
+        volumeMounts:
+        - { name: nvme, mountPath: /mnt/jfs-cache }
+      volumes:
+      - name: nvme
+        hostPath: { path: /mnt/jfs-cache, type: Directory }

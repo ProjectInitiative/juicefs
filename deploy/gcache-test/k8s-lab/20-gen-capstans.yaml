@@ -1,0 +1,47 @@
+# gcache latencybench — stage 2 (capstans): dataset gen on the serving nodes.
+# Both servers hold the FULL 64GiB patterned dataset (any key servable);
+# sharding is proven by the served distinct-keys counters, not by missing data.
+# 16384 keys x 4MiB = 64GiB, written to the fresh NVMe at /mnt/jfs-cache.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-gen-capstan2
+  namespace: agent-sandbox
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: capstan2
+      restartPolicy: Never
+      containers:
+      - name: gen
+        image: busybox:1.36
+        command: ["/mnt/jfs-cache/bin/latencybench","gen","--file","/mnt/jfs-cache/bench.bin","--keys","16384","--blocksize","4194304"]
+        volumeMounts:
+        - { name: nvme, mountPath: /mnt/jfs-cache }
+      volumes:
+      - name: nvme
+        hostPath: { path: /mnt/jfs-cache, type: Directory }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-gen-capstan3
+  namespace: agent-sandbox
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: capstan3
+      restartPolicy: Never
+      containers:
+      - name: gen
+        image: busybox:1.36
+        command: ["/mnt/jfs-cache/bin/latencybench","gen","--file","/mnt/jfs-cache/bench.bin","--keys","16384","--blocksize","4194304"]
+        volumeMounts:
+        - { name: nvme, mountPath: /mnt/jfs-cache }
+      volumes:
+      - name: nvme
+        hostPath: { path: /mnt/jfs-cache, type: Directory }

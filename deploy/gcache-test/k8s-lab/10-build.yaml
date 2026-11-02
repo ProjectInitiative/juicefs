@@ -1,0 +1,170 @@
+# gcache latencybench — stage 1: native per-node builds.
+# Each job builds on its target node (amd64 plain Go on capstans; arm64 cgo
+# + librdmacm on the Sparks) and drops binaries into a node-local dir:
+#   capstans -> /mnt/jfs-cache/bin/   (the fresh NVMe partition)
+#   sparks   -> /var/tmp/lb-bins/
+# The RDMA build needs rdma-core dev headers + gcc (bookworm golang image has
+# gcc; librdmacm-dev via apt). Binaries are static except latencybench-rdma,
+# which links librdmacm.so.1 (present in the Sparks' system profile).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-build-capstan1
+  namespace: agent-sandbox
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: capstan1
+      restartPolicy: Never
+      containers:
+      - name: build
+        image: golang:1.25-bookworm
+        command: ["bash","-c"]
+        args:
+        - |
+          set -euxo pipefail
+          mkdir -p /out
+          cd /tmp
+          curl -fsSL https://codeload.github.com/ProjectInitiative/juicefs/tar.gz/refs/heads/low-latency-ranged-reads -o src.tgz
+          tar xzf src.tgz
+          cd juicefs-low-latency-ranged-reads
+          export CGO_ENABLED=0
+          go build -trimpath -o /out/latencybench ./tools/latencybench
+          /out/latencybench gen --file /tmp/selftest.bin --keys 4 --blocksize 4194304 --force
+          echo BUILD_OK amd64
+        volumeMounts: [{ name: out, mountPath: /out }]
+      volumes:
+      - name: out
+        hostPath: { path: /mnt/jfs-cache/bin, type: DirectoryOrCreate }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-build-capstan2
+  namespace: agent-sandbox
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: capstan2
+      restartPolicy: Never
+      containers:
+      - name: build
+        image: golang:1.25-bookworm
+        command: ["bash","-c"]
+        args:
+        - |
+          set -euxo pipefail
+          mkdir -p /out
+          cd /tmp
+          curl -fsSL https://codeload.github.com/ProjectInitiative/juicefs/tar.gz/refs/heads/low-latency-ranged-reads -o src.tgz
+          tar xzf src.tgz
+          cd juicefs-low-latency-ranged-reads
+          export CGO_ENABLED=0
+          go build -trimpath -o /out/latencybench ./tools/latencybench
+          echo BUILD_OK amd64
+        volumeMounts: [{ name: out, mountPath: /out }]
+      volumes:
+      - name: out
+        hostPath: { path: /mnt/jfs-cache/bin, type: DirectoryOrCreate }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-build-capstan3
+  namespace: agent-sandbox
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: capstan3
+      restartPolicy: Never
+      containers:
+      - name: build
+        image: golang:1.25-bookworm
+        command: ["bash","-c"]
+        args:
+        - |
+          set -euxo pipefail
+          mkdir -p /out
+          cd /tmp
+          curl -fsSL https://codeload.github.com/ProjectInitiative/juicefs/tar.gz/refs/heads/low-latency-ranged-reads -o src.tgz
+          tar xzf src.tgz
+          cd juicefs-low-latency-ranged-reads
+          export CGO_ENABLED=0
+          go build -trimpath -o /out/latencybench ./tools/latencybench
+          echo BUILD_OK amd64
+        volumeMounts: [{ name: out, mountPath: /out }]
+      volumes:
+      - name: out
+        hostPath: { path: /mnt/jfs-cache/bin, type: DirectoryOrCreate }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-build-chronometer
+  namespace: agent-sandbox
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: chronometer
+      restartPolicy: Never
+      containers:
+      - name: build
+        image: golang:1.25-bookworm
+        command: ["bash","-c"]
+        args:
+        - |
+          set -euxo pipefail
+          mkdir -p /out
+          cd /tmp
+          curl -fsSL https://codeload.github.com/ProjectInitiative/juicefs/tar.gz/refs/heads/low-latency-ranged-reads -o src.tgz
+          tar xzf src.tgz
+          cd juicefs-low-latency-ranged-reads
+          CGO_ENABLED=0 go build -trimpath -o /out/latencybench ./tools/latencybench
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
+          CGO_ENABLED=1 go build -tags rdma -trimpath -o /out/latencybench-rdma ./tools/latencybench
+          echo BUILD_OK arm64 + rdma
+        volumeMounts: [{ name: out, mountPath: /out }]
+      volumes:
+      - name: out
+        hostPath: { path: /var/tmp/lb-bins, type: DirectoryOrCreate }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-build-sextant
+  namespace: agent-sandbox
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: sextant
+      restartPolicy: Never
+      containers:
+      - name: build
+        image: golang:1.25-bookworm
+        command: ["bash","-c"]
+        args:
+        - |
+          set -euxo pipefail
+          mkdir -p /out
+          cd /tmp
+          curl -fsSL https://codeload.github.com/ProjectInitiative/juicefs/tar.gz/refs/heads/low-latency-ranged-reads -o src.tgz
+          tar xzf src.tgz
+          cd juicefs-low-latency-ranged-reads
+          CGO_ENABLED=0 go build -trimpath -o /out/latencybench ./tools/latencybench
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
+          CGO_ENABLED=1 go build -tags rdma -trimpath -o /out/latencybench-rdma ./tools/latencybench
+          echo BUILD_OK arm64 + rdma
+        volumeMounts: [{ name: out, mountPath: /out }]
+      volumes:
+      - name: out
+        hostPath: { path: /var/tmp/lb-bins, type: DirectoryOrCreate }

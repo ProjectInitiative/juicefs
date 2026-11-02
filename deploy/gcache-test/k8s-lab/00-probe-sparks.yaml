@@ -1,0 +1,60 @@
+# gcache latencybench on the lab cluster — stage 0: probe the DGX Sparks
+# (storage, RDMA devices, librdmacm) before placing datasets and RDMA pods.
+# Applied from the branch: kubectl apply -f <raw-url of this file>
+#
+# Read-only hostPath mounts only. Delete with: kubectl -n agent-sandbox delete pod lb-probe-chronometer lb-probe-sextant
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lb-probe-chronometer
+  namespace: agent-sandbox
+  labels: { app: lb-probe }
+spec:
+  nodeName: chronometer
+  restartPolicy: Never
+  tolerations:
+  - { key: node-role.kubernetes.io/master, operator: Exists, effect: NoSchedule }
+  containers:
+  - name: probe
+    image: busybox:1.36
+    command: ["sh","-c"]
+    args:
+    - |
+      echo "== infiniband devices"; ls /sys/class/infiniband/ 2>&1
+      echo "== rdma cm"; ls /sys/class/misc/rdma_cm 2>&1
+      echo "== librdmacm (system profile)"; ls /host-sw/lib 2>/dev/null | grep -i rdma
+      echo "== root fs"; df -h / /var/tmp 2>&1 | head -5
+      echo "/var/tmp write:"; touch /var/tmp/lb-probe && echo WRITABLE && rm -f /var/tmp/lb-probe
+      echo "== mounts"; grep -vE "proc|sysfs|cgroup|devpts|tmpfs /sys|securityfs" /proc/mounts | head -12
+      echo "== mem"; head -2 /proc/meminfo
+    volumeMounts:
+    - { name: sw, mountPath: /host-sw, readOnly: true }
+  volumes:
+  - name: sw
+    hostPath: { path: /run/current-system/sw, type: Directory }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lb-probe-sextant
+  namespace: agent-sandbox
+  labels: { app: lb-probe }
+spec:
+  nodeName: sextant
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: busybox:1.36
+    command: ["sh","-c"]
+    args:
+    - |
+      echo "== infiniband devices"; ls /sys/class/infiniband/ 2>&1
+      echo "== librdmacm (system profile)"; ls /host-sw/lib 2>/dev/null | grep -i rdma
+      echo "== root fs"; df -h / /var/tmp 2>&1 | head -5
+      echo "/var/tmp write:"; touch /var/tmp/lb-probe && echo WRITABLE && rm -f /var/tmp/lb-probe
+      echo "== mounts"; grep -vE "proc|sysfs|cgroup|devpts|tmpfs /sys|securityfs" /proc/mounts | head -12
+    volumeMounts:
+    - { name: sw, mountPath: /host-sw, readOnly: true }
+  volumes:
+  - name: sw
+    hostPath: { path: /run/current-system/sw, type: Directory }
