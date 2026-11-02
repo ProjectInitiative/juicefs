@@ -27,6 +27,7 @@ spec:
         - |
           apt-get update -qq && apt-get install -y -qq librdmacm-dev libibverbs-dev >/dev/null
           export VB_DEBUG=1
+          export VB_SRV_IP=172.16.5.56
           stdbuf -o0 /var/tmp/lb-bins/vb_echo server 14090 2>&1 &
           sleep 5
           echo "verbs server up (RC QPs, per-conn CQs); waiting forever"

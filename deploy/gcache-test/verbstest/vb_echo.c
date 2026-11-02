@@ -486,8 +486,19 @@ static int run_server(const char *port) {
     memset(&hints, 0, sizeof hints);
     hints.ai_flags = RAI_PASSIVE;
     hints.ai_port_space = RDMA_PS_TCP;
-    char host[64] = ""; /* wildcard: bind all RDMA devices/addresses */
-    if (rdma_getaddrinfo(host[0] ? host : NULL, (char *)port, &hints, &res)) die("rdma_getaddrinfo");
+    /* Bind explicitly to the rail IP (VB_SRV_IP): a wildcard passive bind
+       also covers the mgmt NIC (no RDMA device) and fails with
+       EADDRNOTAVAIL before the listener ever opens. */
+    static struct sockaddr_in srv_sin;
+    const char *rail = getenv("VB_SRV_IP");
+    if (rail && *rail) {
+        memset(&srv_sin, 0, sizeof srv_sin);
+        srv_sin.sin_family = AF_INET;
+        if (inet_pton(AF_INET, rail, &srv_sin.sin_addr) != 1) die("srv ip");
+        hints.ai_src_addr = (struct sockaddr *)&srv_sin;
+        hints.ai_src_len = sizeof srv_sin;
+    }
+    if (rdma_getaddrinfo(rail && *rail ? (char *)rail : NULL, (char *)port, &hints, &res)) die("rdma_getaddrinfo");
 
     struct ibv_qp_init_attr qpattr;
     memset(&qpattr, 0, sizeof qpattr);
@@ -505,6 +516,7 @@ static int run_server(const char *port) {
     for (;;) {
         struct rdma_cm_id *cid = NULL;
         if (rdma_get_request(lid, &cid)) { fprintf(stderr, "vb_echo: rdma_get_request: %s\n", strerror(errno)); continue; }
+        DBG("[srv] got request; allocating resources\n");
         fprintf(stderr, "vb_echo: server got request; allocating resources\n");
         struct vconn *c = calloc(1, sizeof *c);
         c->is_server = 1;
