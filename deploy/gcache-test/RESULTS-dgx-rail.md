@@ -67,3 +67,44 @@ real hardware.
   (NixOS firewall currently drops them; ssh/22 works).
 - rsockets batch-70 (blocked by finding 4).
 - fio NVMe floor on the Sparks' root NVMe.
+
+
+## Topology validation (2026-11-02, commit 84358dc4) — [hardware]
+
+`latencybench topo --fabric /var/lib/dgx-spark/rdma-fabric.json` from chronometer:
+
+```
+fabric inventory: self=chronometer, 2 peer(s)
+peer 172.16.4.56:13910:            # sextant
+  172.16.5.56:13912  direct-rdma  hops=0  ok   (rail-0)
+  172.16.6.56:13912  direct-rdma  hops=0  ok   (rail-1)
+peer 172.16.4.57:13910:            # octant (no cache server deployed)
+  172.16.7.57:13912  direct-rdma  hops=0  FAIL: connection refused
+  172.16.8.57:13912  direct-rdma  hops=0  FAIL: connection refused
+```
+
+- The graph builder consumed the REAL fabric inventory and classified every
+  edge correctly: live rails verified OK, absent server = clean refusal,
+  no silent fallback anywhere.
+- **Dead-rail failover [hardware]**: client configured with
+  `[172.16.5.99 (unused IP = dead cable), 172.16.6.56 (live)]` in strict
+  mode — the dead endpoint failed bounded (watchdog/CM timeout), the client
+  failed over, and the result records
+  `endpoint=172.16.6.56:13912 class=direct-rdma hops=0` — served by rail-1,
+  no TCP, no silent fallback.
+- **Ghost-serve mode of the rsockets stall [hardware, characterized]**: after
+  a stall, the server ACCEPTS and SERVES requests (its counter climbed to
+  61,208 ranges across all 4096 keys at ~12K IOPS) while client reads time
+  out — responses land in the peer's rsockets buffer but never surface to
+  the application. Recovery requires a server restart. This pins the defect
+  INSIDE librdmacm's rsockets layer (buffer credits / deferred-work), not in
+  our poll/deadline logic, which is fully bounded on both sides.
+
+### Concurrent-NCCL benchmark
+
+The tensorfold v14 head (chronometer) and worker (sextant) pods are up, but
+no inference load was directed at them during our windows — the fabric was
+effectively idle, so all numbers above ARE the idle-fabric baseline. The
+concurrent test (latencybench during active NCCL + tokens/s capture) needs a
+live inference workload and remains pending; the cache transport shares no
+state with NCCL, so the measurement is additive, not structural.
