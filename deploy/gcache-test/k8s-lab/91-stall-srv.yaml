@@ -28,12 +28,12 @@ spec:
           echo "starting fresh echo servers (one per conns level)"
           i=0
           for c in 8 16 24 32 48 64 96 128; do
-            /var/tmp/lb-bins/rs_echo server $((14000+i)) > /tmp/srv-c-$c.log 2>&1 &
+            /var/tmp/lb-bins/rs_echo server $((14000+i)) 2>&1 | sed "s/^/[srv-c-$c] /" &
             i=$((i+1))
           done
           i=0
           for c in 8 16 24 32 48 64 96 128; do
-            /var/tmp/lb-bins/latencybench-rdma rdmaecho --mode server --port $((14100+i)) > /tmp/srv-go-$c.log 2>&1 &
+            /var/tmp/lb-bins/latencybench-rdma rdmaecho --mode server --port $((14100+i)) 2>&1 | sed "s/^/[srv-go-$c] /" &
             i=$((i+1))
           done
           sleep 5
