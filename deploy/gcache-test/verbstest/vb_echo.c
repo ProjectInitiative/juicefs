@@ -269,16 +269,19 @@ static struct vconn *client_connect(const char *src_ip, const char *host, const 
     memset(&hints, 0, sizeof hints);
     hints.ai_port_space = RDMA_PS_TCP;
     char svc[16]; snprintf(svc, sizeof svc, "%s", port);
-    if (rdma_getaddrinfo((char *)host, svc, &hints, &res)) die("rdma_getaddrinfo");
+    static struct sockaddr_in src_sin; /* static: must outlive the call */
     if (src_ip && *src_ip) {
         /* bind the source to the rail IP so the CM picks the mlx5 device on
            that rail (the mgmt NIC has no RDMA device; an unrouted CM REQ
-           hangs rather than failing fast) */
-        struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_src_addr;
-        memset(res->ai_src_addr, 0, res->ai_src_len);
-        sin->sin_family = AF_INET;
-        if (inet_pton(AF_INET, src_ip, &sin->sin_addr) != 1) die("src ip");
+           hangs rather than failing fast). Supply the src in the HINTS —
+           mutating the returned res is invalid (ai_src_addr may be NULL). */
+        memset(&src_sin, 0, sizeof src_sin);
+        src_sin.sin_family = AF_INET;
+        if (inet_pton(AF_INET, src_ip, &src_sin.sin_addr) != 1) die("src ip");
+        hints.ai_src_addr = (struct sockaddr *)&src_sin;
+        hints.ai_src_len = sizeof src_sin;
     }
+    if (rdma_getaddrinfo((char *)host, svc, &hints, &res)) die("rdma_getaddrinfo");
     fprintf(stderr, "vb_echo: resolving route %s:%s (src %s)\n", host, port, src_ip ? src_ip : "any");
 
     struct ibv_qp_init_attr qpattr;
