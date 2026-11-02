@@ -206,24 +206,24 @@ spec:
 
           echo "##### A) mem source: pure transport (no NVMe in the way)"
           echo "--- A1 tcp"
-          $LB  read --backend peer --addr $RAIL:13921 --keys 256 --range --verify --len 4096 --qd 1,8,64 --secs 8 --out $OUT/dgx-mem-tcp.json
+          timeout 120 $LB  read --backend peer --addr $RAIL:13921 --keys 256 --range --verify --len 4096 --qd 1,8,64 --secs 8 --out $OUT/dgx-mem-tcp.json
           echo "--- A2 rsockets strict"
           apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
-          $LBR read --backend peer --addr $RAIL:13922 --rdma --keys 256 --range --verify --len 4096 --qd 1,8,64 --secs 8 --out $OUT/dgx-mem-rdma.json
+          $LBR read --backend peer --addr $RAIL:13922 --rdma --keys 256 --range --verify --len 4096 --qd 1,8 --secs 8 --out $OUT/dgx-mem-rdma.json
 
           echo "##### B) file source (O_DIRECT NVMe): the owner-NVMe model"
           echo "--- B1 tcp"
-          $LB  read --backend peer --addr $RAIL:13911 --keys 4096 --range --verify --len 4096 --qd 1,8,64 --secs 8 --out $OUT/dgx-file-tcp.json
+          timeout 120 $LB  read --backend peer --addr $RAIL:13911 --keys 4096 --range --verify --len 4096 --qd 1,8,64 --secs 8 --out $OUT/dgx-file-tcp.json
           echo "--- B2 rsockets strict"
-          $LBR read --backend peer --addr $RAIL:13912 --rdma --keys 4096 --range --verify --len 4096 --qd 1,8,64 --secs 8 --out $OUT/dgx-file-rdma.json
+          $LBR read --backend peer --addr $RAIL:13912 --rdma --keys 4096 --range --verify --len 4096 --qd 1,8 --secs 8 --out $OUT/dgx-file-rdma.json
 
           echo "##### C) batch-70 — THE inference metric (batch completion p99)"
           echo "--- C1 file tcp"
-          $LB  read --backend peer --addr $RAIL:13911 --keys 4096 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-file-tcp.json
+          timeout 120 $LB  read --backend peer --addr $RAIL:13911 --keys 4096 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-file-tcp.json
           echo "--- C2 file rsockets"
           $LBR read --backend peer --addr $RAIL:13912 --rdma --keys 4096 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-file-rdma.json
           echo "--- C3 mem tcp"
-          $LB  read --backend peer --addr $RAIL:13921 --keys 256 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-mem-tcp.json
+          timeout 120 $LB  read --backend peer --addr $RAIL:13921 --keys 256 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-mem-tcp.json
           echo "--- C4 mem rsockets"
           $LBR read --backend peer --addr $RAIL:13922 --rdma --keys 256 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/dgx-batch70-mem-rdma.json
           echo "DGX_MATRIX_DONE"
