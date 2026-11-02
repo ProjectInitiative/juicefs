@@ -438,9 +438,17 @@ type rsocketConn struct {
 	remote string
 }
 
+// waitReady polls for readiness, but never trusts rpoll alone: on a wedged
+// rsockets fd (librdmacm internal poller deadlock — Phase-1 stall matrix,
+// RESULTS-stall-matrix.md) rpoll blocks FOREVER ignoring its timeout, parking
+// the caller past any deadline. A watchdog goroutine closes the fd when the
+// deadline passes; rclose wakes (or orphans) the blocked rpoll and waitReady
+// reports the deadline. Without a deadline the watchdog is not armed (callers
+// without deadlines are pool-internal and bounded elsewhere).
 func (c *rsocketConn) waitReady(events C.short, deadline time.Time) error {
 	for {
 		var timeoutMs C.int = -1 // infinite
+		var wd *time.Timer
 		if !deadline.IsZero() {
 			d := time.Until(deadline)
 			if d <= 0 {
@@ -454,6 +462,11 @@ func (c *rsocketConn) waitReady(events C.short, deadline time.Time) error {
 				ms = int64(1)<<31 - 1
 			}
 			timeoutMs = C.int(ms)
+			wd = time.AfterFunc(d+100*time.Millisecond, func() {
+				var se C.int
+				_ = C.c_rclose(c.fd, &se) // unblock a wedged rpoll/rread/rwrite
+			})
+			defer wd.Stop()
 		}
 		var revents C.short
 		var serr C.int
@@ -475,6 +488,10 @@ func (c *rsocketConn) waitReady(events C.short, deadline time.Time) error {
 		}
 	}
 }
+
+// cgoEscapesDeadline is documentation-only: the watchdog callback runs on a
+// Go timer thread and calls into cgo; c_rclose is async-signal-safe enough
+// for our use (it only issues close(2) on the fd).
 
 func (c *rsocketConn) Read(b []byte) (int, error) {
 	if len(b) == 0 {
