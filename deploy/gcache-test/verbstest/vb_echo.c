@@ -292,21 +292,13 @@ static struct vconn *client_connect(const char *src_ip, const char *host, const 
     if (rdma_getaddrinfo((char *)host, svc, &hints, &res)) die("rdma_getaddrinfo");
     fprintf(stderr, "vb_echo: resolving route %s:%s (src %s)\n", host, port, src_ip ? src_ip : "any");
 
-    struct ibv_qp_init_attr qpattr;
-    memset(&qpattr, 0, sizeof qpattr);
-    qpattr.cap.max_send_wr  = SLOTS;
-    qpattr.cap.max_recv_wr  = SLOTS;
-    qpattr.cap.max_send_sge = qpattr.cap.max_recv_sge = 1;
-    qpattr.cap.max_inline_data = 64;
-    qpattr.qp_type = IBV_QPT_RC;
-    qpattr.sq_sig_all = 1; /* every send gets a CQE: we poll for completion
-                              before reusing the send buffer (req 8) */
-
+    /* Endpoint WITHOUT a QP first: the PD and CQs must exist (and be ours)
+       before QP creation, otherwise librdmacm attaches its own internal CQs
+       and our poll loops never see completions (this exact bug hung the
+       first POC runs). */
     struct rdma_cm_id *id = NULL;
-    if (rdma_create_ep(&id, res, NULL, &qpattr)) die("rdma_create_ep");
-    fprintf(stderr, "vb_echo: rdma_connect...\n");
-    if (rdma_connect(id, NULL)) die("rdma_connect");
-    fprintf(stderr, "vb_echo: connected; allocating PD/CQs...\n");
+    if (rdma_create_ep(&id, res, NULL, NULL)) die("rdma_create_ep");
+    fprintf(stderr, "vb_echo: allocating PD/CQs...\n");
 
     struct vconn *c = calloc(1, sizeof *c);
     c->is_server = 0;
@@ -316,6 +308,24 @@ static struct vconn *client_connect(const char *src_ip, const char *host, const 
     c->scq = ibv_create_cq(id->verbs, SLOTS * 2, c, NULL, 0);
     c->rcq = ibv_create_cq(id->verbs, SLOTS * 2, c, NULL, 0);
     if (!c->scq || !c->rcq) die("ibv_create_cq");
+
+    struct ibv_qp_init_attr qpattr;
+    memset(&qpattr, 0, sizeof qpattr);
+    qpattr.cap.max_send_wr  = SLOTS;
+    qpattr.cap.max_recv_wr  = SLOTS;
+    qpattr.cap.max_send_sge = qpattr.cap.max_recv_sge = 1;
+    qpattr.cap.max_inline_data = 64;
+    qpattr.qp_type = IBV_QPT_RC;
+    qpattr.send_cq = c->scq;
+    qpattr.recv_cq = c->rcq;
+    qpattr.sq_sig_all = 1; /* every send gets a CQE: we poll for completion
+                              before reusing the send buffer (req 8) */
+    if (rdma_create_qp(id, c->pd, &qpattr)) die("rdma_create_qp");
+
+    fprintf(stderr, "vb_echo: rdma_connect...\n");
+    if (rdma_connect(id, NULL)) die("rdma_connect");
+    fprintf(stderr, "vb_echo: connected; posting recvs...\n");
+
     c->sendbuf = reg_buf(c->pd, MAX_MSG);
     c->framecap = 8 + 4u * 1024 * 1024;
     c->frame = calloc(1, c->framecap);
@@ -500,15 +510,8 @@ static int run_server(const char *port) {
     }
     if (rdma_getaddrinfo(rail && *rail ? (char *)rail : NULL, (char *)port, &hints, &res)) die("rdma_getaddrinfo");
 
-    struct ibv_qp_init_attr qpattr;
-    memset(&qpattr, 0, sizeof qpattr);
-    qpattr.cap.max_send_wr = SLOTS; qpattr.cap.max_recv_wr = SLOTS;
-    qpattr.cap.max_send_sge = qpattr.cap.max_recv_sge = 1;
-    qpattr.cap.max_inline_data = 64;
-    qpattr.qp_type = IBV_QPT_RC;
-
     struct rdma_cm_id *lid = NULL;
-    if (rdma_create_ep(&lid, res, NULL, &qpattr)) die("rdma_create_ep (server)");
+    if (rdma_create_ep(&lid, res, NULL, NULL)) die("rdma_create_ep (server)");
     if (rdma_listen(lid, 256)) die("rdma_listen");
     printf("vb_echo server: listening on rdma_cm port %s (RC QPs, per-conn CQs)\n", port);
     fflush(stdout);
@@ -526,6 +529,17 @@ static int run_server(const char *port) {
         c->scq = ibv_create_cq(cid->verbs, SLOTS * 2, c, NULL, 0);
         c->rcq = ibv_create_cq(cid->verbs, SLOTS * 2, c, NULL, 0);
         if (!c->scq || !c->rcq) die("ibv_create_cq");
+        struct ibv_qp_init_attr qpattr;
+        memset(&qpattr, 0, sizeof qpattr);
+        qpattr.cap.max_send_wr  = SLOTS;
+        qpattr.cap.max_recv_wr  = SLOTS;
+        qpattr.cap.max_send_sge = qpattr.cap.max_recv_sge = 1;
+        qpattr.cap.max_inline_data = 64;
+        qpattr.qp_type = IBV_QPT_RC;
+        qpattr.send_cq = c->scq;
+        qpattr.recv_cq = c->rcq;
+        qpattr.sq_sig_all = 1;
+        if (rdma_create_qp(cid, c->pd, &qpattr)) die("rdma_create_qp (server child)");
         c->sendbuf = reg_buf(c->pd, MAX_MSG);
         c->framecap = 8 + 4u * 1024 * 1024;
         c->frame = calloc(1, c->framecap);
