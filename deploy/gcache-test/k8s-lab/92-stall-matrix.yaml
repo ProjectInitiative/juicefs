@@ -1,0 +1,53 @@
+# Phase-1 stall matrix client (chronometer): for each conns level x each
+# client stack (C, Go) x each server stack (C, Go): an 8s echo leg against
+# that level's fresh server process. 32 legs; full logs per leg.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-stall-matrix
+  namespace: llm-test
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: chronometer
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: matrix
+        image: golang:1.25-bookworm
+        securityContext: { privileged: true }
+        command: ["bash","-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
+          RAIL=172.16.5.56
+          i=0
+          for c in 8 16 24 32 48 64 96 128; do
+            for srv in 14000 14100; do
+              port=$((srv+i))
+              cli=c; [ "$srv" = "14100" ] && cli=go
+              for clibin in c go; do
+                echo "##### LEG conns=$c srv=$( [ $srv = 14000 ] && echo C || echo GO ) cli=$clibin port=$port"
+                if [ "$clibin" = "c" ]; then
+                  timeout 90 /var/tmp/lb-bins/rs_echo client $RAIL $port $c 8 3000
+                else
+                  timeout 90 /var/tmp/lb-bins/latencybench-rdma rdmaecho --mode client \
+                      --addr $RAIL --port $port --conns $c --secs 8 --stall-ms 3000
+                fi
+                echo "##### end leg (exit $?)"
+              done
+            done
+            i=$((i+1))
+          done
+          echo "STALL_MATRIX_DONE"
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: dev, mountPath: /dev }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: dev
+        hostPath: { path: /dev, type: Directory }

@@ -135,7 +135,8 @@ spec:
           go build -trimpath -o /out/latencybench ./tools/latencybench
           apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
           CGO_ENABLED=1 go build -tags rdma -trimpath -o /out/latencybench-rdma ./tools/latencybench
-          echo BUILD_OK arm64 + rdma
+          gcc -O2 -o /out/rs_echo deploy/gcache-test/rdmastall/rs_echo.c -lrdmacm -lpthread
+          echo BUILD_OK arm64 + rdma + rs_echo
         volumeMounts: [{ name: out, mountPath: /out }]
       volumes:
       - name: out
@@ -170,7 +171,8 @@ spec:
           go build -trimpath -o /out/latencybench ./tools/latencybench
           apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
           CGO_ENABLED=1 go build -tags rdma -trimpath -o /out/latencybench-rdma ./tools/latencybench
-          echo BUILD_OK arm64 + rdma
+          gcc -O2 -o /out/rs_echo deploy/gcache-test/rdmastall/rs_echo.c -lrdmacm -lpthread
+          echo BUILD_OK arm64 + rdma + rs_echo
         volumeMounts: [{ name: out, mountPath: /out }]
       volumes:
       - name: out

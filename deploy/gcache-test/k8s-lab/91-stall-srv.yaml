@@ -1,0 +1,49 @@
+# Phase-1 stall matrix server: fresh C and Go rsockets echo processes per
+# connection level, so a poisoned server cannot contaminate later legs.
+#   C  servers: ports 14000..14007  (conns 8,16,24,32,48,64,96,128)
+#   Go servers: ports 14100..14107  (same levels)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-stall-srv
+  namespace: llm-test
+  annotations: { lb-role: "long-running; delete the job to stop it" }
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 21600
+  template:
+    spec:
+      nodeName: sextant
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: servers
+        image: golang:1.25-bookworm
+        securityContext: { privileged: true }
+        command: ["bash","-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
+          echo "starting fresh echo servers (one per conns level)"
+          i=0
+          for c in 8 16 24 32 48 64 96 128; do
+            /var/tmp/lb-bins/rs_echo server $((14000+i)) > /tmp/srv-c-$c.log 2>&1 &
+            i=$((i+1))
+          done
+          i=0
+          for c in 8 16 24 32 48 64 96 128; do
+            /var/tmp/lb-bins/latencybench-rdma rdmaecho --mode server --port $((14100+i)) > /tmp/srv-go-$c.log 2>&1 &
+            i=$((i+1))
+          done
+          sleep 5
+          echo "all listeners up; waiting forever"
+          sleep infinity
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: dev, mountPath: /dev }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
