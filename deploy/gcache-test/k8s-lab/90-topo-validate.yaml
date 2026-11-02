@@ -1,0 +1,57 @@
+# Topology hardware validation on chronometer:
+#   1. topo --fabric: graph from the real rdma-fabric.json (sextant+octant rails)
+#   2. dead-rail failover: RdmaAddrs [unused-IP-on-rail-0, live-rail-1] -> served by rail-1
+#   3. live-rail direct read with endpoint/class/hops reporting
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-topo-validate
+  namespace: llm-test
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: chronometer
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: topo
+        image: golang:1.25-bookworm
+        securityContext: { privileged: true }
+        command: ["bash","-c"]
+        args:
+        - |
+          set -x
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
+          LBR=/var/tmp/lb-bins/latencybench-rdma
+          echo "##### 1) connectivity graph from the fabric inventory"
+          $LBR topo --fabric /var/lib/dgx-spark/rdma-fabric.json --rdma-port 13912 --tcp-port 13910
+          echo "##### 2) dead-rail failover (rail-0 IP unused, rail-1 live) — strict mode"
+          timeout 60 $LBR read --backend peer \
+              --addr 172.16.5.56:13912 \
+              --rdma-addr 172.16.5.99:13912,172.16.6.56:13912 \
+              --rdma --keys 4096 --range --verify --len 4096 --qd 4 --secs 5 \
+              --out /var/tmp/lb-data/results/topo-failover.json || echo "FAILOVER FAILED"
+          echo "##### 3) direct read on the live rail (endpoint/class/hops in output)"
+          timeout 60 $LBR read --backend peer \
+              --addr 172.16.6.56:13912 \
+              --rdma-addr 172.16.6.56:13912 \
+              --rdma --keys 4096 --range --verify --len 4096 --qd 4 --secs 5 \
+              --out /var/tmp/lb-data/results/topo-direct.json || echo "DIRECT FAILED"
+          echo "TOPO_VALIDATE_DONE"
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: data, mountPath: /var/tmp/lb-data }
+        - { name: dev, mountPath: /dev }
+        - { name: fabric, mountPath: /var/lib/dgx-spark, readOnly: true }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: data
+        hostPath: { path: /var/tmp/lb-data, type: DirectoryOrCreate }
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
+      - name: fabric
+        hostPath: { path: /var/lib/dgx-spark, type: Directory }
