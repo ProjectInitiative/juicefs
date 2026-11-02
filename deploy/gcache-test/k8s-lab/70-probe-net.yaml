@@ -1,0 +1,54 @@
+# connectivity probe: does the host firewall let bench ports through?
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-probe-net-capstan
+  namespace: llm-test
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 1800
+  template:
+    spec:
+      nodeName: capstan1
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: probe
+        image: golang:1.25-bookworm
+        command: ["bash","-c"]
+        args:
+        - |
+          probe() { timeout 3 bash -c "echo > /dev/tcp/$1/$2" 2>/dev/null && echo "$1:$2 OPEN" || echo "$1:$2 BLOCKED/timeout"; }
+          echo "--- from capstan1 (hostNetwork) ---"
+          probe 172.16.4.52 13910
+          probe 172.16.4.53 13910
+          probe 172.16.4.52 22
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-probe-net-dgx
+  namespace: llm-test
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 1800
+  template:
+    spec:
+      nodeName: chronometer
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: probe
+        image: golang:1.25-bookworm
+        command: ["bash","-c"]
+        args:
+        - |
+          probe() { timeout 3 bash -c "echo > /dev/tcp/$1/$2" 2>/dev/null && echo "$1:$2 OPEN" || echo "$1:$2 BLOCKED/timeout"; }
+          echo "--- from chronometer to sextant rails (172.16.5.56) ---"
+          probe 172.16.5.56 13911
+          probe 172.16.5.56 13921
+          probe 172.16.5.56 22
+          echo "--- control plane (172.16.4.56) ---"
+          probe 172.16.4.56 13911
