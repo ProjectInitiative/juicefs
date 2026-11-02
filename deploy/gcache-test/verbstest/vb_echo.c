@@ -198,7 +198,7 @@ static int server_echo(struct vconn *c, uint8_t *frame, uint32_t total) {
         sge.lkey = c->sendbuf.mr->lkey;
         wr.wr_id = 1;
         wr.opcode = IBV_WR_SEND;
-        wr.send_flags = chunk <= 64 ? IBV_SEND_INLINE : 0;
+        wr.send_flags = IBV_SEND_SIGNALED | (chunk <= 64 ? IBV_SEND_INLINE : 0);
         wr.sg_list = &sge; wr.num_sge = 1;
         if (ibv_post_send(c->id->qp, &wr, &bad)) return -1;
         /* wait for the send completion before reusing sendbuf (req 8) */
@@ -307,7 +307,8 @@ static struct vconn *client_connect(const char *src_ip, const char *host, const 
     qpattr.cap.max_send_sge = qpattr.cap.max_recv_sge = 1;
     qpattr.cap.max_inline_data = 64;
     qpattr.qp_type = IBV_QPT_RC;
-    qpattr.sq_sig_all = 0;
+    qpattr.sq_sig_all = 1; /* every send gets a CQE: we poll for completion
+                              before reusing the send buffer (req 8) */
 
     struct rdma_cm_id *id = NULL;
     if (rdma_create_ep(&id, res, NULL, &qpattr)) die("rdma_create_ep");
@@ -401,7 +402,7 @@ static void *cli_worker(void *arg) {
             sge.length = chunk;
             sge.lkey = c->sendbuf.mr->lkey;
             wr.wr_id = 1; wr.opcode = IBV_WR_SEND;
-            wr.send_flags = chunk <= 64 ? IBV_SEND_INLINE : 0;
+            wr.send_flags = IBV_SEND_SIGNALED | (chunk <= 64 ? IBV_SEND_INLINE : 0);
             wr.sg_list = &sge; wr.num_sge = 1;
             if (ibv_post_send(c->id->qp, &wr, &bad)) { a->err = 1; goto out; }
             struct ibv_wc wc; int done = 0;
