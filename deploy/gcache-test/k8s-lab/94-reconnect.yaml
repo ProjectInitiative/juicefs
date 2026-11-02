@@ -1,0 +1,79 @@
+# Phase-1 reconnect discriminator: does the SERVER wedge after its first client wave disconnects?
+# One fresh C server (14060) + one fresh Go server (14160) on sextant; sequential legs from
+# chronometer against the SAME server process: A(C) B(Go) C(Go) D(C) — 8 conns, 5s, 3s deadline.
+apiVersion: batch/v1
+kind: Job
+metadata: { name: lb-reconn-srv, namespace: llm-test, annotations: { lb-role: long-running } }
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: sextant
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: servers
+        image: golang:1.25-bookworm
+        securityContext: { privileged: true }
+        command: ["bash","-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
+          stdbuf -o0 /var/tmp/lb-bins/rs_echo server 14060 2>&1 | awk '{ print "[srv-c] " $0; fflush(); }' &
+          stdbuf -o0 /var/tmp/lb-bins/latencybench-rdma rdmaecho --mode server --port 14160 2>&1 | awk '{ print "[srv-go] " $0; fflush(); }' &
+          sleep 5
+          echo "reconn servers up; waiting forever"
+          sleep infinity
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: dev, mountPath: /dev }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: lb-reconn-cli, namespace: llm-test }
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: chronometer
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: cli
+        image: golang:1.25-bookworm
+        securityContext: { privileged: true }
+        command: ["bash","-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
+          RAIL=172.16.5.56
+          echo "waiting for servers..."; sleep 40
+          echo "##### A. C-cli 8c -> C-srv (virgin)";      timeout 60 /var/tmp/lb-bins/rs_echo client $RAIL 14060 8 5 3000; echo "exit $?"
+          sleep 5
+          echo "##### B. Go-cli 8c -> C-srv (after A)";    timeout 60 /var/tmp/lb-bins/latencybench-rdma rdmaecho --mode client --addr $RAIL --port 14060 --conns 8 --secs 5 --stall-ms 3000; echo "exit $?"
+          sleep 5
+          echo "##### C. Go-cli 8c -> C-srv (after B)";    timeout 60 /var/tmp/lb-bins/latencybench-rdma rdmaecho --mode client --addr $RAIL --port 14060 --conns 8 --secs 5 --stall-ms 3000; echo "exit $?"
+          sleep 5
+          echo "##### D. C-cli 8c -> C-srv (after C)";     timeout 60 /var/tmp/lb-bins/rs_echo client $RAIL 14060 8 5 3000; echo "exit $?"
+          sleep 5
+          echo "##### E. Go-cli 8c -> Go-srv (virgin)";    timeout 60 /var/tmp/lb-bins/latencybench-rdma rdmaecho --mode client --addr $RAIL --port 14160 --conns 8 --secs 5 --stall-ms 3000; echo "exit $?"
+          sleep 5
+          echo "##### F. C-cli 8c -> Go-srv (after E)";    timeout 60 /var/tmp/lb-bins/rs_echo client $RAIL 14160 8 5 3000; echo "exit $?"
+          echo "##### done"
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: dev, mountPath: /dev }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
