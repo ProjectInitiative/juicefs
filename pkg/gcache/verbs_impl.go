@@ -602,7 +602,8 @@ func (c *verbsConn) ingest(chunk []byte) error {
 			return fmt.Errorf("verbs: frame %d > max %d", total, vbMaxFrame)
 		}
 		c.pending = make([]byte, 4+int(total))
-		c.pendingLen, c.pendingTotal = 0, int(total)
+		binary.LittleEndian.PutUint32(c.pending[0:4], total)
+		c.pendingLen, c.pendingTotal = 4, int(total)
 	}
 	n := copy(c.pending[c.pendingLen:], chunk)
 	c.pendingLen += n
