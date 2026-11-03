@@ -135,6 +135,17 @@ static int vb_post_send(struct vb_conn *c, struct vb_buf *b, uint32_t len, int i
     return ibv_post_send(c->qp, &wr, &bad);
 }
 
+// vb_qp_to_err transitions the QP to ERR: flushes outstanding WRs locally,
+// wakes pollers, and surfaces flush-error WCs on the peer — without the
+// blocking CM DREQ handshake of rdma_disconnect (which stalls the
+// destructor for the full CM timeout when the peer is gone).
+static int vb_qp_to_err(struct vb_conn *c) {
+    struct ibv_qp_attr attr;
+    memset(&attr, 0, sizeof attr);
+    attr.qp_state = IBV_QPS_ERR;
+    return ibv_modify_qp(c->qp, &attr, IBV_QP_STATE);
+}
+
 // 1 wc, 0 none, -1 CQ error
 static int vb_poll_scq(struct vb_conn *c, struct ibv_wc *wc) {
     int n = ibv_poll_cq(c->scq, 1, wc);
@@ -701,8 +712,8 @@ func (c *verbsConn) Close() error {
 		c.framesMu.Lock()
 		c.framesCond.Broadcast()
 		c.framesMu.Unlock()
-		if prev == stateLive && c.id != nil {
-			C.rdma_disconnect(c.id) // flushes QP; error ignored (idempotent)
+		if prev == stateLive && c.id != nil && c.cn != nil {
+			C.vb_qp_to_err(c.cn) // flushes QP; error ignored (idempotent)
 		}
 		if c.recvDone != nil {
 			select {
