@@ -204,6 +204,7 @@ static int vb_poll_rcq(struct vb_conn *c, struct ibv_wc *wc) {
 import "C"
 
 import (
+	"log"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -580,6 +581,7 @@ func (c *verbsConn) recvLoop() {
 		chunk := (*[vbMsgSize]byte)(unsafe.Pointer(b.data))[:wc.byte_len:wc.byte_len]
 		cp := make([]byte, len(chunk))
 		copy(cp, chunk)
+		vbDebugf("conn %p recv WC len=%d first16=%x", unsafe.Pointer(c.cn), wc.byte_len, cp[:min(16, len(cp))])
 		if err := c.ingest(cp); err != nil {
 			c.markBroken(err)
 			return
@@ -592,6 +594,14 @@ func (c *verbsConn) recvLoop() {
 }
 
 // ingest reassembles chunk(s) into frames; called from recvLoop only.
+var verbsDebug = os.Getenv("VB_DEBUG") != ""
+
+func vbDebugf(format string, args ...any) {
+	if verbsDebug {
+		log.Printf("[vb] "+format, args...)
+	}
+}
+
 func (c *verbsConn) ingest(chunk []byte) error {
 	if c.pending == nil {
 		if len(chunk) < 4 {
@@ -611,6 +621,7 @@ func (c *verbsConn) ingest(chunk []byte) error {
 		return nil // more chunks expected
 	}
 	c.frames = append(c.frames, c.pending)
+	vbDebugf("conn %p frame complete total=%d", unsafe.Pointer(c.cn), c.pendingTotal)
 	c.pending = nil
 	c.framesCond.Broadcast()
 	return nil
