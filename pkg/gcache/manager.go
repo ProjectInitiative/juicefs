@@ -65,6 +65,7 @@ type Config struct {
 	FillOnUpload  bool          // push uploaded blocks to owners (best-effort)
 	RdmaNics      []string      // --rdma-network: NICs to advertise for RDMA ("" or empty => TCP-only)
 	RdmaAdvertise string        // advertised RDMA host:port ("" : rdmaTransport picks)
+	RdmaProto     string        // RDMA protocol when RdmaNics set: "rsockets" (default) | "verbs" — EXPLICIT, never silently switched
 }
 
 func autoC7Advertise(listenAddr string) (string, error) {
@@ -225,25 +226,50 @@ func (m *Manager) Start(ctx context.Context) error {
 		// Initialization failure is FATAL for the RDMA config (no silent
 		// TCP fallback at startup — matches enterprise 5.3 semantics).
 		if len(m.cfg.RdmaNics) > 0 {
-			rt, rerr := ListenRDMA(m.cfg.RdmaNics, m.cfg.RdmaAdvertise)
+			proto := m.cfg.RdmaProto
+			if proto == "" {
+				proto = "rsockets" // backward-compatible default
+			}
+			var ln net.Listener
+			var adv string
+			var rerr error
+			switch proto {
+			case "rsockets":
+				var rrt *RdmaTransport
+				rrt, rerr = ListenRDMA(m.cfg.RdmaNics, m.cfg.RdmaAdvertise)
+				if rerr == nil {
+					ln = rrt.ln
+					adv = rrt.Addr()
+				}
+			case "verbs":
+				if verbsListenImpl == nil {
+					m.cancel()
+					return fmt.Errorf("native verbs transport requires a -tags rdma build")
+				}
+				ln, adv, rerr = verbsListenImpl(m.cfg.RdmaNics, m.cfg.RdmaAdvertise)
+
+			default:
+				m.cancel()
+				return fmt.Errorf("invalid rdma-proto %q (want rsockets|verbs)", proto)
+			}
 			if rerr != nil {
 				m.cancel()
 				return fmt.Errorf("rdma listen on %v: %w", m.cfg.RdmaNics, rerr)
 			}
 			m.mu.Lock()
-			m.rdmaAddr = rt.Addr()
+			m.rdmaAddr = adv
 			m.mu.Unlock()
 			m.wg.Add(1)
 			go func() {
 				defer m.wg.Done()
 				<-ctx.Done()
-				rt.Close()
+				ln.Close()
 			}()
 			m.wg.Add(1)
 			go func() {
 				defer m.wg.Done()
 				for {
-					conn, err := rt.Accept()
+					conn, err := ln.Accept()
 					if err != nil {
 						select {
 						case <-ctx.Done():
@@ -261,7 +287,7 @@ func (m *Manager) Start(ctx context.Context) error {
 					}()
 				}
 			}()
-			logger.Infof("gcache rdma listener ready on %s (%s)", rt.Addr(), rt.Name())
+			logger.Infof("gcache rdma listener ready on %s (%s)", adv, proto)
 		}
 	}
 	m.wg.Add(1)

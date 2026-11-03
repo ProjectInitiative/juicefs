@@ -104,3 +104,7 @@ var (
 	verbsDialFn   func(ctx context.Context, addr string) (net.Conn, error)
 	verbsListenFn func(nics []string, advertise string) (net.Listener, string, error)
 )
+
+// verbsListenImpl is the manager-facing listen hook: nil (unsupported) in
+// plain builds; the rdma-tagged implementation otherwise.
+var verbsListenImpl func(nics []string, advertise string) (net.Listener, string, error)

@@ -187,7 +187,7 @@ type verbsListener struct {
 
 // ListenVerbs binds a native-verbs listener to the rail address derived
 // from advertise/nics. The advertised address is the bound host:port.
-func verbsListenImpl(nics []string, advertise string) (net.Listener, string, error) {
+func verbsListenC(nics []string, advertise string) (net.Listener, string, error) {
 	host, port, err := verbsSplitAdvertise(advertise, nics)
 	if err != nil {
 		return nil, "", err
@@ -758,5 +758,6 @@ func cBool(b bool) C.int {
 
 func init() {
 	verbsDialFn = verbsDialImpl
-	verbsListenFn = verbsListenImpl
+	verbsListenFn = verbsListenC
+	verbsListenImpl = verbsListenC
 }
