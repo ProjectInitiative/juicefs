@@ -371,10 +371,17 @@ static void vconn_destroy(struct vconn *c) {
     }
 
     if (c->qp) {
-        if (atomic_load(&c->state) == VS_LIVE && c->id) {
-            if (rdma_disconnect(c->id))
-                DBG("rdma_disconnect: %s\n", strerror(errno));
-        }
+        /* QP -> ERR: flushes all outstanding WRs locally (wakes pollers)
+           and surfaces flush-error WCs on the PEER, so its recv thread
+           reaps the connection. We do NOT call blocking rdma_disconnect()
+           here: it waits for the peer's DREQ/DREP handshake and blocks the
+           destructor for the full CM timeout when the peer is gone
+           (observed: minutes per conn — this hung the first teardown). */
+        struct ibv_qp_attr attr;
+        memset(&attr, 0, sizeof attr);
+        attr.qp_state = IBV_QPS_ERR;
+        if (ibv_modify_qp(c->qp, &attr, IBV_QP_STATE))
+            fprintf(stderr, "vb_echo: modify_qp(ERR): %s\n", strerror(errno));
         if (ibv_destroy_qp(c->qp))
             fprintf(stderr, "vb_echo: ibv_destroy_qp: %s\n", strerror(errno));
         else
