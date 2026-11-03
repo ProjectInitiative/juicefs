@@ -151,8 +151,9 @@ static int vb_listen(const char *host, const char *port, struct rdma_cm_id **out
     if (rdma_getaddrinfo(host, port, &hints, &res)) { free(sin); return -1; }
     free(sin);
     struct rdma_cm_id *lid = NULL;
-    if (rdma_create_ep(&lid, res, NULL, NULL)) { rdma_freeaddrinfo(res); return -1; }
+    if (rdma_create_ep(&lid, res, NULL, NULL)) { rdma_freeaddrinfo(res); return -2; }
     rdma_freeaddrinfo(res);
+    if (!lid->verbs) { rdma_destroy_id(lid); return -3; } // no device context for the route
     if (rdma_listen(lid, 256)) { rdma_destroy_id(lid); return -1; }
     *out = lid;
     return 0;
@@ -172,8 +173,9 @@ static int vb_dial_id(const char *src_ip, const char *host, const char *port, st
     if (rdma_getaddrinfo(host, port, &hints, &res)) { free(sin); return -1; }
     free(sin);
     struct rdma_cm_id *id = NULL;
-    if (rdma_create_ep(&id, res, NULL, NULL)) { rdma_freeaddrinfo(res); return -1; }
+    if (rdma_create_ep(&id, res, NULL, NULL)) { rdma_freeaddrinfo(res); return -2; }
     rdma_freeaddrinfo(res);
+    if (!id->verbs) { rdma_destroy_id(id); return -3; } // no device context for the route
     *out = id;
     return 0;
 }
@@ -501,6 +503,8 @@ func newVerbsConn(id *C.struct_rdma_cm_id, sharedPD *C.struct_ibv_pd, isServer b
 		return nil, fmt.Errorf("verbs: alloc conn")
 	}
 	c := &verbsConn{id: id, cn: cn, isServer: isServer}
+	cn.id = id       // C side needs the cm id for QP creation and teardown
+	// (is_server is Go-side only)
 	c.framesCond = sync.NewCond(&c.framesMu)
 	c.recvDone = make(chan struct{})
 
