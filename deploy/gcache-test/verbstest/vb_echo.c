@@ -357,12 +357,10 @@ static int vconn_setup(struct vconn *c) {
 static void vconn_destroy(struct vconn *c) {
     if (!c) return;
     double t0 = now_us();
-    DBG("[destroy] quiesce
-");
+    DBG("[destroy] quiesce\n");
     atomic_store(&c->stop, 1);
     if (c->has_rth) pthread_join(c->rth, NULL);
-    DBG("[destroy] joined %.1fms
-", now_us() - t0);
+    DBG("[destroy] joined %.1fms\n", now_us() - t0);
 
     /* reap any still-outstanding send WCs so buffers are quiesced before
        deregistration (req 8 / P0-3); bounded by OP_TIMEOUT */
@@ -383,8 +381,7 @@ static void vconn_destroy(struct vconn *c) {
             atomic_fetch_sub(&g_live_qps, 1);
         c->qp = NULL;
     }
-    DBG("[destroy] qp gone %.1fms
-", now_us() - t0);
+    DBG("[destroy] qp gone %.1fms\n", now_us() - t0);
     for (int i = 0; i < SLOTS; i++) unreg_buf(&c->recvbuf[i]);
     unreg_buf(&c->sendbuf);
     if (c->rcq && ibv_destroy_cq(c->rcq)) fprintf(stderr, "vb_echo: destroy rcq: %s\n", strerror(errno));
@@ -400,8 +397,7 @@ static void vconn_destroy(struct vconn *c) {
         if (rdma_destroy_id(c->id)) fprintf(stderr, "vb_echo: rdma_destroy_id: %s\n", strerror(errno));
         c->id = NULL;
     }
-    DBG("[destroy] done %.1fms
-", now_us() - t0);
+    DBG("[destroy] done %.1fms\n", now_us() - t0);
     free(c->frame);
     pthread_mutex_destroy(&c->mu);
     free(c);
@@ -545,8 +541,7 @@ static void *cli_worker(void *arg) {
     double last_beat = now_us();
     while (now_us() - t0 < (double)a->secs * 1e6) {
         if (now_us() - last_beat > 2e6) {
-            printf("[cli] alive ok=%llu
-", (unsigned long long)a->ok);
+            printf("[cli] alive ok=%llu\n", (unsigned long long)a->ok);
             fflush(stdout);
             last_beat = now_us();
         }
