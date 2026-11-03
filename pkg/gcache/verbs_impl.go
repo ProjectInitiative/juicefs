@@ -135,6 +135,49 @@ static int vb_post_send(struct vb_conn *c, struct vb_buf *b, uint32_t len, int i
     return ibv_post_send(c->qp, &wr, &bad);
 }
 
+// create a passive CM id bound to host:port (host in dotted-quad or NULL).
+// All rdma_addrinfo memory is C-allocated (cgo pointer rules).
+static int vb_listen(const char *host, const char *port, struct rdma_cm_id **out) {
+    struct rdma_addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_flags = RAI_PASSIVE;
+    hints.ai_port_space = RDMA_PS_TCP;
+    struct sockaddr_in *sin = calloc(1, sizeof *sin);
+    if (!sin) return -1;
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = host ? inet_addr(host) : INADDR_ANY;
+    hints.ai_src_addr = (struct sockaddr *)sin;
+    hints.ai_src_len = sizeof *sin;
+    if (rdma_getaddrinfo(host, port, &hints, &res)) { free(sin); return -1; }
+    free(sin);
+    struct rdma_cm_id *lid = NULL;
+    if (rdma_create_ep(&lid, res, NULL, NULL)) { rdma_freeaddrinfo(res); return -1; }
+    rdma_freeaddrinfo(res);
+    if (rdma_listen(lid, 256)) { rdma_destroy_id(lid); return -1; }
+    *out = lid;
+    return 0;
+}
+
+// create an ACTIVE CM id (no QP) resolved to host:port from src_ip.
+static int vb_dial_id(const char *src_ip, const char *host, const char *port, struct rdma_cm_id **out) {
+    struct rdma_addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_port_space = RDMA_PS_TCP;
+    struct sockaddr_in *sin = calloc(1, sizeof *sin);
+    if (!sin) return -1;
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = inet_addr(src_ip);
+    hints.ai_src_addr = (struct sockaddr *)sin;
+    hints.ai_src_len = sizeof *sin;
+    if (rdma_getaddrinfo(host, port, &hints, &res)) { free(sin); return -1; }
+    free(sin);
+    struct rdma_cm_id *id = NULL;
+    if (rdma_create_ep(&id, res, NULL, NULL)) { rdma_freeaddrinfo(res); return -1; }
+    rdma_freeaddrinfo(res);
+    *out = id;
+    return 0;
+}
+
 // vb_qp_to_err transitions the QP to ERR: flushes outstanding WRs locally,
 // wakes pollers, and surfaces flush-error WCs on the peer — without the
 // blocking CM DREQ handshake of rdma_disconnect (which stalls the
@@ -203,32 +246,12 @@ func verbsListenC(nics []string, advertise string) (net.Listener, string, error)
 	if err != nil {
 		return nil, "", err
 	}
-	hints := C.struct_rdma_addrinfo{}
-	hints.ai_flags = C.RAI_PASSIVE
-	hints.ai_port_space = C.RDMA_PS_TCP
-	var src C.struct_sockaddr_in
-	src.sin_family = C.AF_INET
-	src.sin_addr.s_addr = C.inet_addr(C.CString(host)) // #nosec — host is a validated rail IP
-	src.sin_port = C.in_port_t(verbsHtons(uint16(port)))
-	hints.ai_src_addr = (*C.struct_sockaddr)(unsafe.Pointer(&src))
-	hints.ai_src_len = C.socklen_t(unsafe.Sizeof(src))
-
+	var lid *C.struct_rdma_cm_id
 	cHost, cPort := C.CString(host), C.CString(fmt.Sprint(port))
 	defer C.free(unsafe.Pointer(cHost))
 	defer C.free(unsafe.Pointer(cPort))
-	var res *C.struct_rdma_addrinfo
-	if C.rdma_getaddrinfo(cHost, cPort, &hints, &res) != 0 {
-		return nil, "", fmt.Errorf("verbs listen: getaddrinfo: errno %d", C.vb_errno())
-	}
-	defer C.rdma_freeaddrinfo(res)
-
-	var lid *C.struct_rdma_cm_id
-	if C.rdma_create_ep(&lid, res, nil, nil) != 0 {
-		return nil, "", fmt.Errorf("verbs listen: create_ep: errno %d", C.vb_errno())
-	}
-	if C.rdma_listen(lid, 256) != 0 {
-		C.rdma_destroy_id(lid)
-		return nil, "", fmt.Errorf("verbs listen: listen: errno %d", C.vb_errno())
+	if C.vb_listen(cHost, cPort, &lid) != 0 {
+		return nil, "", fmt.Errorf("verbs listen: errno %d", C.vb_errno())
 	}
 	return &verbsListener{id: lid}, net.JoinHostPort(host, fmt.Sprint(port)), nil
 }
@@ -307,6 +330,10 @@ func verbsDialImpl(ctx context.Context, addr string) (net.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("verbs dial %s: %w", addr, err)
 	}
+	railIP, rerr := firstNICIPv4(nil)
+	if rerr != nil {
+		return nil, fmt.Errorf("verbs dial %s: no rail source IP: %w", addr, rerr)
+	}
 	port := 0
 	for _, ch := range portStr {
 		if ch < '0' || ch > '9' {
@@ -315,27 +342,14 @@ func verbsDialImpl(ctx context.Context, addr string) (net.Conn, error) {
 		port = port*10 + int(ch-'0')
 	}
 
-	hints := C.struct_rdma_addrinfo{}
-	hints.ai_port_space = C.RDMA_PS_TCP
-	var src C.struct_sockaddr_in
-	src.sin_family = C.AF_INET
-	if rail, err := firstNICIPv4(nil); err == nil {
-		src.sin_addr.s_addr = C.inet_addr(C.CString(rail))
-		hints.ai_src_addr = (*C.struct_sockaddr)(unsafe.Pointer(&src))
-		hints.ai_src_len = C.socklen_t(unsafe.Sizeof(src))
-	}
+	var id *C.struct_rdma_cm_id
+	cRail := C.CString(railIP)
 	cHost, cPort := C.CString(host), C.CString(portStr)
+	defer C.free(unsafe.Pointer(cRail))
 	defer C.free(unsafe.Pointer(cHost))
 	defer C.free(unsafe.Pointer(cPort))
-	var res *C.struct_rdma_addrinfo
-	if C.rdma_getaddrinfo(cHost, cPort, &hints, &res) != 0 {
-		return nil, fmt.Errorf("verbs dial %s: getaddrinfo: errno %d", addr, C.vb_errno())
-	}
-	defer C.rdma_freeaddrinfo(res)
-
-	var id *C.struct_rdma_cm_id
-	if C.rdma_create_ep(&id, res, nil, nil) != 0 {
-		return nil, fmt.Errorf("verbs dial %s: create_ep: errno %d", addr, C.vb_errno())
+	if C.vb_dial_id(cRail, cHost, cPort, &id) != 0 {
+		return nil, fmt.Errorf("verbs dial %s: resolve/create_ep: errno %d", addr, C.vb_errno())
 	}
 	// The QP must be created with OUR CQs before connecting.
 	conn, err := newVerbsConn(id, nil, false)
