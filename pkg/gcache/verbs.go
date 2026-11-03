@@ -108,3 +108,12 @@ var (
 // verbsListenImpl is the manager-facing listen hook: nil (unsupported) in
 // plain builds; the rdma-tagged implementation otherwise.
 var verbsListenImpl func(nics []string, advertise string) (net.Listener, string, error)
+
+// VerbListenForBench exposes the verbs listener for benchmark harnesses
+// (nil in plain builds). Returns the listener and its advertised address.
+func VerbListenForBench(nics []string, advertise string) (net.Listener, string, error) {
+	if verbsListenImpl == nil {
+		return nil, "", ErrVerbsUnsupported
+	}
+	return verbsListenImpl(nics, advertise)
+}

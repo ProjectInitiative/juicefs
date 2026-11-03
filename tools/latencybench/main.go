@@ -604,6 +604,10 @@ func (s *fileSource) CompressPayload(d, s2 []byte) (int, error) { return copy(d,
 func (s *fileSource) StorePushed(_ context.Context, _ string, _ []byte) error { return nil }
 func (s *fileSource) DropCached(_ string) error                { return nil }
 
+// rdmaProtoFlag: "rsockets" | "verbs" (set from --rdma-proto in read/serve).
+var rdmaProtoFlag = "rsockets"
+var serveRdmaProto = "rsockets"
+
 // ---------------------------------------------------------------- serve
 
 func cmdServe(args []string) {
@@ -614,9 +618,12 @@ func cmdServe(args []string) {
 	direct := fs.Bool("direct", false, "open --file with O_DIRECT (owner-NVMe model; reads are 4096-aligned)")
 	blocks := fs.Int("blocks", 256, "number of preloaded blocks (mem)")
 	blocksize := fs.Int("blocksize", 4<<20, "block size in bytes (mem and file; must be a multiple of 4096 for --src file)")
-	rdma := fs.Bool("rdma", false, "listen on rsockets (RDMA) ONLY — strict benchmark mode, no TCP listener (requires -tags rdma; verify with rping first)")
+	rdma := fs.Bool("rdma", false, "listen on RDMA ONLY — strict benchmark mode, no TCP listener (requires -tags rdma; protocol via --rdma-proto)")
 	nics := fs.String("nics", "", "comma-separated NIC list for --rdma (default: first non-loopback IPv4)")
+	rdmaProto := fs.String("rdma-proto", "rsockets", "RDMA transport protocol for --rdma: rsockets (default) | verbs (native RC QPs)")
 	_ = fs.Parse(args)
+	rdmaProtoFlag = *rdmaProto
+	serveRdmaProto = *rdmaProto
 
 	var inner gcache.ServerSource
 	switch *src {
@@ -677,6 +684,20 @@ func cmdServe(args []string) {
 		adv := ""
 		if p, err := strconv.Atoi(aport); err == nil && p > 0 {
 			adv = ":" + aport
+		}
+		if serveRdmaProto == "verbs" {
+			vln, advAddr, lerr := gcache.VerbListenForBench(nicList, adv)
+			if lerr != nil {
+				fatalf("verbs listen: %v (build latencybench with -tags rdma first)", lerr)
+			}
+			fmt.Printf("gcache peer server on %s (verbs) — RDMA ONLY\n", advAddr)
+			for {
+				conn, err := vln.Accept()
+				if err != nil {
+					return
+				}
+				go gcache.ServeConn(ctx, conn, cs, 65*time.Second)
+			}
 		}
 		rt, err := gcache.ListenRDMA(nicList, adv)
 		if err != nil {
@@ -746,11 +767,23 @@ func newPeer(addrs, rdmaAddrs []string, keys, bs int, useRange, unique, useRDMA,
 	rc := gcache.NewRingClient(timeout, 31, "latencybench") // 31 = maxFailures, NOT pool size
 	rc.SetPoolMaxIdle(maxIdle)
 	if useRDMA {
-		rt, err := gcache.DialRDMA()
-		if err != nil {
-			fatalf("--rdma unavailable: %v (build with -tags rdma and install rdma-core)", err)
+		proto := rdmaProtoFlag
+		switch proto {
+		case "", "rsockets":
+			t2, err := gcache.DialRDMA()
+			if err != nil {
+				fatalf("--rdma unavailable: %v (build with -tags rdma and install rdma-core)", err)
+			}
+			rc.SetRDMA(t2)
+		case "verbs":
+			t2, err := gcache.DialVerbs()
+			if err != nil {
+				fatalf("--rdma-proto verbs unavailable: %v (build with -tags rdma)", err)
+			}
+			rc.SetRDMA(t2)
+		default:
+			fatalf("invalid --rdma-proto %q (want rsockets|verbs)", proto)
 		}
-		rc.SetRDMA(rt)
 		// Strict: an RDMA failure surfaces as an error (counted) instead of
 		// silently degrading the result to TCP (review round 2, finding A).
 		rc.SetStrictRDMA(true)
@@ -858,8 +891,9 @@ func cmdRead(args []string) {
 	addr := fs.String("addr", "", "peer host:port (backend=peer). COMMA-SEPARATED LIST = a sharded ring: owner selection across 2-3 servers (e.g. --addr capstan2:13910,capstan3:13910). With --rdma, also the RDMA endpoint unless --rdma-addr")
 	path := fs.String("path", "", "file path (backend=fuse|nvme)")
 	useRange := fs.Bool("range", false, "use ranged peer reads (MsgRangeReq) instead of full-block fetch")
-	useRDMA := fs.Bool("rdma", false, "peer mode: dial the peer via rsockets in STRICT mode (requires the -tags rdma build; RDMA failure is a counted error, no TCP fallback)")
+	useRDMA := fs.Bool("rdma", false, "peer mode: dial the peer via RDMA in STRICT mode (requires the -tags rdma build; RDMA failure is a counted error, no TCP fallback)")
 	rdmaAddr := fs.String("rdma-addr", "", "peer RDMA endpoint(s) with --rdma — comma list parallel to --addr (default: --addr is the RDMA endpoint)")
+	rdmaProto := fs.String("rdma-proto", "rsockets", "RDMA transport protocol for --rdma: rsockets (default) | verbs (native RC QPs)")
 	lens := fs.String("len", "4096", "comma list of request sizes")
 	qds := fs.String("qd", "1", "comma list of queue depths")
 	batch := fs.Int("batch", 0, "if >0: batched rounds of this many concurrent reads instead of steady QD")
@@ -873,6 +907,7 @@ func cmdRead(args []string) {
 	seed := fs.Int64("seed", 42, "rng seed")
 	timeout := fs.Duration("timeout", 10*time.Second, "peer request timeout")
 	verify := fs.Bool("verify", false, "verify every payload against the bench pattern (correctness gate; requires --bs multiple of 4096 matching the server dataset — gen --blocksize / serve --blocksize / --bs must agree)")
+	rdmaProtoFlag = *rdmaProto
 	_ = fs.Parse(args)
 
 	switch *backend {
