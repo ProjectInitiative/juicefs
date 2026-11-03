@@ -134,7 +134,7 @@ spec:
           export CGO_ENABLED=1
           go build -trimpath -o /out/latencybench ./tools/latencybench
           apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
-          CGO_ENABLED=1 go build -tags rdma -trimpath -o /out/latencybench-rdma ./tools/latencybench
+          CGO_ENABLED=1 CGO_LDFLAGS="-libverbs" go build -tags rdma -trimpath -o /out/latencybench-rdma ./tools/latencybench
           gcc -O2 -o /out/rs_echo deploy/gcache-test/rdmastall/rs_echo.c -lrdmacm -lpthread
           gcc -O2 -Wall -o /out/vb_echo deploy/gcache-test/verbstest/vb_echo.c -libverbs -lrdmacm -lpthread
           echo BUILD_OK arm64 + rdma + rs_echo
@@ -171,7 +171,7 @@ spec:
           export CGO_ENABLED=1
           go build -trimpath -o /out/latencybench ./tools/latencybench
           apt-get update -qq && apt-get install -y -qq librdmacm-dev >/dev/null
-          CGO_ENABLED=1 go build -tags rdma -trimpath -o /out/latencybench-rdma ./tools/latencybench
+          CGO_ENABLED=1 CGO_LDFLAGS="-libverbs" go build -tags rdma -trimpath -o /out/latencybench-rdma ./tools/latencybench
           gcc -O2 -o /out/rs_echo deploy/gcache-test/rdmastall/rs_echo.c -lrdmacm -lpthread
           gcc -O2 -Wall -o /out/vb_echo deploy/gcache-test/verbstest/vb_echo.c -libverbs -lrdmacm -lpthread
           echo BUILD_OK arm64 + rdma + rs_echo
