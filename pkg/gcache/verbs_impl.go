@@ -802,10 +802,12 @@ func (c *verbsConn) Close() error {
 			}
 		}
 		if c.cn != nil {
+			// vb_destroy_conn tears down bufs/QP/CQs/PD AND the cm id (contract order)
 			C.vb_destroy_conn(c.cn)
 			c.cn = nil
-		}
-		if c.id != nil {
+			c.id = nil
+		} else if c.id != nil {
+			// cn never built (partial init): the id is still ours to destroy
 			if C.rdma_destroy_id(c.id) != 0 {
 				err = fmt.Errorf("verbs: destroy_id: errno %d", C.vb_errno())
 			}
