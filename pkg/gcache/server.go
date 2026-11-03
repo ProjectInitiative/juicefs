@@ -17,7 +17,6 @@
 package gcache
 
 import (
-	"log"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -523,12 +522,4 @@ func (s *ringStorage) Get(ctx context.Context, key string, off, limit int64, get
 			return in, nil
 		},
 	}, nil
-}
-
-var verbsDebug = os.Getenv("VB_DEBUG") != ""
-
-func vbDebugf(format string, args ...any) {
-	if verbsDebug {
-		log.Printf("[vbs] "+format, args...)
-	}
 }

@@ -204,7 +204,6 @@ static int vb_poll_rcq(struct vb_conn *c, struct ibv_wc *wc) {
 import "C"
 
 import (
-	"log"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -601,14 +600,6 @@ func (c *verbsConn) recvLoop() {
 }
 
 // ingest reassembles chunk(s) into frames; called from recvLoop only.
-var verbsDebug = os.Getenv("VB_DEBUG") != ""
-
-func vbDebugf(format string, args ...any) {
-	if verbsDebug {
-		log.Printf("[vb] "+format, args...)
-	}
-}
-
 func (c *verbsConn) ingest(chunk []byte) error {
 	if c.pending == nil {
 		if len(chunk) < 4 {
