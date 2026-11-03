@@ -319,6 +319,11 @@ func dataCacheFlags() []cli.Flag {
 			Name:  "rdma-network",
 			Usage: "RDMA NIC(s) for cache data path, e.g. eth1:eth2 or ib0 (enterprise parity; requires RDMA NICs + rdma-core on every group node; falls back to TCP on connection failure and retries RDMA after 5m)",
 		},
+		&cli.StringFlag{
+			Name:  "rdma-proto",
+			Value: "rsockets",
+			Usage: "RDMA transport protocol when --rdma-network is set: rsockets (default, experimental) or verbs (native RC QPs; requires -tags rdma binary). Explicit selection; never switched automatically",
+		},
 		&cli.BoolFlag{
 			Name:  "fill-group-cache",
 			Usage: "send uploaded blocks to their cache group owners (best-effort, no guarantee)",

@@ -699,6 +699,7 @@ func mount(c *cli.Context) error {
 			NoSharing:     c.Bool("no-sharing"),
 			FillOnUpload:  c.Bool("fill-group-cache"),
 			RdmaNics:      parseRdmaNics(c.String("rdma-network")),
+			RdmaProto:     c.String("rdma-proto"),
 		}
 		greg, err := meta.NewGcacheRegistryFromMeta(metaCli)
 		if err != nil {
@@ -717,14 +718,34 @@ func mount(c *cli.Context) error {
 			// client then skips self-owned keys (served locally instead).
 			group := groups[0] // v1: single-group placement
 			if len(gcfg.RdmaNics) > 0 {
-				rt, rerr := gcache.DialRDMA()
+				proto := c.String("rdma-proto")
+				if proto == "" {
+					proto = "rsockets"
+				}
+				var rt *gcache.RdmaTransport
+				var vt *gcache.VerbsTransport
+				var rerr error
+				switch proto {
+				case "rsockets":
+					rt, rerr = gcache.DialRDMA()
+					if rerr == nil {
+						rc.SetRDMA(rt)
+						logger.Infof("gcache rdma transport enabled (%s)", rt.Name())
+					}
+				case "verbs":
+					vt, rerr = gcache.DialVerbs()
+					if rerr == nil {
+						rc.SetRDMA(vt)
+						logger.Infof("gcache rdma transport enabled (%s)", vt.Name())
+					}
+				default:
+					logger.Fatalf("invalid --rdma-proto %q (want rsockets|verbs)", proto)
+				}
 				if rerr != nil {
 					// Enterprise parity: --rdma-network requested but
 					// RDMA userland/hardware is unavailable => fatal.
-					logger.Fatalf("rdma-network %v unavailable: %s", gcfg.RdmaNics, rerr)
+					logger.Fatalf("rdma-network %v (%s) unavailable: %s", gcfg.RdmaNics, proto, rerr)
 				}
-				rc.SetRDMA(rt)
-				logger.Infof("gcache rdma transport enabled (%s)", rt.Name())
 			}
 			blob = gcache.NewRingStorage(blob, rc, func(string) []gcache.Member { return gmgr.AllMembers(group) }, gmgr.UUID())
 			gcache.SetFillOnStorage(blob, c.Bool("fill-group-cache"))
