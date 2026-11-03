@@ -487,7 +487,15 @@ const (
 	stateClosed
 )
 
+// dialMu serializes connection setup: concurrent ibv_reg_mr calls storm the
+// mlx5 driver's pinning path (observed: 40 goroutines stuck in reg_mr on a
+// node with pinned-memory pressure). Registration is per-conn one-shot, so
+// serializing it costs nothing in steady state.
+var dialMu sync.Mutex
+
 func newVerbsConn(id *C.struct_rdma_cm_id, sharedPD *C.struct_ibv_pd, isServer bool) (*verbsConn, error) {
+	dialMu.Lock()
+	defer dialMu.Unlock()
 	cn := C.vb_alloc_conn(vbSendDepth, vbRecvDepth, vbMsgSize)
 	if cn == nil {
 		return nil, fmt.Errorf("verbs: alloc conn")
