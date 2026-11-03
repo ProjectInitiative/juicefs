@@ -232,6 +232,60 @@ type verbsAddr struct {
 func (a *verbsAddr) Network() string { return a.network }
 func (a *verbsAddr) String() string  { return a.addr }
 
+// firstNICIPv4For returns the local IPv4 whose subnet best matches destIP
+// (/24 first, then /16, then the first non-loopback). RoCE rails are /24s,
+// so the destination's /24 identifies the right rail NIC — no explicit
+// source flag needed on the client.
+func firstNICIPv4For(destIP string) (string, error) {
+	dest := net.ParseIP(destIP)
+	if dest == nil {
+		return "", fmt.Errorf("bad dest IP %q", destIP)
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+	var first, same16, same24 string
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip4 := ipnet.IP.To4()
+			if ip4 == nil {
+				continue
+			}
+			if first == "" {
+				first = ip4.String()
+			}
+			if same16 == "" && ip4[0] == dest.To4()[0] && ip4[1] == dest.To4()[1] {
+				same16 = ip4.String()
+			}
+			if same24 == "" && ip4[0] == dest.To4()[0] && ip4[1] == dest.To4()[1] && ip4[2] == dest.To4()[2] {
+				same24 = ip4.String()
+			}
+		}
+	}
+	if same24 != "" {
+		return same24, nil
+	}
+	if same16 != "" {
+		return same16, nil
+	}
+	if first != "" {
+		return first, nil
+	}
+	return "", fmt.Errorf("no non-loopback IPv4 address")
+}
+
 // verbsListener accepts connections on a bound rdma_cm id.
 type verbsListener struct {
 	id     *C.struct_rdma_cm_id
@@ -330,7 +384,7 @@ func verbsDialImpl(ctx context.Context, addr string) (net.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("verbs dial %s: %w", addr, err)
 	}
-	railIP, rerr := firstNICIPv4(nil)
+	railIP, rerr := firstNICIPv4For(host)
 	if rerr != nil {
 		return nil, fmt.Errorf("verbs dial %s: no rail source IP: %w", addr, rerr)
 	}
