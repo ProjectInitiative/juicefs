@@ -17,6 +17,7 @@
 package gcache
 
 import (
+	"log"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -74,6 +75,7 @@ func ServeConn(ctx context.Context, conn net.Conn, src ServerSource, timeout tim
 		if _, err := io.ReadFull(conn, hdr); err != nil {
 			return // EOF / timeout: normal connection end
 		}
+		vbDebugf("srv hdr %x type=%d", hdr[:4], hdr[3])
 		if hdr[0] != magic0 || hdr[1] != magic1 || hdr[2] != protoVer {
 			_ = sendError(ctx, conn, errors.New("bad request header"), timeout)
 			return
@@ -521,4 +523,12 @@ func (s *ringStorage) Get(ctx context.Context, key string, off, limit int64, get
 			return in, nil
 		},
 	}, nil
+}
+
+var verbsDebug = os.Getenv("VB_DEBUG") != ""
+
+func vbDebugf(format string, args ...any) {
+	if verbsDebug {
+		log.Printf("[vbs] "+format, args...)
+	}
 }
