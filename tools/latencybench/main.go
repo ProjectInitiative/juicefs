@@ -907,8 +907,8 @@ func cmdRead(args []string) {
 	seed := fs.Int64("seed", 42, "rng seed")
 	timeout := fs.Duration("timeout", 10*time.Second, "peer request timeout")
 	verify := fs.Bool("verify", false, "verify every payload against the bench pattern (correctness gate; requires --bs multiple of 4096 matching the server dataset — gen --blocksize / serve --blocksize / --bs must agree)")
-	rdmaProtoFlag = *rdmaProto
 	_ = fs.Parse(args)
+	rdmaProtoFlag = *rdmaProto
 
 	switch *backend {
 	case "peer":
