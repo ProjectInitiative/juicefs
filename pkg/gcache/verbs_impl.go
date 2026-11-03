@@ -627,7 +627,7 @@ func (c *verbsConn) ingest(chunk []byte) error {
 	if c.pendingLen < 4+c.pendingTotal {
 		return nil // more chunks expected
 	}
-	c.frames = append(c.frames, c.pending)
+	c.frames = append(c.frames, c.pending[4:]) // surface payload only; wire prefix consumed
 	vbDebugf("conn %p frame complete total=%d", unsafe.Pointer(c.cn), c.pendingTotal)
 	c.pending = nil
 	c.framesCond.Broadcast()
