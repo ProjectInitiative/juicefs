@@ -207,10 +207,14 @@ static int reassemble(struct vconn *c, uint8_t **out, uint32_t *out_len, uint32_
 
 /* server: echo the completed frame back in chunked SENDs (bounded) */
 static int server_echo(struct vconn *c, uint32_t total) {
+    /* echo the reassembled frame (c->frame, total bytes) via the registered
+       sendbuf — chunked; the frame content must be COPIED into the
+       registered buffer (DMA reads only from registered memory) */
     double deadline = now_us() + (double)OP_TIMEOUT_MS * 1000;
     uint32_t remaining = total, off = 0;
     while (remaining > 0) {
         uint32_t chunk = remaining < MAX_MSG ? remaining : MAX_MSG;
+        memcpy(c->sendbuf.data, c->frame + off, chunk);
         struct ibv_send_wr wr = {0}, *bad = NULL;
         struct ibv_sge sge = {0};
         sge.addr = (uintptr_t)c->sendbuf.data;
