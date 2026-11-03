@@ -26,6 +26,7 @@ spec:
         - |
           apt-get update -qq && apt-get install -y -qq librdmacm-dev libibverbs-dev >/dev/null
           export VB_SRV_IP=172.16.5.56
+          export VB_DEBUG=1
           # verbs POC echo server (wave/lifecycle test target)
           stdbuf -o0 /var/tmp/lb-bins/vb_echo server 14090 2>&1 &
           # real peer protocol: memory-backed (4096 blocks x 4 MiB)
@@ -74,7 +75,7 @@ spec:
           export VB_DEBUG=1
           LBR=/var/tmp/lb-bins/latencybench-rdma
           OUT=/var/tmp/lb-out-p2; mkdir -p $OUT
-          echo "waiting for servers..."; sleep 45
+          echo "waiting for servers..."; sleep 90
 
           echo "##### 0. hardened-POC wave test (same server process):"
           echo "#####    3 waves x 8/16/32/64/128 + 10 rapid + 256KiB frag"
@@ -100,6 +101,7 @@ spec:
           timeout 200 $LBR read --backend peer --addr $RAIL:13931 --rdma --rdma-proto verbs --keys 4096 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/p2-batch70-nvme-verbs.json || echo "F4 FAILED"
           echo "##### 5. TCP reference (same server host, TCP mem):"
           echo "     (skipped here — TCP numbers from RESULTS-dgx-rail.md; server has no TCP listener)"
+          echo "--- loop-serve.log tail ---"; tail -40 /tmp/loop-serve.log
           echo "##### phase2 client done"
         volumeMounts:
         - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
