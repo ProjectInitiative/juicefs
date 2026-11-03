@@ -610,8 +610,20 @@ func (c *verbsConn) ingest(chunk []byte) error {
 			return fmt.Errorf("verbs: frame %d > max %d", total, vbMaxFrame)
 		}
 		c.pending = make([]byte, 4+int(total))
-		binary.LittleEndian.PutUint32(c.pending[0:4], total)
-		c.pendingLen, c.pendingTotal = 4, int(total)
+		c.pendingTotal = int(total)
+		if len(chunk) == 4 {
+			// chunk IS the wire prefix; payload arrives in later chunks
+			copy(c.pending[0:4], chunk)
+			c.pendingLen = 4
+			return nil
+		}
+		// single-chunk frame: prefix + payload inline
+		if len(chunk) > 4+c.pendingTotal {
+			return fmt.Errorf("verbs: chunk %d > frame %d", len(chunk), 4+c.pendingTotal)
+		}
+		copy(c.pending, chunk)
+		c.pendingLen = len(chunk)
+		return nil
 	}
 	n := copy(c.pending[c.pendingLen:], chunk)
 	c.pendingLen += n
