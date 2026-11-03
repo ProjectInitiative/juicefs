@@ -557,8 +557,15 @@ func newVerbsConn(id *C.struct_rdma_cm_id, sharedPD *C.struct_ibv_pd, isServer b
 func (c *verbsConn) recvLoop() {
 	defer close(c.recvDone)
 	for {
-		if st := connState(c.state.Load()); st != stateLive {
+		st := connState(c.state.Load())
+		if st == stateBroken || st == stateClosed {
 			return
+		}
+		if st == stateInit {
+			// not yet connected (dial/accept in flight); recvLoop must survive
+			// until the conn goes live (it posts nothing until then)
+			time.Sleep(100 * time.Microsecond)
+			continue
 		}
 		var wc C.struct_ibv_wc
 		n := C.vb_poll_rcq(c.cn, &wc)
