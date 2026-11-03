@@ -87,8 +87,8 @@ spec:
           timeout 300 /var/tmp/lb-bins/vb_echo client $RAIL 14090 8 3 262144 2 3000; echo "frag exit $?"
 
           echo "##### 0b. local loopback Go-transport smoke (serve+read same pod):"
-          (VB_DEBUG=1  serve --rdma --rdma-proto verbs --nics enp1s0f1np1 --addr :13940 --src mem --blocks 64 --blocksize 4194304 > /tmp/loop-serve.log 2>&1 &) ; sleep 3
-          VB_DEBUG=1 timeout 60  read --backend peer --addr 172.16.5.55:13940 --rdma --rdma-proto verbs --keys 4096 --range --verify --len 4096 --qd 1 --secs 5 || echo "LOOPBACK FAILED"
+          (VB_DEBUG=1 $LBR serve --rdma --rdma-proto verbs --nics enp1s0f1np1 --addr :13940 --src mem --blocks 64 --blocksize 4194304 > /tmp/loop-serve.log 2>&1 &) ; sleep 3
+          VB_DEBUG=1 timeout 60 $LBR read --backend peer --addr 172.16.5.55:13940 --rdma --rdma-proto verbs --keys 4096 --range --verify --len 4096 --qd 1 --secs 5 || echo "LOOPBACK FAILED"
           echo "--- loopback serve log head ---"; head -30 /tmp/loop-serve.log
           echo "##### 1. 4KiB mem-backed QD1/QD8/QD32/QD64 (verbs strict):"
           timeout 200 $LBR read --backend peer --addr $RAIL:13930 --rdma --rdma-proto verbs --keys 4096 --range --verify --len 4096 --qd 1,8,32,64 --secs 8 --out $OUT/p2-mem-verbs.json || echo "F1 FAILED"
