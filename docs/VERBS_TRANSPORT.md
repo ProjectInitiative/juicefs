@@ -203,3 +203,35 @@ fragments are carried (`head` buffer) instead of rejected. The reassembler is
 now correct for ANY chunk boundary, including coalesced SENDs and byte-grain
 splits. Regression tests: whole-frame chunk, three coalesced frames in one
 chunk, byte-by-byte boundary churn, mid-prefix fragment carry (`-race` clean).
+
+### Receive-path bugs 12 & 13: CQ overrun and torn frame-queue headers
+
+Post-bug-11 hardware runs still corrupted the frame stream at low rate under
+the NVMe qd=64 leg: the client's verify buffer held the *response header*
+(`got16=47430102...`) while the server provably served correct bytes
+(`srv range ... data16` == `exp16`). A leaked server-side error decoded the
+request pair as `hdr[13:20]+key[0:9]` — completion entries were being lost
+in **both** directions, between the NIC and the reader.
+
+**Bug 12 — recv CQ overrun** (`3f231cb1`): the recvLoop slept *before*
+polling the recv CQ whenever the Go frame queue hit its watermark, so WCs
+piled up unpolled past the CQ depth (32). A verbs CQ overrun silently drops
+completion entries — exactly the missing-chunk signature. Fix: `vbRecvDepth`
+32→512 and the recvLoop now always polls + re-posts the buffer immediately
+after the copy (before ingest). Backpressure is the recv ring itself: once
+all buffers are outstanding, the peer's SENDs park on RNR rather than data
+being lost. The old `vbMaxQueuedFrames/Bytes` watermarks are advisory.
+
+**Bug 13 — torn frame-queue slice headers** (`3b5cea33`): `ingest` appended
+to `c.frames` without `framesMu` while `Read()` re-sliced the same slice
+under the lock. Concurrent append+pop tore the backing array; the hardware
+faulted in `Read`'s memmove with a garbage data pointer. The bug-11-era
+queue-full check had incidentally serialized ingest; fixing bug 12 exposed
+the race. Fix: take `framesMu` around the append + byte accounting.
+
+Shakeout: the C `vb_conn` struct's fixed `recvbufs[32]` array must track
+`vbRecvDepth` (`e7de73b6` — dial-time panic otherwise).
+
+Result: the F2 NVMe qd=64 leg (the case that failed every previous run)
+passes with `errors=0 mismatches=0` and "verify: all payloads correct"
+(iops=1907 probe / 1769 matrix).
