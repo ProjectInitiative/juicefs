@@ -29,6 +29,7 @@ package gcache
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
+#include <sys/mman.h>
 
 static int vb_errno() { return errno; }
 
@@ -79,11 +80,11 @@ static int vb_free_bufs(struct vb_conn *c) {
     int fail = 0;
     for (int i = 0; i < c->nsend; i++) {
         if (c->sendbufs[i].mr) { if (ibv_dereg_mr(c->sendbufs[i].mr)) fail = 1; c->sendbufs[i].mr = NULL; }
-        free(c->sendbufs[i].data); c->sendbufs[i].data = NULL;
+        munmap(c->sendbufs[i].data, c->sendbufs[i].len); c->sendbufs[i].data = NULL;
     }
     for (int i = 0; i < c->nrecv; i++) {
         if (c->recvbufs[i].mr) { if (ibv_dereg_mr(c->recvbufs[i].mr)) fail = 1; c->recvbufs[i].mr = NULL; }
-        free(c->recvbufs[i].data); c->recvbufs[i].data = NULL;
+        munmap(c->recvbufs[i].data, c->recvbufs[i].len); c->recvbufs[i].data = NULL;
     }
     c->nsend = c->nrecv = 0;
     return fail;
@@ -122,11 +123,17 @@ static int vb_destroy_conn_impl(struct vb_conn *c, int destroy_id) {
 
 static int vb_reg(struct ibv_pd *pd, struct vb_buf *b, uint32_t len) {
     memset(b, 0, sizeof *b);
-    b->data = malloc(len);
-    if (!b->data) return -1;
+    // mmap, not malloc: 64 KiB sits below glibc's mmap threshold, so malloc'd
+    // buffers come from the sbrk heap and freed chunks are NOT returned to the
+    // OS — under the wave matrix the server retained ~100 GiB of freed buffer
+    // memory (RSS == accepted-conns × per-conn buffers). mmap'd anonymous
+    // memory is unmapped on munmap → RSS returns to baseline after every wave.
+    b->data = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (b->data == MAP_FAILED) { b->data = NULL; return -1; }
     b->len = len;
     b->mr = ibv_reg_mr(pd, b->data, len, IBV_ACCESS_LOCAL_WRITE);
-    if (!b->mr) { free(b->data); b->data = NULL; return -1; }
+    if (!b->mr) { munmap(b->data, len); b->data = NULL; return -1; }
     return 0;
 }
 
