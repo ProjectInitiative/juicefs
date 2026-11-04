@@ -32,6 +32,9 @@ package gcache
 
 static int vb_errno() { return errno; }
 
+#define VB_SEND_DEPTH_C 8
+#define VB_RECV_DEPTH_C 512
+
 struct vb_buf {
     void *data;
     struct ibv_mr *mr;
@@ -43,29 +46,47 @@ struct vb_conn {
     struct ibv_pd *pd;
     struct ibv_qp *qp;
     struct ibv_cq *scq, *rcq;
-    struct vb_buf sendbufs[8];
-    struct vb_buf recvbufs[512];
-    int nsend, nrecv;
+    struct vb_buf sendbufs[VB_SEND_DEPTH_C];
+    struct vb_buf recvbufs[VB_RECV_DEPTH_C];
+    int nsend, nrecv;         // ACTUALLY REGISTERED buffers (cleanup bound)
+    int nsend_cap, nrecv_cap; // configured capacity (QP WR sizing)
     uint32_t msg_size;
 };
 
-static struct vb_conn *vb_alloc_conn(int nsend, int nrecv, uint32_t msg_size) {
+// Compile-time guard that the fixed arrays track the depth #defines; the Go side
+// cross-checks these against vbSendDepth/vbRecvDepth at dial time (vb_depths_ok).
+_Static_assert(sizeof(((struct vb_conn *)0)->sendbufs) == sizeof(struct vb_buf) * VB_SEND_DEPTH_C, "sendbufs size");
+_Static_assert(sizeof(((struct vb_conn *)0)->recvbufs) == sizeof(struct vb_buf) * VB_RECV_DEPTH_C, "recvbufs size");
+
+static int vb_send_depth() { return VB_SEND_DEPTH_C; }
+static int vb_recv_depth() { return VB_RECV_DEPTH_C; }
+
+static struct vb_conn *vb_alloc_conn(int nsend_cap, int nrecv_cap, uint32_t msg_size) {
     struct vb_conn *c = calloc(1, sizeof *c);
     if (!c) return NULL;
-    c->nsend = nsend; c->nrecv = nrecv; c->msg_size = msg_size;
+    c->nsend_cap = nsend_cap;
+    c->nrecv_cap = nrecv_cap;
+    c->msg_size = msg_size;
     return c;
 }
 
-static void vb_free_bufs(struct vb_conn *c) {
-    for (int i = 0; i < 8; i++) {
-        if (c->sendbufs[i].mr) { ibv_dereg_mr(c->sendbufs[i].mr); c->sendbufs[i].mr = NULL; }
+// Release every SUCCESSFULLY REGISTERED buffer (nsend/nrecv are the registered
+// counts, not the capacity — the old code hardcoded 8/32 and leaked 480 MRs per
+// conn when vbRecvDepth went 32→512). Dereg failures are reported via the
+// return value, not swallowed; the allocation is freed regardless (an
+// un-deregistered region is unrecoverable but must not also leak the heap).
+static int vb_free_bufs(struct vb_conn *c) {
+    int fail = 0;
+    for (int i = 0; i < c->nsend; i++) {
+        if (c->sendbufs[i].mr) { if (ibv_dereg_mr(c->sendbufs[i].mr)) fail = 1; c->sendbufs[i].mr = NULL; }
         free(c->sendbufs[i].data); c->sendbufs[i].data = NULL;
     }
-    for (int i = 0; i < 32; i++) {
-        if (c->recvbufs[i].mr) { ibv_dereg_mr(c->recvbufs[i].mr); c->recvbufs[i].mr = NULL; }
+    for (int i = 0; i < c->nrecv; i++) {
+        if (c->recvbufs[i].mr) { if (ibv_dereg_mr(c->recvbufs[i].mr)) fail = 1; c->recvbufs[i].mr = NULL; }
         free(c->recvbufs[i].data); c->recvbufs[i].data = NULL;
     }
     c->nsend = c->nrecv = 0;
+    return fail;
 }
 
 // teardown step bitmask — which destroy calls failed (resource accounting)
@@ -88,7 +109,9 @@ static int vb_destroy_conn_impl(struct vb_conn *c, int destroy_id) {
         rdma_destroy_qp(c->id); // void; pairs with rdma_create_qp
         c->qp = NULL;
     }
-    vb_free_bufs(c);
+    // QP destroyed above: no outstanding WR can reference the bufs anymore,
+    // so deregistering them here is safe (never while WRs are in flight).
+    if (vb_free_bufs(c)) fail |= VB_TEARDOWN_MR;
     if (c->rcq) { if (ibv_destroy_cq(c->rcq)) fail |= VB_TEARDOWN_CQ; c->rcq = NULL; }
     if (c->scq) { if (ibv_destroy_cq(c->scq)) fail |= VB_TEARDOWN_CQ; c->scq = NULL; }
     if (c->pd)  { if (ibv_dealloc_pd(c->pd))   fail |= VB_TEARDOWN_PD; c->pd = NULL; }
@@ -110,8 +133,8 @@ static int vb_reg(struct ibv_pd *pd, struct vb_buf *b, uint32_t len) {
 static int vb_create_qp(struct vb_conn *c) {
     struct ibv_qp_init_attr a;
     memset(&a, 0, sizeof a);
-    a.cap.max_send_wr = c->nsend + 8;
-    a.cap.max_recv_wr = c->nrecv;
+    a.cap.max_send_wr = c->nsend_cap + 8;
+    a.cap.max_recv_wr = c->nrecv_cap;
     a.cap.max_send_sge = a.cap.max_recv_sge = 1;
     a.cap.max_inline_data = 64;
     a.qp_type = IBV_QPT_RC;
@@ -365,8 +388,104 @@ type verbsListener struct {
 	wakeCh    chan struct{}
 }
 
+// Server-side connection accounting (Phase 2b P0): the hardware matrix showed an
+// accept stall at 840 live conns with no visibility into whether conns were
+// leaking or the counter was wrong. Every accepted conn is registered here and
+// removed exactly once at Close; ServeLiveConns()/ServeLiveStats() expose the
+// numbers for the periodic [gcache-srv] report and the idle reaper.
+var (
+	srvMu       sync.Mutex
+	srvConns    = map[*verbsConn]int64{} // conn -> accepted-at unix nanos
+	srvAccepted atomic.Int64
+	srvClosed   atomic.Int64
+)
+
+// vbServerIdleTimeout is the safety-net reaper threshold for server-side conns
+// with no inbound bytes. 0 disables reaping. Default covers the serve deadline
+// (65s) plus margin; it is NOT the primary disconnect mechanism (a remote close
+// surfaces as a flush-error WC → markBroken → Read error → deferred Close). It
+// exists so a wedged or half-open peer cannot pin QPs/MRs forever.
+var vbServerIdleTimeout atomic.Int64 // nanos; 0 = default below
+
+const vbServerIdleDefault = 120 * time.Second
+
+func srvIdleTimeout() time.Duration {
+	if v := vbServerIdleTimeout.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return vbServerIdleDefault
+}
+
+func srvRegister(c *verbsConn) {
+	srvMu.Lock()
+	srvConns[c] = time.Now().UnixNano()
+	srvMu.Unlock()
+	srvAccepted.Add(1)
+}
+
+func srvUnregister(c *verbsConn) {
+	srvMu.Lock()
+	if _, ok := srvConns[c]; ok {
+		delete(srvConns, c)
+		srvClosed.Add(1)
+	}
+	srvMu.Unlock()
+}
+
+// ServeLiveConns returns the number of currently-open server-side verbs conns.
+func ServeLiveConns() int {
+	srvMu.Lock()
+	defer srvMu.Unlock()
+	return len(srvConns)
+}
+
+// ServeLiveStats returns cumulative accepted/closed plus the live count.
+func ServeLiveStats() (accepted, closed, live int64) {
+	srvMu.Lock()
+	live = int64(len(srvConns))
+	srvMu.Unlock()
+	return srvAccepted.Load(), srvClosed.Load(), live
+}
+
+// reapIdleServerConns closes server conns idle longer than `idle` and returns
+// how many were reaped. Separate from the loop so tests can drive it directly.
+func reapIdleServerConns(idle time.Duration) int {
+	cutoff := time.Now().Add(-idle).UnixNano()
+	srvMu.Lock()
+	var stale []*verbsConn
+	for c := range srvConns {
+		if c.lastActive.Load() < cutoff {
+			stale = append(stale, c)
+		}
+	}
+	srvMu.Unlock()
+	for _, c := range stale {
+		vbDebugf("srv janitor: reaping idle conn %p", unsafe.Pointer(c.cn))
+		_ = c.Close() // idempotent; wakes any blocked Read
+	}
+	return len(stale)
+}
+
+// startServerJanitor runs the idle-reaper loop for the life of the listener.
+func (ln *verbsListener) startServerJanitor() {
+	go func() {
+		for {
+			if ln.closed.Load() {
+				return
+			}
+			time.Sleep(10 * time.Second)
+			if ln.closed.Load() {
+				return
+			}
+			reapIdleServerConns(srvIdleTimeout())
+		}
+	}()
+}
+
 func newVerbsListener(id *C.struct_rdma_cm_id) *verbsListener {
-	return &verbsListener{id: id, wakeCh: make(chan struct{})}
+	ln := &verbsListener{id: id, wakeCh: make(chan struct{})}
+	ln.startServerJanitor()
+	return ln
 }
 
 // ListenVerbs binds a native-verbs listener to the rail address derived
@@ -447,6 +566,8 @@ func (ln *verbsListener) Accept() (net.Conn, error) {
 				return nil, fmt.Errorf("verbs accept: errno %d", C.vb_errno())
 			}
 			conn.state.Store(int32(stateLive))
+			conn.lastActive.Store(time.Now().UnixNano())
+			srvRegister(conn)
 			return conn, nil
 		}
 		if ln.closed.Load() {
@@ -594,6 +715,7 @@ type verbsConn struct {
 	closeOnce   sync.Once
 	connectDone chan struct{} // closed when the dial goroutine has left C code
 	loopStarted bool          // recvLoop was started (guards the recvDone wait)
+	lastActive  atomic.Int64  // unix nanos of last inbound byte (server idle reaper)
 }
 
 var _ net.Conn = (*verbsConn)(nil)
@@ -616,6 +738,12 @@ var dialMu sync.Mutex
 func newVerbsConn(id *C.struct_rdma_cm_id, sharedPD *C.struct_ibv_pd, isServer bool) (*verbsConn, error) {
 	dialMu.Lock()
 	defer dialMu.Unlock()
+	// Cross-check the C fixed arrays against the Go depth constants (bug 12
+	// shakeout: vbRecvDepth 32→512 left recvbufs[32] and panicked on dial).
+	if int(C.vb_send_depth()) != vbSendDepth || int(C.vb_recv_depth()) != vbRecvDepth {
+		return nil, fmt.Errorf("verbs: C buffer depths (%d/%d) out of sync with Go constants (%d/%d)",
+			C.vb_send_depth(), C.vb_recv_depth(), vbSendDepth, vbRecvDepth)
+	}
 	cn := C.vb_alloc_conn(vbSendDepth, vbRecvDepth, vbMsgSize)
 	if cn == nil {
 		return nil, fmt.Errorf("verbs: alloc conn")
@@ -719,6 +847,7 @@ func (c *verbsConn) recvLoop() {
 		chunk := (*[vbMsgSize]byte)(unsafe.Pointer(b.data))[:wc.byte_len:wc.byte_len]
 		cp := make([]byte, len(chunk))
 		copy(cp, chunk)
+		c.lastActive.Store(time.Now().UnixNano()) // server idle-reaper heartbeat
 		if C.vb_post_recv(c.cn, b) != 0 {
 			c.markBroken(fmt.Errorf("verbs: repost recv"))
 			return
@@ -794,14 +923,20 @@ func (c *verbsConn) ingest(chunk []byte) error {
 		// the byte accounting must be atomic against a concurrent pop that
 		// re-slices c.frames (torn slice headers otherwise — hardware faulted
 		// in Read's memmove with a garbage data pointer, Phase-2 F2 probe).
+		// Broadcast WHILE HOLDING framesMu: Read()'s wait protocol checks the
+		// empty queue and calls Cond.Wait under one continuous hold, so a
+		// Broadcast released outside the lock could land in the check→wait
+		// window and be lost forever (lost-wakeup). Holding the lock here makes
+		// producer notification and consumer wait registration mutually
+		// exclusive by construction.
 		c.framesMu.Lock()
 		c.frames = append(c.frames, payload)
 		c.queuedBytes += len(payload)
+		c.framesCond.Broadcast()
 		c.framesMu.Unlock()
 		vbDebugf("conn %p frame complete total=%d", unsafe.Pointer(c.cn), c.pendingTotal)
 		c.pending = nil
 		c.pendingLen = 0
-		c.framesCond.Broadcast()
 		// loop: any chunk tail belongs to the next frame
 	}
 	return nil
@@ -850,6 +985,11 @@ func (c *verbsConn) Read(b []byte) (int, error) {
 	defer c.rmu.Unlock()
 
 	for {
+		// The empty-check → Cond.Wait sequence must happen under ONE continuous
+		// framesMu hold: ingest/markBroken/Close Broadcast while holding
+		// framesMu, so a notification cannot land between the check and the
+		// wait registration (the previous unlock→goroutine→Wait dance had
+		// exactly that lost-wakeup window, plus a goroutine per wait).
 		c.framesMu.Lock()
 		if len(c.frames) > 0 {
 			frame := c.frames[0]
@@ -868,10 +1008,10 @@ func (c *verbsConn) Read(b []byte) (int, error) {
 			}
 			return n, nil
 		}
-		c.framesMu.Unlock()
 
-		// no frame available: check state before waiting
+		// no frame available under the same hold: check state before waiting
 		if st := connState(c.state.Load()); st != stateLive {
+			c.framesMu.Unlock()
 			if st == stateClosed {
 				return 0, os.ErrClosed
 			}
@@ -884,41 +1024,43 @@ func (c *verbsConn) Read(b []byte) (int, error) {
 			return 0, os.ErrClosed
 		}
 
-		// deadline handling (item 7): re-load per iteration so a
+		// deadline handling (item 7): re-loaded per iteration so a
 		// SetReadDeadline issued while this Read is pending takes effect.
+		// A zero deadline means "wait indefinitely" (no synthetic default); a
+		// zero-TIME deadline means non-blocking (fail immediately).
 		dl := c.rdeadline.Load()
-		var timeout <-chan time.Time
+		stopTimer := func() {}
 		if dl != 0 {
 			d := time.Until(time.Unix(0, dl))
 			if d <= 0 {
+				c.framesMu.Unlock()
 				return 0, c.deadlineErr("read")
 			}
 			if d > vbOpTimeout {
 				d = vbOpTimeout // re-check state periodically even w/o deadline
 			}
-			t := time.NewTimer(d)
-			defer t.Stop()
-			timeout = t.C
+			// One-shot waker: broadcasts on the cond at expiry. It exits early
+			// (stopTimer) when the wait completes first, so no accumulation.
+			stop := make(chan struct{})
+			stopTimer = func() { close(stop) }
+			go func(d time.Duration, stop <-chan struct{}) {
+				t := time.NewTimer(d)
+				defer t.Stop()
+				select {
+				case <-t.C:
+					c.framesMu.Lock()
+					c.framesCond.Broadcast()
+					c.framesMu.Unlock()
+				case <-stop:
+				}
+			}(d, stop)
 		}
-		// wait for recvLoop to append a frame (or a deadline/state change);
-		// framesCond is broadcast by ingest/markBroken/Close.
-		done := make(chan struct{})
-		go func() {
-			c.framesMu.Lock()
-			c.framesCond.Wait()
-			c.framesMu.Unlock()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-timeout:
-			// wake the cond-waiter so it doesn't leak
-			c.framesMu.Lock()
-			c.framesCond.Broadcast()
-			c.framesMu.Unlock()
-			// deadline may have moved (SetReadDeadline during wait):
-			// loop and re-evaluate rather than failing outright
-		}
+		// Atomically release framesMu and sleep; any Broadcast (frame, close,
+		// error, deadline waker) re-acquires it before Wait returns.
+		c.framesCond.Wait()
+		stopTimer()
+		c.framesMu.Unlock()
+		// loop: re-check queue/state/deadline from the top
 	}
 }
 
@@ -1053,6 +1195,7 @@ func (c *verbsConn) sendChunk(data []byte, deadline time.Time) error {
 func (c *verbsConn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
+		srvUnregister(c) // server-side accounting; no-op for client conns
 		prev := connState(c.state.Swap(int32(stateClosed)))
 
 		// wake every waiter

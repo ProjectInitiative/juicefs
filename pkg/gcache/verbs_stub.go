@@ -1,3 +1,5 @@
+//go:build !rdma
+
 package gcache
 
 // Stub for builds without the `rdma` tag: the native verbs transport is
@@ -7,3 +9,8 @@ func init() {
 	verbsDialFn = nil
 	verbsListenFn = nil
 }
+
+// Server-side conn accounting stubs (Phase 2b): the verbs registry lives in
+// verbs_impl.go (rdma build); non-rdma builds always report zero.
+func ServeLiveConns() int                       { return 0 }
+func ServeLiveStats() (accepted, closed, live int64) { return 0, 0, 0 }

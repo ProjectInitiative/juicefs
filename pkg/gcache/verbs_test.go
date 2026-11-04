@@ -10,6 +10,7 @@ package gcache
 import (
 	"encoding/binary"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -348,5 +349,107 @@ func TestWriteZeroLengthIsNoop(t *testing.T) {
 	}
 	if n, err := c.Write([]byte{}); n != 0 || err != nil {
 		t.Fatalf("Write(empty) = %d, %v; want 0, nil", n, err)
+	}
+}
+
+// ---- Phase 2b P1-1: lost-wakeup protocol ----
+
+// TestReadWakesOnConcurrentIngest hammers the check→wait boundary: N readers
+// block on an empty conn while a producer pushes frames one at a time (each
+// Broadcast lands while readers are parked or mid-check). Every reader must
+// receive its frame — no stranded waiters. -race clean.
+func TestReadWakesOnConcurrentIngest(t *testing.T) {
+	c := newTestConn()
+	c.state.Store(int32(stateLive))
+	const readers = 8
+	payload := make([]byte, 4096)
+	var wg sync.WaitGroup
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, len(payload))
+			if _, err := io.ReadFull(c, buf); err != nil {
+				t.Errorf("reader: %v", err)
+			}
+		}()
+	}
+	time.Sleep(50 * time.Millisecond) // let all readers park in Wait
+	for i := 0; i < readers; i++ {
+		push(t, c, payload) // each Broadcast wakes exactly one parked reader
+		time.Sleep(time.Millisecond)
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("readers stranded: lost wakeup in the check→wait window")
+	}
+}
+
+// TestReadDeadlineExpiryWakesWaiter: a parked reader must return promptly on
+// deadline expiry even with no frames and no close (the one-shot waker).
+func TestReadDeadlineExpiryWakesWaiter(t *testing.T) {
+	c := newTestConn()
+	c.state.Store(int32(stateLive))
+	c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	start := time.Now()
+	if _, err := c.Read(make([]byte, 16)); err == nil {
+		t.Fatal("expected deadline error")
+	} else if !strings.Contains(err.Error(), "deadline") {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("deadline wake took %s (stranded waiter)", d)
+	}
+}
+
+// ---- Phase 2b P0-2: server conn accounting + idle reaper ----
+
+func TestServeLiveStatsAccounting(t *testing.T) {
+	a0, c0, l0 := ServeLiveStats()
+	cs := newTestConn()
+	cs.isServer = true
+	cs.lastActive.Store(time.Now().UnixNano())
+	srvRegister(cs)
+	a1, _, l1 := ServeLiveStats()
+	if l1 != l0+1 {
+		t.Fatalf("live after register = %d, want %d", l1, l0+1)
+	}
+	if a1 != a0+1 {
+		t.Fatalf("accepted after register = %d, want %d", a1, a0+1)
+	}
+	srvUnregister(cs) // exactly-once
+	srvUnregister(cs) // idempotent
+	_, c2, l2 := ServeLiveStats()
+	if l2 != l0 {
+		t.Fatalf("live after unregister = %d, want %d", l2, l0)
+	}
+	if c2 != c0+1 {
+		t.Fatalf("closed after unregister = %d, want %d", c2, c0+1)
+	}
+}
+
+func TestServerIdleReaper(t *testing.T) {
+	idle := 50 * time.Millisecond
+	old := newTestConn()
+	old.isServer = true
+	old.lastActive.Store(time.Now().Add(-2 * idle).UnixNano()) // stale
+	fresh := newTestConn()
+	fresh.isServer = true
+	fresh.lastActive.Store(time.Now().UnixNano()) // active
+	srvRegister(old)
+	srvRegister(fresh)
+	defer func() { srvUnregister(old); srvUnregister(fresh) }()
+	reaped := reapIdleServerConns(idle)
+	if reaped != 1 {
+		t.Fatalf("reaped = %d, want 1 (only the stale conn)", reaped)
+	}
+	if old.state.Load() != int32(stateClosed) {
+		t.Fatal("stale conn was not closed")
+	}
+	if fresh.state.Load() == int32(stateClosed) {
+		t.Fatal("active conn was reaped")
 	}
 }
