@@ -44,7 +44,7 @@ struct vb_conn {
     struct ibv_qp *qp;
     struct ibv_cq *scq, *rcq;
     struct vb_buf sendbufs[8];
-    struct vb_buf recvbufs[32];
+    struct vb_buf recvbufs[512];
     int nsend, nrecv;
     uint32_t msg_size;
 };
