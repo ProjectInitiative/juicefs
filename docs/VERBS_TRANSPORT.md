@@ -235,3 +235,14 @@ Shakeout: the C `vb_conn` struct's fixed `recvbufs[32]` array must track
 Result: the F2 NVMe qd=64 leg (the case that failed every previous run)
 passes with `errors=0 mismatches=0` and "verify: all payloads correct"
 (iops=1907 probe / 1769 matrix).
+
+
+### Phase 2b: lifecycle, resource-leak, receive-queue hardening
+
+Hardware lifecycle waves (100 waves, 5207 cumulative conns against one server) exposed and fixed:
+
+- **MR cleanup leak** (`c9106614`): `vb_free_bufs` hardcoded the old 8/32 depths - 480 MRs leaked per teardown after the ring went to 512. Cleanup now loops actual registered counts, reports dereg failures, and runs after QP destruction; capacity vs registered counts separated (`nsend_cap/nrecv_cap`); `_Static_assert` + dial-time cross-check pin the C arrays to the Go constants.
+- **Abandoned-conn teardown** (`922c4ab8`): an error WC (peer disconnect, QP fatal, RNR) called only `markBroken` - resources stayed allocated until a deferred Close that never ran. The recvLoop now triggers `Close()` itself on the lifecycle event; a 120 s idle janitor (`reapIdleServerConns`) is the safety net; `ServeLiveStats()` + a periodic `[gcache-srv]` report give the acceptance/cleanup time series.
+- **Lost wakeup** (`c9106614`): Read's empty-check -> unlock -> goroutine -> Wait window could swallow a Broadcast. Check + Wait now share one continuous `framesMu` hold; `ingest` broadcasts under the lock; deadlines wake via a self-terminating one-shot waker. Stress tests: `TestReadWakesOnConcurrentIngest`, `TestReadDeadlineExpiryWakesWaiter`.
+- **Bounded receive** (`ac51defb`): hard ceiling `vbRecvDepth*vbMsgSize` on unread bytes enforced in `ingest` (the ring + peer send depth is the physical maximum); WC failures named via `ibv_wc_status_str`. No silent frame drops.
+- **RSS retention** (`2b12239e`): registered buffers are mmap'd (64 KiB sat below glibc's mmap threshold - freed chunks were never returned to the OS; RSS hit 122 GiB = accepted x 32.5 MiB/conn). Hardware: NVMe server RSS 118 MiB -> 121 KiB after full teardown; mem server accepted=5207 closed=5207 live=0.
