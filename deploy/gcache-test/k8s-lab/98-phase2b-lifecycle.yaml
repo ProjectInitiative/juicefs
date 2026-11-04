@@ -1,0 +1,119 @@
+# Phase 2b lifecycle + correctness validation.
+# Server (sextant, rail 172.16.5.56): ONE continuously running Go verbs server
+# pair — mem :13930, NVMe O_DIRECT :13931 — with [gcache-srv] conn accounting
+# (accepted/closed/live/rss) every 5s. NO C POC (the 840-conn stall was vb_echo's
+# known no-reaper design, not the Go server; this phase proves the Go server).
+# Client (chronometer): 100 connect/disconnect waves (qd 8/16/32/64/128 cycling),
+# an abrupt client kill mid-leg, deadline-expiry legs, then the P3 correctness
+# matrix with warm/cold separation. Every wave re-dials; the server must return
+# to live=0 after each and never grow RSS monotonically.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-p2b-srv
+  namespace: llm-test
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: sextant
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: srv
+        image: golang:1.25-bookworm
+        securityContext: { privileged: true }
+        command: ["bash","-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev libibverbs-dev >/dev/null
+          /var/tmp/lb-bins/latencybench-rdma serve --rdma --rdma-proto verbs --nics enp1s0f1np1 --addr :13930 --src mem --blocks 4096 --blocksize 4194304 2>&1 &
+          /var/tmp/lb-bins/latencybench-rdma serve --rdma --rdma-proto verbs --nics enp1s0f1np1 --addr :13931 --src file --file /var/tmp/lb-data/bench.bin --blocksize 4194304 --direct 2>&1 &
+          echo "phase2b servers up; waiting forever"
+          sleep infinity
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: data, mountPath: /var/tmp/lb-data, readOnly: true }
+        - { name: dev, mountPath: /dev }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: data
+        hostPath: { path: /var/tmp/lb-data, type: Directory }
+      - name: dev
+        hostPath: { path: /dev, type: Directory }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lb-p2b-cli
+  namespace: llm-test
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      nodeName: chronometer
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: cli
+        image: golang:1.25-bookworm
+        securityContext: { privileged: true }
+        command: ["bash","-c"]
+        args:
+        - |
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev libibverbs-dev >/dev/null
+          LBR=/var/tmp/lb-bins/latencybench-rdma
+          RAIL=172.16.5.56
+          OUT=/var/tmp/lb-out; mkdir -p $OUT
+          echo "waiting for servers..."; sleep 60
+          echo "##### P2 waves: 100 connect/disconnect waves against one server"
+          for i in $(seq 1 100); do
+            case $((i % 5)) in
+              0) QD=8;; 1) QD=16;; 2) QD=32;; 3) QD=64;; 4) QD=128;;
+            esac
+            timeout 30 $LBR read --backend peer --addr $RAIL:13930 --rdma --rdma-proto verbs \
+              --keys 4096 --range --verify --len 4096 --qd $QD --secs 3 \
+              --out $OUT/wave-$(printf %03d $i).json > /dev/null 2>&1 || echo "wave $i qd=$QD FAILED"
+          done
+          echo "##### P2 abrupt client kill (SIGKILL mid-leg, no graceful close)"
+          timeout 30 $LBR read --backend peer --addr $RAIL:13930 --rdma --rdma-proto verbs \
+            --keys 4096 --range --verify --len 4096 --qd 64 --secs 30 \
+            --out $OUT/killme.json > /dev/null 2>&1 &
+          KPID=$!
+          sleep 5
+          kill -9 $KPID 2>/dev/null; wait $KPID 2>/dev/null
+          echo "killed mid-leg; server must reap the dead QPs"
+          sleep 15
+          echo "##### P2 deadline-expiry legs (server 5s+ waits must not wedge conns)"
+          timeout 60 $LBR read --backend peer --addr $RAIL:13930 --rdma --rdma-proto verbs \
+            --keys 4096 --range --verify --len 4096 --qd 8 --secs 3 --timeout 10ms \
+            --out $OUT/deadline.json 2>&1 | tail -3 || true
+          echo "##### P3-1: 4KiB NVMe O_DIRECT QD64 (the Phase-2 failing case) — cold"
+          timeout 200 $LBR read --backend peer --addr $RAIL:13931 --rdma --rdma-proto verbs \
+            --keys 4096 --range --verify --len 4096 --qd 64 --secs 8 --out $OUT/p3-nvme-qd64-cold.json 2>&1 | tail -4 || echo "P3-1 FAILED"
+          echo "##### P3-2: same, warm (server cache fully warm now)"
+          timeout 200 $LBR read --backend peer --addr $RAIL:13931 --rdma --rdma-proto verbs \
+            --keys 4096 --range --verify --len 4096 --qd 64 --secs 15 --out $OUT/p3-nvme-qd64-warm.json 2>&1 | tail -4 || echo "P3-2 FAILED"
+          echo "##### P3-3: mem-backed QD1/8/32/64 (regression: the errno-111 legs)"
+          timeout 300 $LBR read --backend peer --addr $RAIL:13930 --rdma --rdma-proto verbs \
+            --keys 4096 --range --verify --len 4096 --qd 1,8,32,64 --secs 8 --out $OUT/p3-mem-qd.json 2>&1 | grep -E '===|iops=|verify|FAILED' || echo "P3-3 FAILED"
+          echo "##### P3-4: batch-70 NVMe with full verify + round latency percentiles"
+          timeout 300 $LBR read --backend peer --addr $RAIL:13931 --rdma --rdma-proto verbs \
+            --keys 4096 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/p3-batch70-nvme.json 2>&1 | tail -6 || echo "P3-4 FAILED"
+          echo "##### P3-5: batch-70 mem (warm) — round percentiles"
+          timeout 300 $LBR read --backend peer --addr $RAIL:13930 --rdma --rdma-proto verbs \
+            --keys 4096 --range --verify --len 4096 --batch 70 --secs 15 --out $OUT/p3-batch70-mem.json 2>&1 | tail -6 || echo "P3-5 FAILED"
+          echo "##### phase2b client done"
+        volumeMounts:
+        - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
+        - { name: out, mountPath: /var/tmp/lb-out }
+      volumes:
+      - name: bins
+        hostPath: { path: /var/tmp/lb-bins, type: Directory }
+      - name: out
+        hostPath: { path: /var/tmp/lb-out, type: DirectoryOrCreate }

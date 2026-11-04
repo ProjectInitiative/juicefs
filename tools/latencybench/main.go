@@ -664,6 +664,20 @@ func cmdServe(args []string) {
 		for range t.C {
 			fmt.Printf("[serve] warm loads=%d cold fills=%d ranges=%d distinct-keys=%d\n",
 				cs.load.Load(), cs.fill.Load(), cs.ranges.Load(), cs.distinct())
+			// Phase 2b P0: server-side conn accounting (accept/closed/live) — a
+			// monotonic live count is the leak signal the 840-conn hardware
+			// observation lacked.
+			a, c, live := gcache.ServeLiveStats()
+			rss := 0
+			if b, rerr := os.ReadFile("/proc/self/status"); rerr == nil {
+				for _, ln := range strings.Split(string(b), "\n") {
+					if strings.HasPrefix(ln, "VmRSS:") {
+						fmt.Sscanf(ln, "VmRSS: %d", &rss)
+						break
+					}
+				}
+			}
+			fmt.Printf("[gcache-srv] conns accepted=%d closed=%d live=%d rss_kb=%d\n", a, c, live, rss)
 		}
 	}()
 
