@@ -128,3 +128,55 @@ misalignment under batch pipelining, 0.6% of F4 reads) and latency tuning remain
 Commit index for this phase: `4b7f1e33`, `4900c0f9`, `a020c26d`, `904f3ecf`,
 `387eb163`, `bc9e888b`, `2347c694`, `af51ed31`, `7a17265f`, `178c5ac5`,
 `42c2a095`, `aa23007a`, `bd77ddb7`, `9dc86f41`, `094067b7`, `c59a7cf0`.
+
+## Update — F2 corruption root-caused and fixed (bugs 12 + 13)
+
+Instrumented rerun (VB_DEBUG on both ends, `data16`/`exp16`/`got16` correlation) pinned
+the F2 (NVMe qd=64) payload mismatches to the **client receive path**: the server always
+served correct bytes (`srv range ... data16` == `exp16`), while the verify buffer held
+the 20-byte response header (`got16=47430102...`). Byte-decoding a leaked server-side
+error confirmed both directions of the same root cause: the server parsed a request pair
+assembled from `hdr[13:20]+key[0:9]` ("invalid range off=0x62000... len='ench-key'") —
+the wire frame stream had silently LOST completion entries on both ends.
+
+**Bug 12 — recv CQ overrun** (`3f231cb1`): the recvLoop slept *before* polling the recv
+CQ whenever the Go-side frame queue hit its watermark, leaving WCs unpolled past the CQ
+depth (32). A CQ overrun silently drops completion entries → wire frames arrive missing
+their 4-byte prefix chunks. Fix: `vbRecvDepth` 32→512, and the recvLoop now **always
+polls and re-posts the buffer immediately after the copy** (before ingest) — backpressure
+comes from the recv ring itself (peer SENDs park on RNR) instead of a Go-side sleep.
+
+**Bug 13 — torn frame-queue slice headers** (`3b5cea33`): `ingest()` appended to
+`c.frames` *without* `framesMu` while `Read()` re-sliced the same slice under the lock —
+concurrent append+pop tore the backing array; hardware faulted in `Read`'s memmove with a
+garbage data pointer (`fatal error: fault`, addr `0x100000001`). The old queue-full check
+had accidentally serialized ingest; bug 12's repost-before-ingest exposed the race within
+seconds. Fix: lock `framesMu` around the append + `queuedBytes` accounting.
+
+One fix-shakeout: the C `recvbufs[32]` array must match `vbRecvDepth` (`e7de73b6`).
+
+### Final hardware matrix (commit `3b5cea33`, chronometer → sextant)
+
+| Leg | Result |
+| F2 NVMe 4 KiB qd=64 (focused probe, 12 s) | **iops=1907 mibs=7.4 errors=0 mismatches=0 — "verify: all payloads correct"** |
+| F2 NVMe 4 KiB qd=64 (matrix) | **iops=1769 errors=0 mismatches=0 — PASS** |
+| F4 batch-70 NVMe qd=1 | errors=0 mismatches=0 — PASS |
+| F3 mem legs (qd1/8/32/64, :13931) | ECONNREFUSED — mem server stopped accepting at 840 live conns (infra, not data correctness) |
+
+**The F2 signature case that failed every previous run now passes clean.** The F3 mem
+stall is a separate server-side conn-lifetime/capacity issue (see open item 5).
+
+## Open items (revised)
+
+1. ~~Response misalignment under batch pipelining~~ — resolved: bugs 12+13.
+2. C POC server-side reaper (unchanged).
+3. Latency tuning (Phase 5): NVMe p50 1.0 ms, p99 ~150-300 ms (tail from cold fills);
+   batch-70 path needs the pipelining-depth work.
+4. `--rdma-proto` default stays `rsockets` (verbs opt-in) — unchanged.
+5. **Server-side conn reaping/capacity**: the matrix mem server stalled accepting after
+   ~840 accumulated live conns (`[vb-srv] live: conns=840 qps=840 threads=841`), so
+   subsequent legs got ECONNREFUSED. ServeConn's deferred Close should release on client
+   disconnect; the counters say otherwise — needs a lifetime audit (idle reaper or
+   CM-event driven teardown) before Phase 5 load runs.
+
+Commit index (bug 12+13 wave): `3f231cb1`, `e7de73b6`, `3b5cea33`.
