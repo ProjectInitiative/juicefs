@@ -46,6 +46,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -824,6 +825,13 @@ func newPeer(addrs, rdmaAddrs []string, keys, bs int, useRange, unique, useRDMA,
 
 // checkPayload recomputes the bench pattern for (key, off, len(buf)) and
 // compares — the --verify correctness gate over the sharded ring.
+func vbDebugf(format string, args ...any) {
+	if os.Getenv("VB_DEBUG") == "" {
+		return
+	}
+	log.Printf("[vb] "+format, args...)
+}
+
 func (p *peerClient) checkPayload(key string, off int64, buf []byte) error {
 	idx, err := benchKeyIndex(key)
 	if err != nil {
@@ -841,6 +849,8 @@ func (p *peerClient) checkPayload(key string, off int64, buf []byte) error {
 				break
 			}
 		}
+		vbDebugf("VERIFY MISMATCH key=%s off=%d len=%d first-diff@%d exp16=%x got16=%x",
+			key, off, len(buf), d, exp[:min(16, len(exp))], buf[:min(16, len(buf))])
 		p.mismatch.Add(1)
 		return fmt.Errorf("VERIFY MISMATCH key=%s off=%d len=%d first-diff@%d", key, off, len(buf), d)
 	}

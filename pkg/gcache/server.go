@@ -233,6 +233,7 @@ func serveRange(ctx context.Context, conn net.Conn, src ServerSource, key string
 	if rerr != nil && !errors.Is(rerr, io.ErrUnexpectedEOF) && !errors.Is(rerr, io.EOF) {
 		return sendError(ctx, conn, fmt.Errorf("read cached range: %w", rerr), timeout)
 	}
+	vbDebugf("srv range key=%s off=%d n=%d read=%d data16=%x", key, off, n, read, data[:min(16, int(read))])
 	observeRangeServe(int(n))
 	if err := writeResp(ctx, conn, WireRaw, bytes.NewReader(data[:read]), timeout); err != nil {
 		return fmt.Errorf("write range response: %w", err)
