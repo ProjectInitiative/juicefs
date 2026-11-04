@@ -57,6 +57,7 @@ spec:
         command: ["bash","-c"]
         args:
         - |
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev libibverbs-dev >/dev/null
           export VB_DEBUG=1
           LBR=/var/tmp/lb-bins/latencybench-rdma
           echo "waiting for server..."; sleep 20
