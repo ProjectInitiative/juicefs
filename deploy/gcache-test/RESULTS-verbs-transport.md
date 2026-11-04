@@ -180,3 +180,42 @@ stall is a separate server-side conn-lifetime/capacity issue (see open item 5).
    CM-event driven teardown) before Phase 5 load runs.
 
 Commit index (bug 12+13 wave): `3f231cb1`, `e7de73b6`, `3b5cea33`.
+
+
+## Phase 2b — lifecycle, resource-leak, and receive-queue hardening (final)
+
+Follow-up to the review's three findings plus the 840-conn accept stall. Root causes, fixes, and the hardware proof:
+
+### Root causes found
+
+1. **Registered-memory leak on cleanup** — `vb_free_bufs` hardcoded `8`/`32` loops; after `vbRecvDepth` 32->512 every conn teardown leaked 480 MRs + their buffers. Also `nsend/nrecv` double-counted (capacity set at alloc, incremented again per registration), skewing QP sizing and cleanup bounds. Fix `c9106614`: cleanup loops the **actual registered counts**, reports `ibv_dereg_mr` failures into the teardown bitmask, runs only after QP destruction, and capacity lives in `nsend_cap/nrecv_cap`. C arrays are sized by `VB_*_DEPTH_C` with `_Static_assert` + a Go-side cross-check at dial time (the `e7de73b6` shakeout avoided going forward).
+2. **The 840-conn accept stall — exact root cause, reproduced on the Go server.** With live counters (`[gcache-srv] conns accepted/closed/live/rss`), 100 waves against one server showed `closed=0` while `accepted` climbed to 3673: a flush/dead-peer error WC called `markBroken` but **nobody called `Close()`** — QPs/CQs/MRs stayed allocated until the 120s janitor, the accept path exhausted device resources at ~800 live conns (the old failure), and RSS retained every buffer ever registered (malloc'd 64 KiB chunks below glibc's mmap threshold are never returned to the OS: RSS hit 122 GiB = accepted x 32.5 MiB/conn). Fixes: `922c4ab8` — the recvLoop treats an error WC as a lifecycle event and triggers `Close()` itself (idempotent, wakes blocked Reads); `2b12239e` — registered buffers are `mmap(MAP_ANONYMOUS)` + `munmap`, returning to the OS at teardown.
+3. **Lost wakeup in `Read()`** — the empty-check unlocked `framesMu`, then a fresh goroutine re-locked and `Wait`ed: a frame landing in that window broadcast to nobody (plus a goroutine per wait). Fix `c9106614`: check + `Wait` under ONE continuous hold (Wait releases atomically); `ingest` broadcasts under the same lock; deadlines wake via a self-terminating one-shot waker.
+4. **Bounded receive** — the ring (512 x 64 KiB = 32 MiB/conn) plus the peer's send depth is the physical ceiling of unread data; `ingest` now fails loudly past it (protocol violation) and never silently drops a frame. WC failures carry `ibv_wc_status_str` (RNR/flush/QP-fatal named in logs).
+
+### Hardware proof (chronometer -> sextant, `922c4ab8`, one continuous server pair)
+
+Resource time series (mem server, every 5s):
+- during 100 waves (qd 8/16/32/64/128 cycling): accepted 16->5207, closed trailing by the 120s janitor window, live peaked ~940 during the storm then drained 864->175->134->70
+- after the client finished: **accepted=5207 closed=5207 live=0** and stable
+- RSS: NVMe server **118 MiB -> 121 KiB baseline after full teardown** (verbs buffers fully reclaimed); the abrupt-SIGKILL leg's dead QPs reaped; 0 cleanup failures
+- zero wave failures, zero server restarts
+
+Correctness + performance (P3, all -verify, full payload compare):
+
+| Leg | iops | errors | mismatches | batch p50/p95/p99 |
+|---|---|---|---|---|
+| NVMe QD64 cold | 10866 | 14 (dial-timeout) | 0 | - |
+| NVMe QD64 warm | 16113 | 8 | 0 | - |
+| mem QD1 | 895 | 0 | 0 | - |
+| mem QD8 | 9941 | 0 | 0 | - |
+| mem QD32 | 69875 | 0 | 0 | - |
+| mem QD64 | 101396 | 0 | 0 | - |
+| batch-70 NVMe | 10878 | 0 | 0 | 5.1 / 9.0 / 10.5 ms |
+| batch-70 mem | 38323 | 0 | 0 | 1.4 / 2.6 / 3.6 ms |
+
+Warm/cold separation: NVMe QD64 cold 10.9k -> warm 16.1k iops (+48%); the old "p99 150-300 ms" tail was cold fills + the conn-stall death spiral, both now gone (batch-70 NVMe p99 = 10.5 ms with zero cold fills in the warm path).
+
+The 512-deep ring costs 32 MiB/conn registered + mapped; kept (the overrun it prevents is worse) - production sizing note in docs/VERBS_TRANSPORT.md.
+
+**Phase 2 lifecycle COMPLETE.** Commit index: `c9106614`, `ac51defb`, `4d4f3b05`, `2b12239e`, `922c4ab8`.
