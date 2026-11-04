@@ -833,13 +833,22 @@ func (c *verbsConn) recvLoop() {
 		}
 		if n < 0 {
 			c.markBroken(fmt.Errorf("verbs: recv CQ error"))
+			// Deterministic teardown (Phase 2b P0): a fatal CQ means the conn is
+			// finished — release its QP/CQs/MRs now instead of waiting for a
+			// deferred Close that may never run (ServeConn wedged elsewhere).
+			go c.Close()
 			return
 		}
 		if wc.status != C.IBV_WC_SUCCESS {
-			// peer disconnect or QP error: expected on Close
+			// peer disconnect or QP error: expected on Close — and the signal
+			// that an ABANDONED conn (client exited without graceful Close)
+			// must be torn down NOW. markBroken alone leaves the QP/CQs/MRs
+			// allocated until something else calls Close — hardware showed
+			// ~800 conns accumulating exactly that way under the wave matrix.
 			if connState(c.state.Load()) == stateLive {
 				c.markBroken(fmt.Errorf("verbs: recv WC status %d (%s) — peer disconnect, QP error, or RNR exhaustion", wc.status, C.GoString(C.ibv_wc_status_str(wc.status))))
 			}
+			go c.Close() // idempotent; also wakes any blocked Read via Broadcast
 			return
 		}
 		// Bug 12 (hardware-verified): copy out of the registered buffer and
