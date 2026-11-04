@@ -22,22 +22,48 @@ QP can only ever block its own completion polling, never other connections.
 ## 2. Teardown order (contract)
 
 ```
-1. mark state closed (wakes all waiters)
-2. rdma_disconnect(id)          — QP→SQD: HW flushes outstanding WRs as
+1. mark state Closed            — wakes all waiters (Read cond, recvLoop, accepts)
+2. QP → IBV_QPS_ERR (if Live)   — HW flushes outstanding WRs as
                                   IBV_WC_WR_FLUSH_ERR completions, so any
                                   poller in flight gets a WC and returns
-3. join recv thread             — it observes the state and exits (bounded 2 s)
-4. ibv_destroy_qp               — QP must die before its CQs/MRs are released
-5. ibv_dereg_mr (all buffers)   — no WRs outstanding now (flushed in step 2)
-6. ibv_destroy_cq (recv, send)
-7. ibv_dealloc_pd
-8. rdma_destroy_id
+3. wait for the dial goroutine  — Close must never free the CM id (or anything
+                                  else) while rdma_connect is inside C. Bounded
+                                  by DialTimeout+2s; past that the id is LEAKED
+                                  (reported) rather than freed under an active
+                                  cgo call — a bounded, observable leak beats
+                                  memory corruption. (DialTimeout is 5 s.)
+4. join the recv thread         — unconditional; its polls are non-blocking
+                                  (ibv_poll_cq) and it exits on the state flip,
+                                  so this returns promptly. NO timeout-and-
+                                  free: a wedged loop means leak (reported),
+                                  never use-after-free.
+5. rdma_destroy_qp              — the counterpart of rdma_create_qp (clears
+                                  id->qp); the QP dies BEFORE its CQs and MRs,
+                                  which it can still reference via posted WRs
+6. ibv_dereg_mr + free (all bufs)
+7. ibv_destroy_cq (recv, send)
+8. ibv_dealloc_pd
+9. rdma_destroy_id
 ```
 
-Every destruction return value is checked and logged. `Close()` is
-idempotent (`sync.Once`). Partial initialization frees exactly what was
-already allocated (`vconn_free_partial` in the POC; early returns + destroy
-in `newVerbsConn`).
+Every destruction return value is checked; a failed step is returned from
+`Close()` as a typed error and the C side returns a step bitmask
+(`VB_TEARDOWN_*`) that `vbDestroyConn` maps to the specific failing call.
+`Close()` is idempotent (`sync.Once`) and safe for Live, Broken, and Init
+states (Init with no C resources allocated is a no-op).
+
+### CM-id ownership
+
+The `rdma_cm_id` is owned by whoever created it:
+
+- **dial** (`verbsDialImpl`) creates it and destroys it if `newVerbsConn`
+  fails; `newVerbsConn` never destroys it (its internal `destroy_id` flag is
+  fixed false).
+- **accept** (`verbsListener.Accept`) creates per-conn ids via
+  `rdma_get_request` and destroys them only when `newVerbsConn` fails.
+- a fully-built `verbsConn` owns its id through `Close()`.
+
+This makes double-destroy impossible: exactly one owner destroys exactly once.
 
 ## 3. Buffer ownership rules
 
@@ -88,3 +114,61 @@ in `newVerbsConn`).
   counters return to zero after every wave (no QP/CQ/MR/thread growth).
 - The POC prints live QP/CQ/MR/thread counters per wave and the server
   logs them every 5 s — reclamation is observed, not assumed.
+
+## 7. Hardening pass (post-Phase-2 review)
+
+### Read/queue synchronization
+
+The frame queue is produced by the recvLoop and consumed by `Read`:
+
+- `framesMu` guards `frames` and `queuedBytes` (the producer/consumer
+  boundary).
+- `rmu` serializes ENTIRE `Read` calls — a frame is never copied by two
+  concurrent readers and never double-popped (the pop happens under
+  `framesMu` only after the frame is fully consumed, verified by identity
+  against `frames[0]`).
+- `framesCond` is broadcast by ingest, `markBroken`, and `Close`; `Read`
+  waits on it instead of sleep-polling.
+
+### Bounded receive queue & backpressure
+
+Frames awaiting the reader are capped at `vbMaxQueuedFrames` (128) and
+`vbMaxQueuedBytes` (16 MiB). When either watermark is hit the recvLoop stops
+draining the recv CQ: the 32-slot ring fills, the RQ stops accepting, and the
+peer's SENDs back up at transport level. Memory per connection is therefore
+bounded at ~2 MiB (ring) + 16 MiB (queue) + 512 KiB (send pool) regardless of
+reader behavior.
+
+### Deadlines
+
+- Sentinel `0` (never set) = wait indefinitely with periodic state re-checks.
+- Any explicit deadline is re-loaded on every wait iteration, so
+  `SetReadDeadline`/`SetWriteDeadline` issued while an operation is pending
+  take effect immediately (verified by
+  `TestReadHonorsDeadlineUpdateWhilePending`).
+- `Write` re-loads the write deadline per chunk of a segmented frame.
+- Zero-length `Write` is a no-op (an empty wire frame would otherwise be a
+  framing ambiguity the gcache protocol never uses); zero-length `Read`
+  returns `(0, nil)` without consuming.
+
+### Listener shutdown
+
+`verbsListener.Close()` flips `closed`, closes `wakeCh` (interrupting every
+pending `Accept` immediately with `net.ErrClosed`) and destroys the listening
+CM id exactly once (`closeOnce` + nil check). `Accept` never polls a dead id.
+
+### Resource accounting
+
+`vb_destroy_conn_impl` returns a bitmask of failed steps; `vbDestroyConn`
+converts it to a typed error naming the failing call and errno. A clean
+teardown and a failed teardown are distinguishable by the error path alone.
+
+### Test coverage (hardware-independent, `-race` clean)
+
+`pkg/gcache/verbs_test.go`: split-prefix reassembly, multi-SEND fragmentation,
+stream reassembly across consecutive reads, zero-length ops, concurrent
+readers (serialized, no double-pop), queue accounting under backpressure,
+deadline update while a Read is pending, oversized/short-chunk rejection,
+`Close` idempotence for Init/Broken/Closed. Hardware paths (wave matrix,
+resource counters, real CM teardown) remain covered by
+`deploy/gcache-test/k8s-lab/96-phase2-validate.yaml` on the CX7 rail.
