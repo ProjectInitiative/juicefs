@@ -587,6 +587,7 @@ type verbsConn struct {
 	recvDone   chan struct{}
 	closeOnce   sync.Once
 	connectDone chan struct{} // closed when the dial goroutine has left C code
+	loopStarted bool          // recvLoop was started (guards the recvDone wait)
 }
 
 var _ net.Conn = (*verbsConn)(nil)
@@ -663,6 +664,7 @@ func newVerbsConn(id *C.struct_rdma_cm_id, sharedPD *C.struct_ibv_pd, isServer b
 			return nil, fmt.Errorf("verbs: post_recv: errno %d", C.vb_errno())
 		}
 	}
+	c.loopStarted = true
 	go c.recvLoop()
 	return c, nil
 }
@@ -1034,7 +1036,7 @@ func (c *verbsConn) Close() error {
 		// item 4: wait for the recv thread unconditionally — it exits on the
 		// state flip (non-blocking poll + 100µs slice), so this is prompt.
 		// No timeout-and-free: a wedged loop means we leak, not corrupt.
-		if c.recvDone != nil {
+		if c.recvDone != nil && c.loopStarted {
 			<-c.recvDone
 		}
 
