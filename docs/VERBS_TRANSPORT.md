@@ -172,3 +172,34 @@ deadline update while a Read is pending, oversized/short-chunk rejection,
 `Close` idempotence for Init/Broken/Closed. Hardware paths (wave matrix,
 resource counters, real CM teardown) remain covered by
 `deploy/gcache-test/k8s-lab/96-phase2-validate.yaml` on the CX7 rail.
+
+### Frame-stream reassembly (bug 11: silent chunk-byte loss)
+
+Hardware validation found a **frame-stream desync** under load: the server
+parsed `off=0x06014347` (`'G','C',1,0x06` — the request magic) and
+`len=0x1000000E00` (`[klen=14 wire prefix][0x10 pair wire prefix]`) as one
+request's off/len pair — the classic 4-byte slip. Signature: "invalid range
+off=..." errors with garbage values, plus correct-length payload mismatches
+(`first-diff@0`), at low rate (F2: 36 errors/9 mismatches; F3: 4/2; F4: 4/1
+of ~13.5k reads), always under the highest-concurrency legs. Both peers
+logged perfectly well-formed recv WCs — the corruption was between the WC
+copy and the frame the reader saw.
+
+Root cause in `ingest` (both directions, client and server):
+
+1. **Silent truncation** — `copy(c.pending[pendingLen:], chunk)` discards a
+   chunk tail that exceeds the current frame's remaining capacity. A chunk
+   carrying `hdr20 + keyPrefix4` completed the 20-byte header frame and
+   dropped the key's 4-byte length prefix; every subsequent frame was then
+   assembled 4 bytes off.
+2. **Missing completion** — a chunk carrying a whole frame
+   (`len(chunk) == 4+total`) was staged but never completed; completion fired
+   on the *next* chunk, silently dropping its bytes.
+
+Fix (commit `ca0724b1`): `ingest` is now a **strict stream consumer** — every
+input byte is consumed exactly once, a frame completes the moment its last
+byte arrives, and any chunk tail rolls into the next frame; sub-4-byte
+fragments are carried (`head` buffer) instead of rejected. The reassembler is
+now correct for ANY chunk boundary, including coalesced SENDs and byte-grain
+splits. Regression tests: whole-frame chunk, three coalesced frames in one
+chunk, byte-by-byte boundary churn, mid-prefix fragment carry (`-race` clean).
