@@ -790,8 +790,14 @@ func (c *verbsConn) ingest(chunk []byte) error {
 			return nil // more chunks expected
 		}
 		payload := c.pending[4:] // surface payload only; wire prefix consumed
+		// framesMu: the frame queue is shared with Read()/pop — the append and
+		// the byte accounting must be atomic against a concurrent pop that
+		// re-slices c.frames (torn slice headers otherwise — hardware faulted
+		// in Read's memmove with a garbage data pointer, Phase-2 F2 probe).
+		c.framesMu.Lock()
 		c.frames = append(c.frames, payload)
 		c.queuedBytes += len(payload)
+		c.framesMu.Unlock()
 		vbDebugf("conn %p frame complete total=%d", unsafe.Pointer(c.cn), c.pendingTotal)
 		c.pending = nil
 		c.pendingLen = 0
