@@ -230,8 +230,9 @@ func (*testStopError) Error() string { return "test stop" }
 
 func TestQueueBackpressure(t *testing.T) {
 	c := newTestConn()
-	// push more bytes than vbMaxQueuedBytes via ingest directly (recvLoop
-	// checks the watermark, but ingest must still accept and account).
+	// bug 12 revision: the recvLoop no longer pauses polling when the frame
+	// queue grows (the recv ring itself bounds in-flight bytes); ingest must
+	// still accept and account unboundedly as long as the reader keeps up.
 	payload := make([]byte, 1<<20)
 	for i := 0; i < 20; i++ {
 		push(t, c, payload)

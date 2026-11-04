@@ -236,18 +236,23 @@ import (
 
 const (
 	vbMsgSize   = 64 * 1024        // per-SEND chunk (registered)
-	vbRecvDepth = 32               // recv ring slots (2 MiB/conn)
+	vbRecvDepth = 512              // recv ring slots (32 MiB/conn)
 	vbSendDepth = 8                // send pool slots
 	vbMaxFrame  = 16 * 1024 * 1024 // 4 MiB blocks + headroom
 	vbOpTimeout = 5 * time.Second  // default op deadline when none set
 	vbDialTimeout = 5 * time.Second
 
-	// Bounded receive queue (item 10): frames buffered for the reader are
-	// capped by count AND bytes. When either limit is hit the recvLoop stops
-	// polling (leaving the recv ring full), which applies transport-level
-	// backpressure to the peer instead of buffering without bound.
-	vbMaxQueuedFrames = 128
-	vbMaxQueuedBytes  = 16 << 20
+	// Frame-queue accounting (item 10, revised after bug 12): the frame queue
+	// itself is bounded by the RECV RING — at most vbRecvDepth chunks of
+	// vbMsgSize can be in flight per conn (32 MiB), and the peer's send queue
+	// (vbSendDepth) bounds outstanding SENDs. The recvLoop must NEVER stop
+	// polling/reposting: the old pre-poll "queue full → sleep" check let WCs
+	// pile up past the recv CQ depth (32), producing a CQ overrun that silently
+	// dropped completion entries under the NVMe qd=64 workload (hardware-verified
+	// F2 corruption: response wire streams with missing prefix chunks). The
+	// counters below are now advisory (metrics/tests) and a paranoid failsafe.
+	vbMaxQueuedFrames = 1024
+	vbMaxQueuedBytes  = 48 << 20
 )
 
 // vbDestroyConn tears down the conn's resources. When destroyID is false
@@ -702,28 +707,25 @@ func (c *verbsConn) recvLoop() {
 			}
 			return
 		}
-		// Backpressure (item 10): when the reader has fallen behind, stop
-		// draining the recv CQ. The ring stays full, the RQ stops accepting,
-		// and the peer's sends back up at transport level — bounded memory
-		// instead of an unbounded frame queue. Wake when the reader drains.
-		c.framesMu.Lock()
-		full := len(c.frames) >= vbMaxQueuedFrames || c.queuedBytes >= vbMaxQueuedBytes
-		c.framesMu.Unlock()
-		if full {
-			time.Sleep(200 * time.Microsecond)
-			continue
-		}
+		// Bug 12 (hardware-verified): copy out of the registered buffer and
+		// RE-POST IT IMMEDIATELY, before ingesting. The old code ingested
+		// first and skipped polling entirely while the frame queue was full —
+		// unpolled WCs then piled up past the recv CQ depth and the CQ
+		// overran (silent completion loss → desynchronized wire streams).
+		// Backpressure now comes from the recv ring itself: once all
+		// vbRecvDepth buffers are outstanding the RQ stops accepting and the
+		// peer's SENDs park on RNR instead of data being lost.
 		b := (*C.struct_vb_buf)(unsafe.Pointer(uintptr(wc.wr_id)))
 		chunk := (*[vbMsgSize]byte)(unsafe.Pointer(b.data))[:wc.byte_len:wc.byte_len]
 		cp := make([]byte, len(chunk))
 		copy(cp, chunk)
+		if C.vb_post_recv(c.cn, b) != 0 {
+			c.markBroken(fmt.Errorf("verbs: repost recv"))
+			return
+		}
 		vbDebugf("conn %p recv WC len=%d first16=%x", unsafe.Pointer(c.cn), wc.byte_len, cp[:min(16, len(cp))])
 		if err := c.ingest(cp); err != nil {
 			c.markBroken(err)
-			return
-		}
-		if C.vb_post_recv(c.cn, b) != 0 {
-			c.markBroken(fmt.Errorf("verbs: repost recv"))
 			return
 		}
 	}
