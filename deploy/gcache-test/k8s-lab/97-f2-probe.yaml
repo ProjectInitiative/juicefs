@@ -22,6 +22,7 @@ spec:
         command: ["bash","-c"]
         args:
         - |
+          apt-get update -qq && apt-get install -y -qq librdmacm-dev libibverbs-dev >/dev/null
           export VB_DEBUG=1
           /var/tmp/lb-bins/latencybench-rdma serve --rdma --rdma-proto verbs --nics enp1s0f1np1 --addr :13931 --src file --file /var/tmp/lb-data/bench.bin --blocksize 4194304 --direct 2>&1
         volumeMounts:
