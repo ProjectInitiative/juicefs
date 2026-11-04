@@ -255,6 +255,7 @@ func TestWriteZeroLengthIsNoop(t *testing.T) {
 	// The real check is behavioral: the write path is guarded before any C
 	// call, so a nil-cn conn must return 0,nil rather than crash.
 	c := newTestConn()
+	c.state.Store(int32(stateLive)) // nil-cn; the zero-length path must not touch C
 	if n, err := c.Write(nil); n != 0 || err != nil {
 		t.Fatalf("Write(nil) = %d, %v; want 0, nil", n, err)
 	}
