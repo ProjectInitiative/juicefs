@@ -68,15 +68,33 @@ static void vb_free_bufs(struct vb_conn *c) {
     c->nsend = c->nrecv = 0;
 }
 
-static void vb_destroy_conn(struct vb_conn *c) {
-    if (!c) return;
+// teardown step bitmask — which destroy calls failed (resource accounting)
+#define VB_TEARDOWN_QP    (1 << 0)
+#define VB_TEARDOWN_MR    (1 << 1)
+#define VB_TEARDOWN_CQ    (1 << 2)
+#define VB_TEARDOWN_PD    (1 << 3)
+#define VB_TEARDOWN_ID    (1 << 4)
+
+
+// Full teardown in contract order: QP first (nothing may reference bufs or
+// CQs afterwards), then MRs/buffers, then CQs, then PD, then the CM id
+// (only when destroy_id is nonzero — the id is owned by the caller that
+// created it and may outlive a partial-setup conn).
+// Returns a bitmask of failed steps; 0 means every step succeeded.
+static int vb_destroy_conn_impl(struct vb_conn *c, int destroy_id) {
+    if (!c) return 0;
+    int fail = 0;
+    if (c->qp) {
+        rdma_destroy_qp(c->id); // void; pairs with rdma_create_qp
+        c->qp = NULL;
+    }
     vb_free_bufs(c);
-    if (c->qp) { ibv_destroy_qp(c->qp); c->qp = NULL; }
-    if (c->rcq) { ibv_destroy_cq(c->rcq); c->rcq = NULL; }
-    if (c->scq) { ibv_destroy_cq(c->scq); c->scq = NULL; }
-    if (c->pd) { ibv_dealloc_pd(c->pd); c->pd = NULL; }
-    if (c->id) { rdma_destroy_id(c->id); c->id = NULL; }
+    if (c->rcq) { if (ibv_destroy_cq(c->rcq)) fail |= VB_TEARDOWN_CQ; c->rcq = NULL; }
+    if (c->scq) { if (ibv_destroy_cq(c->scq)) fail |= VB_TEARDOWN_CQ; c->scq = NULL; }
+    if (c->pd)  { if (ibv_dealloc_pd(c->pd))   fail |= VB_TEARDOWN_PD; c->pd = NULL; }
+    if (destroy_id && c->id) { if (rdma_destroy_id(c->id)) fail |= VB_TEARDOWN_ID; c->id = NULL; }
     free(c);
+    return fail;
 }
 
 static int vb_reg(struct ibv_pd *pd, struct vb_buf *b, uint32_t len) {
@@ -223,7 +241,48 @@ const (
 	vbMaxFrame  = 16 * 1024 * 1024 // 4 MiB blocks + headroom
 	vbOpTimeout = 5 * time.Second  // default op deadline when none set
 	vbDialTimeout = 5 * time.Second
+
+	// Bounded receive queue (item 10): frames buffered for the reader are
+	// capped by count AND bytes. When either limit is hit the recvLoop stops
+	// polling (leaving the recv ring full), which applies transport-level
+	// backpressure to the peer instead of buffering without bound.
+	vbMaxQueuedFrames = 128
+	vbMaxQueuedBytes  = 16 << 20
 )
+
+// vbDestroyConn tears down the conn's resources. When destroyID is false
+// the CM id is left untouched (the dial/accept caller owns it and may need
+// to destroy it after a failed setup). Returns an error describing the
+// first failed teardown step, or nil when everything was released cleanly.
+func vbDestroyConn(c *C.struct_vb_conn, destroyID bool) error {
+	if c == nil {
+		return nil
+	}
+	fail := C.vb_destroy_conn_impl(c, cBool(destroyID))
+	switch {
+	case fail&C.VB_TEARDOWN_MR != 0:
+		return fmt.Errorf("verbs: teardown: dereg_mr failed (errno %d)", C.vb_errno())
+	case fail&C.VB_TEARDOWN_CQ != 0:
+		return fmt.Errorf("verbs: teardown: destroy_cq failed (errno %d)", C.vb_errno())
+	case fail&C.VB_TEARDOWN_PD != 0:
+		return fmt.Errorf("verbs: teardown: dealloc_pd failed (errno %d)", C.vb_errno())
+	case fail&C.VB_TEARDOWN_ID != 0:
+		return fmt.Errorf("verbs: teardown: destroy_id failed (errno %d)", C.vb_errno())
+	}
+	return nil
+}
+
+// vbDestroyID destroys a cm id the caller owns (dial/accept error paths).
+func vbDestroyID(id *C.struct_rdma_cm_id) error {
+	if id == nil {
+		return nil
+	}
+	if C.rdma_destroy_id(id) != 0 {
+		return fmt.Errorf("verbs: destroy_id failed (errno %d)", C.vb_errno())
+	}
+	return nil
+}
+
 
 // verbsAddr is the net.Addr for verbs connections (host:port opaque).
 type verbsAddr struct {
@@ -289,10 +348,20 @@ func firstNICIPv4For(destIP string) (string, error) {
 }
 
 // verbsListener accepts connections on a bound rdma_cm id.
+// Shutdown (item 6): Close() flips closed, wakes every pending Accept via
+// wakeCh, and destroys the listening CM id exactly once (guarded by mu +
+// closeOnce). Pending Accepts return net.ErrClosed promptly instead of
+// polling a dead identifier forever.
 type verbsListener struct {
-	id     *C.struct_rdma_cm_id
-	mu     sync.Mutex
-	closed atomic.Bool
+	id        *C.struct_rdma_cm_id
+	mu        sync.Mutex
+	closed    atomic.Bool
+	closeOnce sync.Once
+	wakeCh    chan struct{}
+}
+
+func newVerbsListener(id *C.struct_rdma_cm_id) *verbsListener {
+	return &verbsListener{id: id, wakeCh: make(chan struct{})}
 }
 
 // ListenVerbs binds a native-verbs listener to the rail address derived
@@ -309,7 +378,7 @@ func verbsListenC(nics []string, advertise string) (net.Listener, string, error)
 	if C.vb_listen(cHost, cPort, &lid) != 0 {
 		return nil, "", fmt.Errorf("verbs listen: errno %d", C.vb_errno())
 	}
-	return &verbsListener{id: lid}, net.JoinHostPort(host, fmt.Sprint(port)), nil
+	return newVerbsListener(lid), net.JoinHostPort(host, fmt.Sprint(port)), nil
 }
 
 func verbsSplitAdvertise(advertise string, nics []string) (string, int, error) {
@@ -349,12 +418,22 @@ func (ln *verbsListener) Accept() (net.Conn, error) {
 		if id == nil {
 			return nil, net.ErrClosed
 		}
+		select {
+		case <-ln.wakeCh:
+			if ln.closed.Load() {
+				return nil, net.ErrClosed
+			}
+		default:
+		}
 		var cid *C.struct_rdma_cm_id
 		if C.rdma_get_request(id, &cid) == 0 {
 			conn, err := newVerbsConn(cid, nil, true)
 			if err != nil {
+				// newVerbsConn does not own the id — destroy it here.
 				if cid != nil {
-					C.rdma_destroy_id(cid)
+					if cerr := vbDestroyID(cid); cerr != nil {
+						vbDebugf("accept: %v", cerr)
+					}
 				}
 				return nil, err
 			}
@@ -368,12 +447,30 @@ func (ln *verbsListener) Accept() (net.Conn, error) {
 		if ln.closed.Load() {
 			return nil, net.ErrClosed
 		}
-		time.Sleep(20 * time.Millisecond) // bounded, non-spinning accept poll
+		// bounded, non-spinning accept poll; Close wakes us immediately
+		select {
+		case <-ln.wakeCh:
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 }
 
+// Close stops the listener: wakes pending Accepts and releases the
+// listening CM id exactly once. Safe to call from multiple goroutines.
 func (ln *verbsListener) Close() error {
-	ln.closed.Store(true)
+	ln.closeOnce.Do(func() {
+		ln.closed.Store(true)
+		ln.mu.Lock()
+		id := ln.id
+		ln.id = nil
+		ln.mu.Unlock()
+		close(ln.wakeCh) // interrupt every pending Accept
+		if id != nil {
+			if err := vbDestroyID(id); err != nil {
+				vbDebugf("listener close: %v", err)
+			}
+		}
+	})
 	return nil
 }
 
@@ -410,12 +507,25 @@ func verbsDialImpl(ctx context.Context, addr string) (net.Conn, error) {
 	// The QP must be created with OUR CQs before connecting.
 	conn, err := newVerbsConn(id, nil, false)
 	if err != nil {
-		C.rdma_destroy_id(id)
+		// newVerbsConn never owns the id; destroy it here (ownership rule).
+		if cerr := vbDestroyID(id); cerr != nil {
+			vbDebugf("dial %s: %v", addr, cerr)
+		}
 		return nil, err
 	}
-	// bounded connect: run on a goroutine, poll state with a deadline
+	// LIFETIME RACE (review item 5): rdma_connect blocks in the CM for the
+	// full negotiation; a dial timeout must not free the id (or anything the
+	// CM call touches) while that goroutine is still inside C. Track it:
+	// Close() waits (bounded) for the connect goroutine BEFORE releasing any
+	// C resource. If the goroutine is wedged beyond the bound, the id is
+	// deliberately leaked (documented) rather than freed under an active
+	// cgo call — a bounded, observable leak beats memory corruption.
+	conn.connectDone = make(chan struct{})
 	done := make(chan error, 1)
-	go func() { done <- cgoErr(C.rdma_connect(id, nil)) }()
+	go func() {
+		defer close(conn.connectDone) // signals Close that C code has been left
+		done <- cgoErr(C.rdma_connect(id, nil))
+	}()
 	deadline := time.Now().Add(vbDialTimeout)
 	for {
 		select {
@@ -456,7 +566,6 @@ type verbsConn struct {
 
 	// wire state
 	wmu      sync.Mutex
-	wpend    []byte // unsent tail of a partially-written frame (stream semantics)
 	sendRR   int
 	inflight [vbSendDepth]int32
 
@@ -469,13 +578,15 @@ type verbsConn struct {
 	frames     [][]byte
 	framesMu   sync.Mutex
 	framesCond *sync.Cond
+	queuedBytes int // protected by framesMu; bytes of unconsumed frame payloads
 
 	rdeadline, wdeadline atomic.Int64 // unix nanos; 0 = default
 
 	recvErr    error
 	errMu      sync.Mutex
 	recvDone   chan struct{}
-	closeOnce  sync.Once
+	closeOnce   sync.Once
+	connectDone chan struct{} // closed when the dial goroutine has left C code
 }
 
 var _ net.Conn = (*verbsConn)(nil)
@@ -502,6 +613,11 @@ func newVerbsConn(id *C.struct_rdma_cm_id, sharedPD *C.struct_ibv_pd, isServer b
 	if cn == nil {
 		return nil, fmt.Errorf("verbs: alloc conn")
 	}
+	// CM-ID OWNERSHIP: the caller (dial/accept) created the id and owns it
+	// through every failure path below; we must NOT destroy it here, or a
+	// caller-side destroy would double-free. vb_destroy_conn_impl's
+	// destroy_id flag enforces this.
+	const destroyID = C.int(0)
 	c := &verbsConn{id: id, cn: cn, isServer: isServer}
 	cn.id = id       // C side needs the cm id for QP creation and teardown
 	// (is_server is Go-side only)
@@ -513,37 +629,37 @@ func newVerbsConn(id *C.struct_rdma_cm_id, sharedPD *C.struct_ibv_pd, isServer b
 	} else {
 		cn.pd = C.ibv_alloc_pd(id.verbs)
 		if cn.pd == nil {
-			C.vb_destroy_conn(cn)
+			C.vb_destroy_conn_impl(cn, destroyID)
 			return nil, fmt.Errorf("verbs: alloc_pd: errno %d", C.vb_errno())
 		}
 	}
 	cn.scq = C.ibv_create_cq(id.verbs, C.int(vbSendDepth+8), nil, nil, 0)
 	cn.rcq = C.ibv_create_cq(id.verbs, C.int(vbRecvDepth), nil, nil, 0)
 	if cn.scq == nil || cn.rcq == nil {
-		C.vb_destroy_conn(cn)
+		C.vb_destroy_conn_impl(cn, destroyID)
 		return nil, fmt.Errorf("verbs: create_cq: errno %d", C.vb_errno())
 	}
 	for i := 0; i < vbSendDepth; i++ {
 		if C.vb_reg(cn.pd, &cn.sendbufs[i], vbMsgSize) != 0 {
-			C.vb_destroy_conn(cn)
+			C.vb_destroy_conn_impl(cn, destroyID)
 			return nil, fmt.Errorf("verbs: reg send buf")
 		}
 		cn.nsend++
 	}
 	for i := 0; i < vbRecvDepth; i++ {
 		if C.vb_reg(cn.pd, &cn.recvbufs[i], vbMsgSize) != 0 {
-			C.vb_destroy_conn(cn)
+			C.vb_destroy_conn_impl(cn, destroyID)
 			return nil, fmt.Errorf("verbs: reg recv buf")
 		}
 		cn.nrecv++
 	}
 	if C.vb_create_qp(cn) != 0 {
-		C.vb_destroy_conn(cn)
+		C.vb_destroy_conn_impl(cn, destroyID)
 		return nil, fmt.Errorf("verbs: create_qp: errno %d", C.vb_errno())
 	}
 	for i := 0; i < vbRecvDepth; i++ {
 		if C.vb_post_recv(cn, &cn.recvbufs[i]) != 0 {
-			C.vb_destroy_conn(cn)
+			C.vb_destroy_conn_impl(cn, destroyID)
 			return nil, fmt.Errorf("verbs: post_recv: errno %d", C.vb_errno())
 		}
 	}
@@ -582,6 +698,17 @@ func (c *verbsConn) recvLoop() {
 				c.markBroken(fmt.Errorf("verbs: recv WC status %d", wc.status))
 			}
 			return
+		}
+		// Backpressure (item 10): when the reader has fallen behind, stop
+		// draining the recv CQ. The ring stays full, the RQ stops accepting,
+		// and the peer's sends back up at transport level — bounded memory
+		// instead of an unbounded frame queue. Wake when the reader drains.
+		c.framesMu.Lock()
+		full := len(c.frames) >= vbMaxQueuedFrames || c.queuedBytes >= vbMaxQueuedBytes
+		c.framesMu.Unlock()
+		if full {
+			time.Sleep(200 * time.Microsecond)
+			continue
 		}
 		b := (*C.struct_vb_buf)(unsafe.Pointer(uintptr(wc.wr_id)))
 		chunk := (*[vbMsgSize]byte)(unsafe.Pointer(b.data))[:wc.byte_len:wc.byte_len]
@@ -630,7 +757,9 @@ func (c *verbsConn) ingest(chunk []byte) error {
 	if c.pendingLen < 4+c.pendingTotal {
 		return nil // more chunks expected
 	}
-	c.frames = append(c.frames, c.pending[4:]) // surface payload only; wire prefix consumed
+	payload := c.pending[4:] // surface payload only; wire prefix consumed
+	c.frames = append(c.frames, payload)
+	c.queuedBytes += len(payload)
 	vbDebugf("conn %p frame complete total=%d", unsafe.Pointer(c.cn), c.pendingTotal)
 	c.pending = nil
 	c.framesCond.Broadcast()
@@ -664,15 +793,44 @@ func (c *verbsConn) brokenErr() error {
 // Read returns the next frame payload with stream semantics (a frame larger
 // than len(b) is delivered across consecutive Reads; the 4-byte header is
 // consumed internally and not surfaced).
+//
+// Synchronization (item 3): the ENTIRE read path — frame queue and read
+// offset — is serialized under rmu, so concurrent Reads cannot interleave
+// copies into the same frame or double-pop it. framesMu protects only the
+// queue produced by recvLoop. Deadlines are re-loaded every wait iteration
+// so SetReadDeadline affects a pending Read (item 7); the zero deadline
+// means "wait indefinitely" (no synthetic default), and a zero-time
+// SetDeadline means non-blocking.
 func (c *verbsConn) Read(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
-	deadline := c.deadline(c.rdeadline.Load())
-	c.framesMu.Lock()
-	for len(c.frames) == 0 {
-		if st := connState(c.state.Load()); st != stateLive {
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
+
+	for {
+		c.framesMu.Lock()
+		if len(c.frames) > 0 {
+			frame := c.frames[0]
 			c.framesMu.Unlock()
+
+			n := copy(b, frame[c.readOff:])
+			c.readOff += n
+			if c.readOff >= len(frame) {
+				c.framesMu.Lock()
+				if len(c.frames) > 0 && &c.frames[0][0] == &frame[0] {
+					c.frames = c.frames[1:]
+					c.queuedBytes -= len(frame)
+				}
+				c.framesMu.Unlock()
+				c.readOff = 0
+			}
+			return n, nil
+		}
+		c.framesMu.Unlock()
+
+		// no frame available: check state before waiting
+		if st := connState(c.state.Load()); st != stateLive {
 			if st == stateClosed {
 				return 0, os.ErrClosed
 			}
@@ -684,31 +842,43 @@ func (c *verbsConn) Read(b []byte) (int, error) {
 			}
 			return 0, os.ErrClosed
 		}
-		if !timeBeforeNow(deadline) {
-			c.framesMu.Unlock()
-			return 0, c.deadlineErr("read")
-		}
-		// bounded wait: sleep-slice re-check honors deadlines
-		c.framesMu.Unlock()
-		time.Sleep(100 * time.Microsecond)
-		c.framesMu.Lock()
-	}
-	frame := c.frames[0]
-	c.framesMu.Unlock()
 
-	c.rmu.Lock()
-	defer c.rmu.Unlock()
-	n := copy(b, frame[c.readOff:])
-	c.readOff += n
-	if c.readOff >= len(frame) {
-		c.framesMu.Lock()
-		if len(c.frames) > 0 && len(c.frames[0]) == len(frame) {
-			c.frames = c.frames[1:]
+		// deadline handling (item 7): re-load per iteration so a
+		// SetReadDeadline issued while this Read is pending takes effect.
+		dl := c.rdeadline.Load()
+		var timeout <-chan time.Time
+		if dl != 0 {
+			d := time.Until(time.Unix(0, dl))
+			if d <= 0 {
+				return 0, c.deadlineErr("read")
+			}
+			if d > vbOpTimeout {
+				d = vbOpTimeout // re-check state periodically even w/o deadline
+			}
+			t := time.NewTimer(d)
+			defer t.Stop()
+			timeout = t.C
 		}
-		c.framesMu.Unlock()
-		c.readOff = 0
+		// wait for recvLoop to append a frame (or a deadline/state change);
+		// framesCond is broadcast by ingest/markBroken/Close.
+		done := make(chan struct{})
+		go func() {
+			c.framesMu.Lock()
+			c.framesCond.Wait()
+			c.framesMu.Unlock()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-timeout:
+			// wake the cond-waiter so it doesn't leak
+			c.framesMu.Lock()
+			c.framesCond.Broadcast()
+			c.framesMu.Unlock()
+			// deadline may have moved (SetReadDeadline during wait):
+			// loop and re-evaluate rather than failing outright
+		}
 	}
-	return n, nil
 }
 
 // Write sends b as (the payload continuation of) one framed message.
@@ -723,8 +893,6 @@ func (c *verbsConn) Write(b []byte) (int, error) {
 	if err := c.brokenErr(); err != nil {
 		return 0, err
 	}
-	deadline := c.deadline(c.wdeadline.Load())
-
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 
@@ -732,9 +900,18 @@ func (c *verbsConn) Write(b []byte) (int, error) {
 	if total > vbMaxFrame {
 		return 0, fmt.Errorf("verbs: frame %d > max %d", total, vbMaxFrame)
 	}
+	if total == 0 {
+		// zero-length write: no-op. Sending a total=0 frame would be a
+		// wire-level no-payload frame; the gcache protocol never emits one
+		// and io.Writer permits skipping empty writes.
+		return 0, nil
+	}
+	// item 7: the deadline is re-loaded for every chunk, so a
+	// SetWriteDeadline issued while a multi-chunk Write is pending
+	// affects the outstanding chunks.
 	hdr := make([]byte, 4)
 	binary.LittleEndian.PutUint32(hdr, uint32(total))
-	if err := c.sendChunk(hdr, deadline); err != nil {
+	if err := c.sendChunk(hdr, c.chunkDeadline()); err != nil {
 		return 0, err
 	}
 	written := 0
@@ -743,12 +920,23 @@ func (c *verbsConn) Write(b []byte) (int, error) {
 		if end > total {
 			end = total
 		}
-		if err := c.sendChunk(b[written:end], deadline); err != nil {
+		if err := c.sendChunk(b[written:end], c.chunkDeadline()); err != nil {
 			return written, err
 		}
 		written = end
 	}
 	return total, nil
+}
+
+// chunkDeadline converts the current write deadline into a concrete time
+// for one sendChunk. Zero sentinel → default op timeout (unchanged
+// behavior); explicit past deadlines → immediate expiry.
+func (c *verbsConn) chunkDeadline() time.Time {
+	n := c.wdeadline.Load()
+	if n == 0 {
+		return time.Now().Add(vbOpTimeout)
+	}
+	return time.Unix(0, n)
 }
 
 // sendChunk acquires a free send slot, copies data in, posts, and waits
@@ -805,38 +993,81 @@ func (c *verbsConn) sendChunk(data []byte, deadline time.Time) error {
 	}
 }
 
-// Close tears down in contract order; idempotent. The QP transition flushes
-// outstanding WRs as error WCs, so no poller can be stranded mid-C-call.
+// Close tears down in contract order; idempotent and safe for Live, Broken
+// and Init states (item 4).
+//
+// Quiescence guarantee: active read/write operations finish (or fail) before
+// any C resource is released. The sequence is:
+//  1. state → Closed: wakes every waiter (Read cond, recvLoop, accept polls)
+//  2. QP → ERR (when Live): flushes outstanding WRs as error WCs so no
+//     poller can be stranded mid-completion-wait
+//  3. wait for the dial-time rdma_connect goroutine (item 5) — bounded by
+//     vbDialTimeout+2s; past that the id is LEAKED (never freed under an
+//     active cgo call) and the failure is reported
+//  4. wait for recvLoop (unconditional): its polls are non-blocking and it
+//     exits on the state flip, so this returns promptly. We NEVER free
+//     resources merely because a join timeout expired — if the loop is wedged
+//     we leak (and report) instead of corrupting memory.
+//  5. release C resources in contract order; per-step failures are returned.
 func (c *verbsConn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
 		prev := connState(c.state.Swap(int32(stateClosed)))
+
+		// wake every waiter
 		c.framesMu.Lock()
 		c.framesCond.Broadcast()
 		c.framesMu.Unlock()
-		if prev == stateLive && c.id != nil && c.cn != nil {
-			C.vb_qp_to_err(c.cn) // flushes QP; error ignored (idempotent)
+
+		// flush the QP so pollers observe error WCs and exit their loops
+		if prev == stateLive && c.cn != nil && c.cn.qp != nil {
+			C.vb_qp_to_err(c.cn) // idempotent; error folded into teardown below
 		}
+
+		// item 5: the dial goroutine may still be inside rdma_connect(id).
+		quiesced := c.waitConnect()
+		if !quiesced {
+			err = fmt.Errorf("verbs: close: rdma_connect still in flight after %s; cm id leaked to avoid use-after-free", vbDialTimeout+2*time.Second)
+			return // never free while a C call is active
+		}
+
+		// item 4: wait for the recv thread unconditionally — it exits on the
+		// state flip (non-blocking poll + 100µs slice), so this is prompt.
+		// No timeout-and-free: a wedged loop means we leak, not corrupt.
 		if c.recvDone != nil {
-			select {
-			case <-c.recvDone:
-			case <-time.After(2 * time.Second): // bounded; teardown proceeds
-			}
+			<-c.recvDone
 		}
+
 		if c.cn != nil {
-			// vb_destroy_conn tears down bufs/QP/CQs/PD AND the cm id (contract order)
-			C.vb_destroy_conn(c.cn)
+			if terr := vbDestroyConn(c.cn, true); terr != nil && err == nil {
+				err = terr
+			}
 			c.cn = nil
 			c.id = nil
 		} else if c.id != nil {
 			// cn never built (partial init): the id is still ours to destroy
-			if C.rdma_destroy_id(c.id) != 0 {
-				err = fmt.Errorf("verbs: destroy_id: errno %d", C.vb_errno())
+			if derr := vbDestroyID(c.id); derr != nil && err == nil {
+				err = derr
 			}
 			c.id = nil
 		}
 	})
 	return err
+}
+
+// waitConnect blocks until the dial-time rdma_connect goroutine has left C
+// code. Returns false if it is still in flight after a generous bound —
+// in which case Close must NOT release the id (leak, report).
+func (c *verbsConn) waitConnect() bool {
+	if c.connectDone == nil {
+		return true // no dial in flight (accepted conns)
+	}
+	select {
+	case <-c.connectDone:
+		return true
+	case <-time.After(vbDialTimeout + 2*time.Second):
+		return false
+	}
 }
 
 func (c *verbsConn) LocalAddr() net.Addr  { return &verbsAddr{} }
@@ -851,12 +1082,14 @@ func (c *verbsConn) SetDeadline(t time.Time) error {
 func (c *verbsConn) SetReadDeadline(t time.Time) error  { c.rdeadline.Store(t.UnixNano()); return nil }
 func (c *verbsConn) SetWriteDeadline(t time.Time) error { c.wdeadline.Store(t.UnixNano()); return nil }
 
-func (c *verbsConn) deadline(unixNanos int64) time.Time {
-	if unixNanos == 0 {
-		return time.Now().Add(vbOpTimeout)
-	}
-	return time.Unix(0, unixNanos)
-}
+// deadline semantics (item 7): the zero unixNanos sentinel means "no
+// deadline set" — callers treat it as wait-indefinitely (with periodic
+// state re-checks). A caller may still request a non-blocking or
+// already-expired deadline explicitly: time.Time{} stores the minimum
+// unix nano (already past → immediate ErrDeadlineExceeded), and
+// time.Now() stores "expire immediately" — both handled by the
+// time.Until() <= 0 path in Read/sendChunk.
+const vbNoDeadline = int64(0)
 
 func (c *verbsConn) deadlineErr(op string) error {
 	return fmt.Errorf("verbs: %s deadline exceeded: %w", op, os.ErrDeadlineExceeded)
