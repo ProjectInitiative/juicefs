@@ -574,6 +574,7 @@ type verbsConn struct {
 	pending    []byte // reassembly (Go memory; wire chunks land in registered bufs)
 	pendingLen int
 	pendingTotal int
+	head       []byte // sub-4-byte prefix fragment carry (arbitrary chunk boundaries)
 
 	frames     [][]byte
 	framesMu   sync.Mutex
@@ -729,42 +730,72 @@ func (c *verbsConn) recvLoop() {
 }
 
 // ingest reassembles chunk(s) into frames; called from recvLoop only.
+//
+// The wire framing is [u32 total][total payload bytes]; a chunk (one recv WC)
+// may carry ANY byte boundary: a lone prefix, a payload piece, a whole frame,
+// or several frames coalesced (and one frame split across many chunks). The
+// reassembler is therefore written as a strict stream consumer: every input
+// byte is accounted for exactly once — a frame completes the moment its last
+// byte arrives, and any tail bytes beyond the frame roll into the next frame.
+// The previous implementation silently DROPPED chunk tails that exceeded the
+// current frame's remaining capacity (copy() truncation) and never completed
+// a whole-frame chunk until the next chunk arrived — either case permanently
+// desynchronized the frame stream by the dropped size, surfacing downstream as
+// garbage request pairs (e.g. off parsed from 'GC\x01\x06' magic + wire
+// prefixes) and payload mismatches with correct lengths (hardware-verified,
+// Phase-2 F2/F3/F4).
 func (c *verbsConn) ingest(chunk []byte) error {
-	if c.pending == nil {
-		if len(chunk) < 4 {
-			return fmt.Errorf("verbs: short chunk %d", len(chunk))
+	// Carry a sub-4-byte head fragment until enough bytes for the prefix.
+	if c.pending == nil && len(c.head) > 0 {
+		need := 4 - len(c.head)
+		take := need
+		if len(chunk) < take {
+			take = len(chunk)
 		}
-		total := binary.LittleEndian.Uint32(chunk[0:4])
-		if total > vbMaxFrame {
-			return fmt.Errorf("verbs: frame %d > max %d", total, vbMaxFrame)
+		c.head = append(c.head, chunk[:take]...)
+		chunk = chunk[take:]
+		if len(c.head) < 4 {
+			return nil // still mid-prefix
 		}
-		c.pending = make([]byte, 4+int(total))
-		c.pendingTotal = int(total)
-		if len(chunk) == 4 {
-			// chunk IS the wire prefix; payload arrives in later chunks
-			copy(c.pending[0:4], chunk)
+		// fall through with the assembled prefix at the head of `chunk`
+		chunk = append(c.head, chunk...)
+		c.head = nil
+	}
+	for len(chunk) > 0 {
+		if c.pending == nil {
+			if len(chunk) < 4 {
+				// mid-prefix fragment: hold it
+				c.head = append(c.head, chunk...)
+				return nil
+			}
+			total := binary.LittleEndian.Uint32(chunk[0:4])
+			if total > vbMaxFrame {
+				return fmt.Errorf("verbs: frame %d > max %d", total, vbMaxFrame)
+			}
+			c.pending = make([]byte, 4+int(total))
+			c.pendingTotal = int(total)
+			copy(c.pending[0:4], chunk[0:4])
 			c.pendingLen = 4
-			return nil
+			chunk = chunk[4:]
+			if len(chunk) == 0 {
+				return nil // bare prefix: payload arrives in later chunks
+			}
 		}
-		// single-chunk frame: prefix + payload inline
-		if len(chunk) > 4+c.pendingTotal {
-			return fmt.Errorf("verbs: chunk %d > frame %d", len(chunk), 4+c.pendingTotal)
+		n := copy(c.pending[c.pendingLen:], chunk)
+		c.pendingLen += n
+		chunk = chunk[n:]
+		if c.pendingLen < 4+c.pendingTotal {
+			return nil // more chunks expected
 		}
-		copy(c.pending, chunk)
-		c.pendingLen = len(chunk)
-		return nil
+		payload := c.pending[4:] // surface payload only; wire prefix consumed
+		c.frames = append(c.frames, payload)
+		c.queuedBytes += len(payload)
+		vbDebugf("conn %p frame complete total=%d", unsafe.Pointer(c.cn), c.pendingTotal)
+		c.pending = nil
+		c.pendingLen = 0
+		c.framesCond.Broadcast()
+		// loop: any chunk tail belongs to the next frame
 	}
-	n := copy(c.pending[c.pendingLen:], chunk)
-	c.pendingLen += n
-	if c.pendingLen < 4+c.pendingTotal {
-		return nil // more chunks expected
-	}
-	payload := c.pending[4:] // surface payload only; wire prefix consumed
-	c.frames = append(c.frames, payload)
-	c.queuedBytes += len(payload)
-	vbDebugf("conn %p frame complete total=%d", unsafe.Pointer(c.cn), c.pendingTotal)
-	c.pending = nil
-	c.framesCond.Broadcast()
 	return nil
 }
 

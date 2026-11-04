@@ -59,6 +59,77 @@ func TestIngestSplitPrefixSingleChunk(t *testing.T) {
 	}
 }
 
+func TestIngestWholeFrameInOneChunk(t *testing.T) {
+	// Regression (Phase-2 F2/F3/F4 hardware corruption): a chunk carrying
+	// [prefix][whole payload] must complete the frame IMMEDIATELY. The old
+	// implementation staged it and only completed on the NEXT chunk — whose
+	// bytes were then silently discarded, permanently desynchronizing the
+	// frame stream.
+	c := newTestConn()
+	if err := c.ingest(frameBytes([]byte("hello"))); err != nil {
+		t.Fatalf("ingest whole frame: %v", err)
+	}
+	if len(c.frames) != 1 || string(c.frames[0]) != "hello" {
+		t.Fatalf("frame = %q, want hello", c.frames[0])
+	}
+	if c.pending != nil || c.pendingLen != 0 {
+		t.Fatalf("pending not cleared: len=%d", c.pendingLen)
+	}
+	// the next frame must be intact too
+	push(t, c, []byte("world"))
+	if len(c.frames) != 2 || string(c.frames[1]) != "world" {
+		t.Fatalf("frame[1] = %q, want world", c.frames[1])
+	}
+}
+
+func TestIngestCoalescedFramesInOneChunk(t *testing.T) {
+	// Regression: several frames coalesced into one chunk (any chunk boundary
+	// must be handled — every byte consumed exactly once).
+	c := newTestConn()
+	var blob []byte
+	blob = append(blob, frameBytes([]byte("aaa"))...)
+	blob = append(blob, frameBytes([]byte("bb"))...)
+	blob = append(blob, frameBytes([]byte("c"))...)
+	if err := c.ingest(blob); err != nil {
+		t.Fatalf("ingest coalesced: %v", err)
+	}
+	want := []string{"aaa", "bb", "c"}
+	if len(c.frames) != len(want) {
+		t.Fatalf("frames = %d, want %d", len(c.frames), len(want))
+	}
+	for i, w := range want {
+		if string(c.frames[i]) != w {
+			t.Fatalf("frames[%d] = %q, want %q", i, c.frames[i], w)
+		}
+	}
+}
+
+func TestIngestFrameSplitAcrossChunkBoundary(t *testing.T) {
+	// Regression: a frame whose prefix and payload are split at arbitrary
+	// positions (including mid-prefix) must reassemble; the tail of the
+	// carrying chunk belongs to the next frame.
+	c := newTestConn()
+	a := frameBytes([]byte("hello-world"))
+	b := frameBytes([]byte("xy"))
+	blob := append(append([]byte{}, a...), b...)
+	// feed byte-by-byte: worst-case boundary churn
+	for i := range blob {
+		if err := c.ingest(blob[i : i+1]); err != nil {
+			t.Fatalf("ingest byte %d: %v", i, err)
+		}
+	}
+	if len(c.frames) != 2 || string(c.frames[0]) != "hello-world" || string(c.frames[1]) != "xy" {
+		t.Fatalf("frames = %v", c.frames)
+	}
+}
+
+// frameBytes wires payload with its u32 length prefix.
+func frameBytes(payload []byte) []byte {
+	hdr := make([]byte, 4)
+	binary.LittleEndian.PutUint32(hdr, uint32(len(payload)))
+	return append(hdr, payload...)
+}
+
 func TestIngestFragmentedFrame(t *testing.T) {
 	c := newTestConn()
 	payload := make([]byte, 3*vbMsgSize+1234)
@@ -227,10 +298,25 @@ func TestIngestRejectsOversizedFrame(t *testing.T) {
 	}
 }
 
-func TestIngestRejectsShortChunk(t *testing.T) {
+func TestIngestCarriesShortChunkFragment(t *testing.T) {
+	// A sub-4-byte chunk with no pending frame is a mid-prefix fragment: it
+	// must be carried (never dropped) until the prefix is complete.
 	c := newTestConn()
-	if err := c.ingest([]byte{1, 2}); err == nil {
-		t.Fatal("ingest accepted 2-byte chunk as frame start")
+	if err := c.ingest([]byte{4, 0}); err != nil {
+		t.Fatalf("ingest fragment: %v", err)
+	}
+	if err := c.ingest([]byte{0, 0}); err != nil {
+		t.Fatalf("ingest rest of prefix: %v", err)
+	}
+	if c.pending == nil || c.pendingLen != 4 || c.pendingTotal != 4 {
+		t.Fatalf("prefix not staged: pending=%v len=%d total=%d", c.pending != nil, c.pendingLen, c.pendingTotal)
+	}
+	// payload follows in a later chunk
+	if err := c.ingest([]byte("abcd")); err != nil {
+		t.Fatalf("ingest payload: %v", err)
+	}
+	if len(c.frames) != 1 || string(c.frames[0]) != "abcd" {
+		t.Fatalf("frame = %q, want abcd", c.frames[0])
 	}
 }
 
