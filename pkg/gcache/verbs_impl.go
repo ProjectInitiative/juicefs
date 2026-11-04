@@ -831,7 +831,7 @@ func (c *verbsConn) recvLoop() {
 		if wc.status != C.IBV_WC_SUCCESS {
 			// peer disconnect or QP error: expected on Close
 			if connState(c.state.Load()) == stateLive {
-				c.markBroken(fmt.Errorf("verbs: recv WC status %d", wc.status))
+				c.markBroken(fmt.Errorf("verbs: recv WC status %d (%s) — peer disconnect, QP error, or RNR exhaustion", wc.status, C.GoString(C.ibv_wc_status_str(wc.status))))
 			}
 			return
 		}
@@ -932,6 +932,18 @@ func (c *verbsConn) ingest(chunk []byte) error {
 		c.framesMu.Lock()
 		c.frames = append(c.frames, payload)
 		c.queuedBytes += len(payload)
+		// Hard bound (Phase 2b P1-2): the ring (vbRecvDepth × vbMsgSize) plus the
+		// peer's send depth is the physical ceiling of unread data — the peer
+		// cannot have more in flight than its send queue holds, and once all our
+		// recv buffers are outstanding its SENDs park on RNR. Exceeding the
+		// bound means a peer/protocol violation: fail loudly instead of growing
+		// without bound. Never silently drops a frame.
+		if c.queuedBytes > vbRecvDepth*vbMsgSize {
+			qb := c.queuedBytes
+			c.framesMu.Unlock()
+			return fmt.Errorf("verbs: frame queue %d bytes exceeds ring bound %d (protocol violation)",
+				qb, vbRecvDepth*vbMsgSize)
+		}
 		c.framesCond.Broadcast()
 		c.framesMu.Unlock()
 		vbDebugf("conn %p frame complete total=%d", unsafe.Pointer(c.cn), c.pendingTotal)
@@ -1148,8 +1160,9 @@ func (c *verbsConn) sendChunk(data []byte, deadline time.Time) error {
 				if n > 0 {
 					atomic.StoreInt32(&c.inflight[slot], 0)
 					if wc.status != C.IBV_WC_SUCCESS {
-						c.markBroken(fmt.Errorf("verbs: send WC status %d", wc.status))
-						return fmt.Errorf("verbs: send WC status %d", wc.status)
+						s := C.GoString(C.ibv_wc_status_str(wc.status))
+						c.markBroken(fmt.Errorf("verbs: send WC status %d (%s)", wc.status, s))
+						return fmt.Errorf("verbs: send WC status %d (%s)", wc.status, s)
 					}
 					c.sendRR = (slot + 1) % vbSendDepth
 					return nil
