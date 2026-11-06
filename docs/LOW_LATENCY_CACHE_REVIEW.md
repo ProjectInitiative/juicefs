@@ -531,8 +531,21 @@ branch.
    require revisiting `poolIdleTTL`.
 7. **Risk — mem-only cache mounts:** `SetPeerRangeLoaderOnStore` is a no-op for non-cachedStore
    backends (S3 gateway), consistent with the bridge's behavior.
+8. **Phase 2b lifecycle hardening (2026-11-04, hardware-validated):** the verbs
+   transport had four receive/lifecycle defects — MR cleanup hardcoded to the old
+   32-deep ring (480 MRs leaked per teardown), abandoned conns never Closed (error
+   WCs only marked broken; ~800 live QPs stalled accepting), a lost-wakeup window
+   in Read's cond-var protocol, and unbounded frame-queue growth. All fixed and
+   proven on hardware: 100 connect/disconnect waves + SIGKILL + deadline-expiry
+   against one continuous server → accepted=5207 closed=5207 live=0, NVMe-server
+   RSS 118 MiB → 121 KiB after teardown, zero wave failures, zero mismatches in
+   the full P3 matrix (mem QD1-64 + NVMe QD64 cold/warm + batch-70 both backends).
+   See deploy/gcache-test/RESULTS-verbs-transport.md and
+   deploy/gcache-test/k8s-lab/98-phase2b-lifecycle.yaml.
 
 ---
+
+
 
 ## 9. Commit index (branch `low-latency-ranged-reads`)
 
