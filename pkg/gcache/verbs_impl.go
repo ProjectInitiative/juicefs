@@ -49,6 +49,13 @@ struct vb_conn {
     struct ibv_cq *scq, *rcq;
     struct vb_buf sendbufs[VB_SEND_DEPTH_C];
     struct vb_buf recvbufs[VB_RECV_DEPTH_C];
+    // Batched registration: one contiguous mmap + ONE ibv_reg_mr per direction
+    // (520 reg_mr calls/conn made the accept path the dial-timeout bottleneck —
+    // the SGEs below point into the single region, so per-WR semantics are
+    // unchanged).
+    void *send_base, *recv_base;
+    struct ibv_mr *send_mr, *recv_mr;
+    uint32_t send_region_len, recv_region_len;
     int nsend, nrecv;         // ACTUALLY REGISTERED buffers (cleanup bound)
     int nsend_cap, nrecv_cap; // configured capacity (QP WR sizing)
     uint32_t msg_size;
@@ -71,21 +78,17 @@ static struct vb_conn *vb_alloc_conn(int nsend_cap, int nrecv_cap, uint32_t msg_
     return c;
 }
 
-// Release every SUCCESSFULLY REGISTERED buffer (nsend/nrecv are the registered
-// counts, not the capacity — the old code hardcoded 8/32 and leaked 480 MRs per
-// conn when vbRecvDepth went 32→512). Dereg failures are reported via the
-// return value, not swallowed; the allocation is freed regardless (an
-// un-deregistered region is unrecoverable but must not also leak the heap).
+// Release the batched regions: one dereg + one munmap per direction, plus
+// per-buf pointers nulled for accounting. nsend/nrecv count how many bufs were
+// HANDED OUT (registration is batched, so the regions are all-or-nothing).
 static int vb_free_bufs(struct vb_conn *c) {
     int fail = 0;
-    for (int i = 0; i < c->nsend; i++) {
-        if (c->sendbufs[i].mr) { if (ibv_dereg_mr(c->sendbufs[i].mr)) fail = 1; c->sendbufs[i].mr = NULL; }
-        munmap(c->sendbufs[i].data, c->sendbufs[i].len); c->sendbufs[i].data = NULL;
-    }
-    for (int i = 0; i < c->nrecv; i++) {
-        if (c->recvbufs[i].mr) { if (ibv_dereg_mr(c->recvbufs[i].mr)) fail = 1; c->recvbufs[i].mr = NULL; }
-        munmap(c->recvbufs[i].data, c->recvbufs[i].len); c->recvbufs[i].data = NULL;
-    }
+    if (c->send_mr) { if (ibv_dereg_mr(c->send_mr)) fail = 1; c->send_mr = NULL; }
+    if (c->recv_mr) { if (ibv_dereg_mr(c->recv_mr)) fail = 1; c->recv_mr = NULL; }
+    if (c->send_base) { munmap(c->send_base, c->send_region_len); c->send_base = NULL; }
+    if (c->recv_base) { munmap(c->recv_base, c->recv_region_len); c->recv_base = NULL; }
+    for (int i = 0; i < VB_SEND_DEPTH_C; i++) { c->sendbufs[i].data = NULL; c->sendbufs[i].mr = NULL; }
+    for (int i = 0; i < VB_RECV_DEPTH_C; i++) { c->recvbufs[i].data = NULL; c->recvbufs[i].mr = NULL; }
     c->nsend = c->nrecv = 0;
     return fail;
 }
@@ -121,6 +124,17 @@ static int vb_destroy_conn_impl(struct vb_conn *c, int destroy_id) {
     return fail;
 }
 
+// vb_mmap: anonymous private mapping for a registered-buffer region (returned
+// to the OS on munmap at teardown).
+static void *vb_mmap(size_t len) {
+    void *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+}
+
+// vb_reg: single-buffer registration, retained for the Phase 3 'smaller
+// registered-buffer configuration' experiments; the hot path uses batched
+// regions (vb_mmap + one reg_mr per direction).
 static int vb_reg(struct ibv_pd *pd, struct vb_buf *b, uint32_t len) {
     memset(b, 0, sizeof *b);
     // mmap, not malloc: 64 KiB sits below glibc's mmap threshold, so malloc'd
@@ -406,6 +420,29 @@ var (
 	srvAccepted atomic.Int64
 	srvClosed   atomic.Int64
 )
+
+// Lifecycle metrics (Phase 3, item 4): unregistration vs completed destruction
+// are reported separately — closed counts srvUnregister (accounting), destroyed
+// counts vbDestroyConn with a 0 failure bitmask, and cleanupFailures sums any
+// QP/CQ/MR/PD/ID step failures ever observed.
+var (
+	srvDestroyed      atomic.Int64
+	srvCleanupFailures atomic.Int64
+	srvTeardownTotalNs atomic.Int64 // cumulative disconnect→destroyed latency
+	srvTeardownCount   atomic.Int64
+)
+
+// ServeLifecycleMetrics returns cumulative server-side lifecycle counters:
+// accepted, unregistered (closed), fully destroyed, cumulative cleanup-step
+// failures, and mean teardown latency ns (0 when no teardown completed).
+func ServeLifecycleMetrics() (accepted, unregistered, destroyed, cleanupFailures int64, meanTeardownNs int64) {
+	n := srvTeardownCount.Load()
+	mean := int64(0)
+	if n > 0 {
+		mean = srvTeardownTotalNs.Load() / n
+	}
+	return srvAccepted.Load(), srvClosed.Load(), srvDestroyed.Load(), srvCleanupFailures.Load(), mean
+}
 
 // vbServerIdleTimeout is the safety-net reaper threshold for server-side conns
 // with no inbound bytes. 0 disables reaping. Default covers the serve deadline
@@ -781,18 +818,43 @@ func newVerbsConn(id *C.struct_rdma_cm_id, sharedPD *C.struct_ibv_pd, isServer b
 		C.vb_destroy_conn_impl(cn, destroyID)
 		return nil, fmt.Errorf("verbs: create_cq: errno %d", C.vb_errno())
 	}
+	// Batched registration (Phase 3): one contiguous mmap + one ibv_reg_mr per
+	// direction instead of 520 individual calls — registration was the accept
+	// path's dial-timeout bottleneck (64 concurrent dials × 512 reg_mr calls
+	// serialized the CM accept loop past the 5 s dial deadline). The per-buf
+	// SGEs point into the single region; wire semantics are unchanged.
+	cnsendRegion := C.size_t(vbSendDepth) * C.size_t(vbMsgSize)
+	cnrecvRegion := C.size_t(vbRecvDepth) * C.size_t(vbMsgSize)
+	cn.send_base = C.vb_mmap(cnrecvRegion)
+	if cn.send_base == nil {
+		C.vb_destroy_conn_impl(cn, destroyID)
+		return nil, fmt.Errorf("verbs: mmap send region")
+	}
+	cn.send_region_len = C.uint32_t(cnsendRegion)
+	cn.recv_base = C.vb_mmap(cnrecvRegion)
+	if cn.recv_base == nil {
+		C.vb_destroy_conn_impl(cn, destroyID)
+		return nil, fmt.Errorf("verbs: mmap recv region")
+	}
+	cn.recv_region_len = C.uint32_t(cnrecvRegion)
+	cn.send_mr = C.ibv_reg_mr(cn.pd, cn.send_base, cnsendRegion, C.IBV_ACCESS_LOCAL_WRITE)
+	cn.recv_mr = C.ibv_reg_mr(cn.pd, cn.recv_base, cnrecvRegion, C.IBV_ACCESS_LOCAL_WRITE)
+	if cn.send_mr == nil || cn.recv_mr == nil {
+		C.vb_destroy_conn_impl(cn, destroyID)
+		return nil, fmt.Errorf("verbs: reg_mr: errno %d", C.vb_errno())
+	}
 	for i := 0; i < vbSendDepth; i++ {
-		if C.vb_reg(cn.pd, &cn.sendbufs[i], vbMsgSize) != 0 {
-			C.vb_destroy_conn_impl(cn, destroyID)
-			return nil, fmt.Errorf("verbs: reg send buf")
-		}
+		b := &cn.sendbufs[i]
+		b.data = unsafe.Pointer(uintptr(cn.send_base) + uintptr(i)*vbMsgSize)
+		b.mr = cn.send_mr
+		b.len = vbMsgSize
 		cn.nsend++
 	}
 	for i := 0; i < vbRecvDepth; i++ {
-		if C.vb_reg(cn.pd, &cn.recvbufs[i], vbMsgSize) != 0 {
-			C.vb_destroy_conn_impl(cn, destroyID)
-			return nil, fmt.Errorf("verbs: reg recv buf")
-		}
+		b := &cn.recvbufs[i]
+		b.data = unsafe.Pointer(uintptr(cn.recv_base) + uintptr(i)*vbMsgSize)
+		b.mr = cn.recv_mr
+		b.len = vbMsgSize
 		cn.nrecv++
 	}
 	if C.vb_create_qp(cn) != 0 {
@@ -1052,10 +1114,10 @@ func (c *verbsConn) Read(b []byte) (int, error) {
 			return 0, os.ErrClosed
 		}
 
-		// deadline handling (item 7): re-loaded per iteration so a
-		// SetReadDeadline issued while this Read is pending takes effect.
-		// A zero deadline means "wait indefinitely" (no synthetic default); a
-		// zero-TIME deadline means non-blocking (fail immediately).
+		// deadline handling (Phase 3, Go semantics): 0 = cleared (wait
+		// indefinitely — every exit path broadcasts, so no waker is needed);
+		// negative/past = fail now; future = one-shot waker. Re-loaded per
+		// iteration so SetReadDeadline issued while pending takes effect.
 		dl := c.rdeadline.Load()
 		stopTimer := func() {}
 		if dl != 0 {
@@ -1104,9 +1166,6 @@ func (c *verbsConn) Write(b []byte) (int, error) {
 	if err := c.brokenErr(); err != nil {
 		return 0, err
 	}
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
-
 	total := len(b)
 	if total > vbMaxFrame {
 		return 0, fmt.Errorf("verbs: frame %d > max %d", total, vbMaxFrame)
@@ -1117,6 +1176,12 @@ func (c *verbsConn) Write(b []byte) (int, error) {
 		// and io.Writer permits skipping empty writes.
 		return 0, nil
 	}
+	if c.cn == nil {
+		return 0, fmt.Errorf("verbs: write on a conn without C resources (partial init or closed)")
+	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+
 	// item 7: the deadline is re-loaded for every chunk, so a
 	// SetWriteDeadline issued while a multi-chunk Write is pending
 	// affects the outstanding chunks.
@@ -1140,12 +1205,13 @@ func (c *verbsConn) Write(b []byte) (int, error) {
 }
 
 // chunkDeadline converts the current write deadline into a concrete time
-// for one sendChunk. Zero sentinel → default op timeout (unchanged
-// behavior); explicit past deadlines → immediate expiry.
+// for one sendChunk. Zero (cleared/unset) → far-future (poll until the WC
+// or a CQ error — Go semantics: no deadline means no timeout); explicit
+// past deadlines → immediate expiry.
 func (c *verbsConn) chunkDeadline() time.Time {
 	n := c.wdeadline.Load()
-	if n == 0 {
-		return time.Now().Add(vbOpTimeout)
+	if n == vbNoDeadline {
+		return time.Now().Add(24 * 365 * time.Hour)
 	}
 	return time.Unix(0, n)
 }
@@ -1224,6 +1290,7 @@ func (c *verbsConn) sendChunk(data []byte, deadline time.Time) error {
 func (c *verbsConn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
+		started := time.Now()
 		srvUnregister(c) // server-side accounting; no-op for client conns
 		prev := connState(c.state.Swap(int32(stateClosed)))
 
@@ -1236,6 +1303,18 @@ func (c *verbsConn) Close() error {
 		if prev == stateLive && c.cn != nil && c.cn.qp != nil {
 			C.vb_qp_to_err(c.cn) // idempotent; error folded into teardown below
 		}
+
+		// Quiesce the WRITE side (Phase 3 safety): a Write holding wmu may be
+		// inside sendChunk — posting into a sendbuf or busy-polling the send
+		// CQ. Destroying C resources under it would be a use-after-free. The
+		// QP→ERR above converts the writer's outstanding WR into an error WC,
+		// so it observes a failure and releases wmu promptly (bounded by one
+		// chunk deadline); this lock pairs with it — after it returns, no
+		// Write is posting or polling. recvLoop's async Close is safe: closeOnce
+		// makes concurrent Closes a no-op, and this never blocks on a channel
+		// the writer owns.
+		c.wmu.Lock()
+		c.wmu.Unlock()
 
 		// item 5: the dial goroutine may still be inside rdma_connect(id).
 		quiesced := c.waitConnect()
@@ -1252,9 +1331,15 @@ func (c *verbsConn) Close() error {
 		}
 
 		if c.cn != nil {
-			if terr := vbDestroyConn(c.cn, true); terr != nil && err == nil {
+			terr := vbDestroyConn(c.cn, true)
+			if terr != nil && err == nil {
 				err = terr
+				srvCleanupFailures.Add(1)
+			} else {
+				srvDestroyed.Add(1)
 			}
+			srvTeardownTotalNs.Add(time.Since(started).Nanoseconds())
+			srvTeardownCount.Add(1)
 			c.cn = nil
 			c.id = nil
 		} else if c.id != nil {
@@ -1262,6 +1347,8 @@ func (c *verbsConn) Close() error {
 			if derr := vbDestroyID(c.id); derr != nil && err == nil {
 				err = derr
 			}
+			srvTeardownTotalNs.Add(time.Since(started).Nanoseconds())
+			srvTeardownCount.Add(1)
 			c.id = nil
 		}
 	})
@@ -1287,22 +1374,41 @@ func (c *verbsConn) LocalAddr() net.Addr  { return &verbsAddr{} }
 func (c *verbsConn) RemoteAddr() net.Addr { return &verbsAddr{} }
 
 func (c *verbsConn) SetDeadline(t time.Time) error {
-	n := t.UnixNano()
+	n := deadlineNanos(t)
 	c.rdeadline.Store(n)
 	c.wdeadline.Store(n)
+	// wake blocked readers so they re-evaluate the new deadline (a clear must
+	// extend a wait that a previous expiry waker is about to terminate)
+	c.framesMu.Lock()
+	c.framesCond.Broadcast()
+	c.framesMu.Unlock()
 	return nil
 }
-func (c *verbsConn) SetReadDeadline(t time.Time) error  { c.rdeadline.Store(t.UnixNano()); return nil }
-func (c *verbsConn) SetWriteDeadline(t time.Time) error { c.wdeadline.Store(t.UnixNano()); return nil }
+func (c *verbsConn) SetReadDeadline(t time.Time) error {
+	c.rdeadline.Store(deadlineNanos(t))
+	c.framesMu.Lock()
+	c.framesCond.Broadcast()
+	c.framesMu.Unlock()
+	return nil
+}
+func (c *verbsConn) SetWriteDeadline(t time.Time) error {
+	c.wdeadline.Store(deadlineNanos(t))
+	return nil
+}
 
-// deadline semantics (item 7): the zero unixNanos sentinel means "no
-// deadline set" — callers treat it as wait-indefinitely (with periodic
-// state re-checks). A caller may still request a non-blocking or
-// already-expired deadline explicitly: time.Time{} stores the minimum
-// unix nano (already past → immediate ErrDeadlineExceeded), and
-// time.Now() stores "expire immediately" — both handled by the
-// time.Until() <= 0 path in Read/sendChunk.
+// deadline semantics (Phase 3): Go net.Conn rules — time.Time{} (IsZero)
+// CLEARS the deadline (operations wait indefinitely); a past deadline fails
+// immediately with os.ErrDeadlineExceeded. Internally 0 = "no deadline";
+// any other value is a unix-nano instant.
 const vbNoDeadline = int64(0)
+
+// deadlineNanos normalizes t for the atomic deadline fields.
+func deadlineNanos(t time.Time) int64 {
+	if t.IsZero() {
+		return vbNoDeadline
+	}
+	return t.UnixNano()
+}
 
 func (c *verbsConn) deadlineErr(op string) error {
 	return fmt.Errorf("verbs: %s deadline exceeded: %w", op, os.ErrDeadlineExceeded)

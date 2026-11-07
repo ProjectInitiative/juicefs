@@ -678,6 +678,9 @@ func cmdServe(args []string) {
 				}
 			}
 			fmt.Printf("[gcache-srv] conns accepted=%d closed=%d live=%d rss_kb=%d\n", a, c, live, rss)
+			a2, u2, d2, cf, mt := gcache.ServeLifecycleMetrics()
+			fmt.Printf("[gcache-srv] lifecycle accepted=%d unregistered=%d destroyed=%d cleanup_failures=%d mean_teardown_ms=%.1f\n",
+				a2, u2, d2, cf, float64(mt)/1e6)
 		}
 	}()
 

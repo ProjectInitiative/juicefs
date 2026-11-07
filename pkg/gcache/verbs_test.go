@@ -453,3 +453,97 @@ func TestServerIdleReaper(t *testing.T) {
 		t.Fatal("active conn was reaped")
 	}
 }
+
+// ---- Phase 3 safety: Go deadline semantics ----
+
+// TestDeadlineClearExtendsWait: SetReadDeadline(past) fails a pending read;
+// SetReadDeadline(zero) must CLEAR it so a subsequent Read waits indefinitely
+// (until a frame arrives) rather than failing instantly.
+func TestDeadlineClearExtendsWait(t *testing.T) {
+	c := newTestConn()
+	c.state.Store(int32(stateLive))
+	c.SetReadDeadline(time.Now().Add(-time.Second))
+	if _, err := c.Read(make([]byte, 8)); err == nil {
+		t.Fatal("expected deadline error for a past deadline")
+	}
+	c.SetReadDeadline(time.Time{}) // clear
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Read(make([]byte, 8))
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond) // would have failed instantly if still expired
+	push(t, c, []byte("deadlines"))
+	if err := <-done; err != nil {
+		t.Fatalf("read after clear: %v", err)
+	}
+}
+
+// TestDeadlineClearThenSet: clear → wait → set past → pending read fails.
+func TestDeadlineClearThenSet(t *testing.T) {
+	c := newTestConn()
+	c.state.Store(int32(stateLive))
+	c.SetReadDeadline(time.Time{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Read(make([]byte, 8))
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	c.SetReadDeadline(time.Now().Add(-time.Second))
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected deadline error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending read not woken by SetReadDeadline")
+	}
+}
+
+// TestSetDeadlineAppliesToBoth: SetDeadline sets both directions.
+func TestSetDeadlineAppliesToBoth(t *testing.T) {
+	c := newTestConn()
+	c.state.Store(int32(stateLive))
+	if err := c.SetDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+	if _, err := c.Read(make([]byte, 8)); err == nil {
+		t.Fatal("read should fail on expired SetDeadline")
+	}
+	if _, err := c.Write([]byte("x")); err == nil {
+		t.Fatal("write should fail on expired SetDeadline")
+	}
+}
+
+// ---- Phase 3 safety: Close vs active Write ----
+
+// TestCloseWaitsForActiveWrite: a Write in sendChunk (polling the send CQ)
+// must observe a failure and exit before Close destroys C resources. The
+// Close path serializes on wmu; with no NIC this test can only prove the
+// lock pairing doesn't deadlock and post-Close Writes fail fast — the C-level
+// race is exercised by the hardware wave matrix (kill-9 legs).
+func TestCloseWaitsForActiveWrite(t *testing.T) {
+	c := newTestConn() // cn == nil: Close skips C teardown; Write fails broken
+	c.state.Store(int32(stateLive))
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Write(make([]byte, 64))
+		done <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Write after Close should fail")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Write did not exit after Close")
+	}
+	if _, err := c.Write([]byte("x")); err == nil {
+		t.Fatal("Write after Close must fail")
+	}
+}
