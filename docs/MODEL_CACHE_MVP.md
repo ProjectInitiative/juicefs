@@ -1,6 +1,6 @@
 # model-cache distributed cache MVP: activation record
 
-Status: **GitOps fix merged; live activation and peer-read proof pending** (2026-11-08 05:05 UTC). Do not mistake a custom image or a Ready PVC for a working ring.
+Status: **GitOps fix reconciled; live mount attempt failed at FUSE, peer-read proof pending** (2026-11-08 05:12 UTC). Do not mistake a custom image or a Ready PVC for a working ring.
 
 ## Identity and scope
 
@@ -18,14 +18,23 @@ Homelab `clusters/mc.yaml`: move the exact `matchName: model-cache` / `matchStor
 
 - Homelab commit `c4beed9`, PR [#313](https://github.com/ProjectInitiative/homelab/pull/313), merged as `ddcdae759c015aebde51ac258239058efdcf4b52` to `main`; `dev` was fast-forwarded and pushed.
 - `nix run .#generate-manifests` passed; rendered `.direnv/manifests/mc.k8s.yaml` shows target patch last and no RDMA flags. The Argo Application targets chart `0.33.0` with `globalConfig.manageByHelm: true`, `automated.prune/selfHeal: true` and the MC cluster.
-- **Live ConfigMap had not yet reconciled at 05:05 UTC**: `kube-system/juicefs-csi-driver-config` was still resourceVersion `629875246`, with the old patch order and RDMA flags. The agent's MCP identity cannot patch/update ConfigMaps in kube-system or read Argo Applications on the control cluster. Do not launch another mount test until the live ConfigMap is confirmed updated.
+- Argo reconciled the live `kube-system/juicefs-csi-driver-config` to resourceVersion `629971860`: ring patch last, no `rdma-*` flags. No CSI driver change was needed.
+
+## First live mount attempt and new blocker
+
+A bounded read-only consumer `gcache-ring-mvp-chronometer` created a fresh chronometer Mount Pod with the custom image and **actual** `cache-group=dgx-model-cache`, `peer-range-read`, TCP/13910, `auto-c7` and `/mnt/pool/juicefs-ring`; the hostPath mount was `/mnt/pool/juicefs-ring`. The fork logged the existing volume UUID `e95bc32e-deae-42ab-8ef5-3f489dcca33f`, PostgreSQL metadata, Garage object store, and four advertised chronometer C7 endpoints. It briefly logged `cache group [dgx-model-cache] joined` before FUSE failed:
+
+`fusermount3: unknown option 'peer-range-read'`.
+
+The mount helper's `-o` parser forwarded `peer-range-read` to FUSE even though it is a JuiceFS flag. The consumer never became Ready. It was deleted, and CSI subsequently removed the failing chronometer Mount Pods; the capstan3 `gate-inspector` Mount Pod was not changed. No model data was read through the failed mount.
+
+**The exact custom-image build provenance needs checking.** Current fork source `cmd/main.go` recognizes `peer-range-read` as a `cli.BoolFlag` in `cmd/flags.go` (the new `TestHandleSysMountArgs` covers the exact `-o` option and passes locally). The pinned running image nevertheless forwarded it to FUSE. Either the image contains a pre-flag build or its actual helper differs from the current fork. Rebuild a verified arm64 image from the intended source SHA, pin the new digest in the exact PVC-scoped homelab patch, let Argo sync, then create a fresh DGX mount. Do **not** enable a mount that fails FUSE or delete the live capstan3 mount. A temporary alternative is to remove only `peer-range-read` for a whole-block ring proof if a safe verified fork image cannot be built; this must be documented as reduced functionality, not called ranged-read success.
 
 ## Acceptance checks still required
 
-1. Verify the live ConfigMap has the ring patch **last** and no `rdma-*` entries. If Argo does not reconcile, inspect/sync the `argocd-mc/juicefs-csi-driver` Application using an identity authorized for the control cluster; do not bypass GitOps with a permanent drift patch.
-2. On chronometer and sextant, start only read-only, bounded PVC consumers after checking for other consumers and node-local `/mnt/pool/juicefs-ring` paths. Inspect only **mount options**, not the full container startup command (which embeds credential-shaped material). Confirm both fresh Mount Pods use the digest above, TCP group flags, and persistent NVMe cache path. The capstan3 mount must remain untouched.
-3. Confirm a two-member group in the existing PostgreSQL-backed membership registry; check peer listener/advertised ConnectX addresses and mount metrics without reading Secrets. Select a real model-weight shard already on the PVC and verify a bounded streamed read against an authoritative SHA-256. Capture before/after `juicefs_remotecache_*` and owner-side cache/S3 counters to distinguish an NVMe-served peer hit from object-store fill. No such proof has been observed yet.
-4. Only after a proven peer hit, review `juicefs warmup` and `--fill-group-cache` owner semantics; warm one shard at bounded concurrency and verify per-node residency and memory. Do not initiate full-model or Engram warmup without identifying the actual files and ownership behavior.
+1. Verify image build provenance, fix/pin the arm64 mount image or safely omit `peer-range-read`, and prove a fresh chronometer mount becomes Ready (not merely that its Pod is Running). Follow with sextant; inspect only selected mount options or sanitized logs, not full credential-bearing startup commands.
+2. Confirm a two-member group in the existing PostgreSQL-backed membership registry; check peer listener/advertised ConnectX addresses and mount metrics without reading Secrets. Select a real model-weight shard already on the PVC and verify a bounded streamed read against an authoritative SHA-256. Capture before/after `juicefs_remotecache_*` and owner-side cache/S3 counters to distinguish an NVMe-served peer hit from object-store fill. No such proof has been observed yet.
+3. Only after a proven peer hit, review `juicefs warmup` and `--fill-group-cache` owner semantics; warm one shard at bounded concurrency and verify per-node residency and memory. Do not initiate full-model or Engram warmup without identifying the actual files and ownership behavior.
 
 ## Rollback
 

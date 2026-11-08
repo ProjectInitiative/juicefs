@@ -99,6 +99,11 @@ func TestHandleSysMountArgs(t *testing.T) {
 			false,
 		},
 		{
+			[]string{"/mount.juicefs", "memkv://", "/jfs", "-o", "cache-group=dgx-model-cache,group-listen=:13910,peer-range-read"},
+			"juicefs mount -d --cache-group=dgx-model-cache --group-listen=:13910 --peer-range-read memkv:// /jfs",
+			false,
+		},
+		{
 			[]string{"/mount.juicefs", "memkv://", "/jfs", "-o", "cache-size"},
 			"",
 			true,
