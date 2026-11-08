@@ -18,6 +18,7 @@ spec:
       nodeName: sextant
       restartPolicy: Never
       hostNetwork: true
+      hostPID: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: srv
@@ -31,6 +32,8 @@ spec:
           /var/tmp/lb-bins/latencybench-rdma serve --rdma --rdma-proto verbs --nics enp1s0f1np1 --addr :13931 --src file --file /var/tmp/lb-data/bench.bin --blocksize 4194304 --direct 2>&1 &
           /var/tmp/lb-bins/latencybench-rdma serve --addr :13932 --src mem --blocks 4096 --blocksize 4194304 2>&1 &
           /var/tmp/lb-bins/latencybench-rdma serve --addr :13933 --src file --file /var/tmp/lb-data/bench.bin --blocksize 4194304 --direct 2>&1 &
+          # Publish readiness on a shared node-local path for the client Job.
+          touch /var/tmp/lb-bins/phase3-listeners-ready
           echo "phase3 servers up; waiting forever"
           sleep infinity
         volumeMounts:
@@ -58,6 +61,7 @@ spec:
       nodeName: chronometer
       restartPolicy: Never
       hostNetwork: true
+      hostPID: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: cli
@@ -67,10 +71,20 @@ spec:
         args:
         - |
           apt-get update -qq && apt-get install -y -qq librdmacm-dev libibverbs-dev >/dev/null
+          # Await all four listeners, not a fixed delay.
+          for i in $(seq 1 30); do
+            if ss -lnt | grep -q ':13933 ' && ss -lnt | grep -q ':13932 ' && ss -lnt | grep -q ':13931 ' && ss -ln | grep -q ':13930 '; then break; fi
+            sleep 1
+          done
+          touch /tmp/phase3-listeners-ready
           LBR=/var/tmp/lb-bins/latencybench-rdma
           RAIL=172.16.5.56
           OUT=/var/tmp/lb-out; mkdir -p $OUT
-          echo "waiting for servers..."; sleep 60
+          for i in $(seq 1 60); do
+            if [ -f /var/tmp/lb-bins/phase3-listeners-ready ]; then break; fi
+            sleep 1
+          done
+          if [ ! -f /var/tmp/lb-bins/phase3-listeners-ready ]; then echo "ERROR: server readiness marker missing"; exit 1; fi
           COMMON="--keys 4096 --range --verify --len 4096"
           echo "##### warm-up: one verbs + one TCP leg to settle caches (discarded)"
           timeout 120 $LBR read --backend peer --addr $RAIL:13931 --rdma --rdma-proto verbs $COMMON --qd 64 --secs 5 > /dev/null 2>&1 || true
