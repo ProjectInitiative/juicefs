@@ -1,6 +1,6 @@
 # model-cache distributed cache MVP: activation record
 
-Status: **two live registry members verified; one real shard SHA-256 verified; remote NVMe hit NOT proven, ownership-aware full-shard warmup NOT performed** (2026-11-08 15:36 UTC). The temporary consumers have been requested for deletion. A Ready mount or a checksum is not evidence of a remote NVMe hit.
+Status: **two live registry members verified; one real shard SHA-256 verified; remote NVMe hit NOT proven, ownership-aware full-shard warmup NOT performed** (latest bounded recheck 2026-11-08 16:45 UTC). The two named temporary consumers remain Running because no safe read candidate was found. A Ready mount or a checksum is not evidence of a remote NVMe hit.
 
 ## Identity and scope
 
@@ -55,6 +55,16 @@ Operational caveat: deleting an initial short-lived chronometer test consumer di
 Before re-establishing the two mounts, source inspection confirmed `pkg/gcache/manager.go` `NewManager` assigns `uuid: NewUUID()`; `NewUUID` draws 16 random bytes **per mount process**. `pkg/gcache/CONTRACT.md` explicitly states that member UUIDs are fresh per mount process. Therefore UUIDs **cannot remain stable** across CSI Mount Pod recreation. Rendezvous `Score(uuid, blockKey)` consequently reshuffles ownership on every restart even if the physical nodes and their persistent NVMe cache contents are unchanged. Historic dual residency compounds this: an old cached file can be present on a node that no longer owns the block. A snapshot pinned to transient UUIDs cannot guarantee durable one-owner placement or resumability across restarts; this must be addressed before full-shard owner warmup or described explicitly as temporary/best-effort with post-restart reconciliation. Do not mistake the previous registry IDs for current identities.
 
 The MC Kubernetes MCP endpoint returned `fetch failed` on connection, local `kubectl` has no current context/kubeconfig, and SSH to chronometer via management IP `172.16.1.55` only yielded the **k3s agent-controller** kubeconfig (`/var/lib/rancher/k3s/agent/k3scontroller.kubeconfig`), whose `auth can-i create pods -n llm-test` returned `no`. Thus no new consumer was created and no live peer read, owner-side counters, Garage activity, or model-shard warmup was measured in this follow-up. Refrained from bypassing RBAC or changing CSI/cluster infrastructure. Peer proof and optional warmup implementation remain gated on obtaining authorized targeted MC access **and** a deliberate answer to ephemeral member identity; the earlier successful checksum remains the only live shard validation.
+
+## Bounded peer-proof recheck (2026-11-08 16:45 UTC)
+
+Authorized node SSH plus `sudo -n crictl exec` was available for read-only checks; MC MCP remains unable to `pods/exec`. Live `jfs_gcache_members` rows were simultaneous (ages 1–4s): chronometer endpoint `172.16.8.55:13910`, UUID `840e2717-5b40-40da-a6e3-c5e73466f5e6`; sextant endpoint `172.16.10.56:13910`, UUID `5a8bb209-23d3-425a-858e-b204491d839f`. These are fresh current mount identities, distinct from the older remembered node/UUID association; map identities by the advertised endpoint in each Mount Pod log.
+
+A single batched read-only PostgreSQL query decoded all 19 chunk rows / 27 slice mappings for model shard inode `152727`; rendezvous calculation against the current UUIDs generated 153 Sextant-owner block candidates (4 MiB blocks, including final partials). One batched read-only filesystem inventory compared candidate keys against each node's existing raw cache. **There were zero keys both Sextant-owned and resident only on Sextant**; observed cached candidates were shared/dual-resident or absent from Sextant. The targeted one-inode search therefore had no safe proof candidate. No file was read through Chronometer, no counters changed, and no S3 read was attributed.
+
+Metrics listeners were safely discovered from filtered Mount Pod logs (chronometer `35479`, sextant `43373`). At baseline both clients showed peer range hits/bytes, remote gets/bytes/errors, and local block-cache hit/miss bytes all 0. This is not a before/after experiment because no read was performed. Both named read-only consumers remain Running by design; no cleanup was attempted. PVC `model-cache` remains Bound to the original PV/UID, and the original capstan3 Mount Pod remains Running. No cache files or backends were changed.
+
+**Result: BLOCKED on finding a Sextant-owned, Sextant-only resident block.** Do not manufacture one by eviction, warmup, or cache mutation. Resume only after a broader authorized read-only search locates such a valid candidate, or report this constraint; do not infer peer service from registry membership or pre-existing cache files.
 
 ## Rollback
 
