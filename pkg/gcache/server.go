@@ -258,6 +258,17 @@ func serveBlock(ctx context.Context, conn net.Conn, src ServerSource, key string
 	if len(data) > maxBlockPayload {
 		return sendError(ctx, conn, errors.New("block exceeds payload limit"), timeout)
 	}
+	// Plain-mode keys embed the block's exact byte size. Serving fewer bytes
+	// than that is a truncated read (2026-11-08 incident: 2 MiB tail blocks
+	// streamed at a deterministic prefix length with no error), never a
+	// legitimate shorter object — compressed volumes re-encode, so the check
+	// only applies to uncompressed ones. Answer with an error frame so the
+	// client falls back to object storage instead of consuming a poisoned
+	// payload, and log loudly for diagnosis.
+	if want := keyOrigSize(key); want > 0 && int64(len(data)) != want && src.CompressAlgo() == "none" {
+		logger.Warnf("gcache serve %s truncated: got %d bytes, want %d", key, len(data), want)
+		return sendError(ctx, conn, fmt.Errorf("served block truncated: got %d want %d", len(data), want), timeout)
+	}
 
 	algo := WireRaw
 	payload := bytes.NewReader(data)

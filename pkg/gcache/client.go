@@ -38,19 +38,19 @@ type kickFunc func()
 // (CONTRACT.md §7): one retry per request, maxFailures consecutive failures
 // evict a peer from this consumer's view until a success un-evicts it.
 type RingClient struct {
-	timeout     time.Duration
-	maxFailures int
-	selfUUID    string
-	kick        kickFunc // optional: requests membership refresh
-	tcp         Transport
-	rdma        Transport // nil => TCP-only
-	strictRDMA  bool      // verification mode: no TCP fallback when RDMA configured
-	epState     map[string]endpointState
-	pool        *connPool
+	timeout      time.Duration
+	maxFailures  int
+	selfUUID     string
+	kick         kickFunc // optional: requests membership refresh
+	tcp          Transport
+	rdma         Transport // nil => TCP-only
+	strictRDMA   bool      // verification mode: no TCP fallback when RDMA configured
+	epState      map[string]endpointState
+	pool         *connPool
 	lastEndpoint atomic.Value // string: endpoint of the last successful dial
 
 	mu      sync.Mutex
-	failCnt map[string]int    // peer addr -> consecutive failures
+	failCnt map[string]int // peer addr -> consecutive failures
 	evicted map[string]time.Time
 	rangeNo map[string]time.Time // peer addr -> range-unsupported until
 }
@@ -294,6 +294,22 @@ func (c *RingClient) fetchOnce(ctx context.Context, key string, members []Member
 			c.pool.discard(conn) // error frame: frame sync is fine, but keep the simple path
 			c.MarkSuccess(peer)  // peer answered; fetch-level failure, not peer failure
 			return               // err already holds the *errFrame
+		}
+		// Length validation for plain-mode keys (they embed the exact byte
+		// size): a WireRaw full-block payload shorter than the declared size
+		// is a truncated serve (2026-11-08 incident), and consuming it later
+		// surfaces as EIO to the application. Compressed volumes always emit
+		// WireCompressed here, so WireRaw + wrong length is unambiguously a
+		// short serve. Reject BEFORE handing the reader upstream so the
+		// decorator falls back to object storage and never caches the junk.
+		if algo == WireRaw {
+			if want := keyOrigSize(key); want > 0 && int64(plen) != want {
+				c.pool.discard(conn)
+				c.MarkSuccess(peer) // peer answered; data issue, not peer health
+				logger.Warnf("gcache peer serve truncated: %s plen=%d want=%d from %s", key, plen, want, peer)
+				err = fmt.Errorf("peer serve truncated for %s: plen %d want %d", key, plen, want)
+				return
+			}
 		}
 		c.MarkSuccess(peer) // header OK; payload streams below
 		fetched = int64(plen)
@@ -648,7 +664,7 @@ func (c *RingClient) sendRangeReq(ctx context.Context, conn net.Conn, key string
 	hdr := make([]byte, headerLen)
 	hdr[0], hdr[1], hdr[2] = magic0, magic1, protoVer
 	hdr[3] = MsgRangeReq
-	binary.LittleEndian.PutUint32(hdr[5:9], 0)  // xid (single-flight per conn)
+	binary.LittleEndian.PutUint32(hdr[5:9], 0) // xid (single-flight per conn)
 	binary.LittleEndian.PutUint16(hdr[9:11], uint16(len(key)))
 	binary.LittleEndian.PutUint64(hdr[12:20], 16) // trailing off/len pair
 	if err := ctxSend(ctx, conn, hdr); err != nil {

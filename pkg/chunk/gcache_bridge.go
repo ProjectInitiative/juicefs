@@ -115,8 +115,9 @@ func (cs *cachedStore) loadCached(key string) (io.ReadCloser, error) {
 		}
 		return nil, err
 	}
-	// ReadCloser (ReaderAt+Closer) → io.ReadCloser.
-	return NewReadAtReader(r), nil
+	// ReadCloser (ReaderAt+Closer) → io.ReadCloser; keyed so a short clean
+	// read can be attributed to the block key in logs (2026-11-08 diagnosis).
+	return NewKeyedReadAtReader(r, key), nil
 }
 
 // fillFromStorage fetches the block from object storage through the normal
@@ -217,6 +218,7 @@ func (a *rangeReadCloser) Close() error { return a.r.Close() }
 // ReadAtReader adapts chunk.ReadCloser (ReaderAt+Closer) to io.ReadCloser.
 type ReadAtReader struct {
 	r   ReadCloser
+	key string // "": unkeyed (older callers); logged on unexpected short reads
 	off int64
 	eof int64 // file length once known (-1: unknown); disk cache's ReadAt
 	// panics when called at/past EOF (NewOffPage(0)), so after the
@@ -226,6 +228,12 @@ type ReadAtReader struct {
 // NewReadAtReader wraps a chunk ReadCloser for sequential reading.
 func NewReadAtReader(r ReadCloser) *ReadAtReader { return &ReadAtReader{r: r, eof: -1} }
 
+// NewKeyedReadAtReader wraps a chunk ReadCloser for sequential reading and
+// attributes unexpected short reads (2026-11-08 serve truncation) to key.
+func NewKeyedReadAtReader(r ReadCloser, key string) *ReadAtReader {
+	return &ReadAtReader{r: r, key: key, eof: -1}
+}
+
 func (a *ReadAtReader) Read(p []byte) (int, error) {
 	if a.eof >= 0 && a.off >= a.eof {
 		return 0, io.EOF
@@ -233,7 +241,14 @@ func (a *ReadAtReader) Read(p []byte) (int, error) {
 	n, err := a.r.ReadAt(p, a.off)
 	a.off += int64(n)
 	if n < len(p) && a.eof < 0 {
-		a.eof = a.off // first short read pins the file length
+		// First short read pins the file length. A CLEAN short read
+		// (err == nil, n < requested) on a plain-mode key is a serve
+		// truncation in disguise: log it loudly with the key so the real
+		// truncation point is visible in mount logs (2026-11-08).
+		if err == nil && n > 0 {
+			logger.Warnf("gcache bridge %s short clean read: off=%d n=%d want=%d", a.key, a.off-int64(n), n, len(p))
+		}
+		a.eof = a.off
 	}
 	if err == io.EOF && n > 0 {
 		// ReadAt may return n>0 with io.EOF; io.Readers may report EOF on the

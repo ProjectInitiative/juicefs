@@ -137,7 +137,9 @@ func TestDecoratorInterceptsFullBlock(t *testing.T) {
 	if key == "" {
 		t.Fatal("no key maps to peer")
 	}
-	block := bytes.Repeat([]byte{0x5A}, 512<<10)
+	// Key declares 1 MiB; the peer must serve exactly that length (the
+	// client rejects shorter WireRaw payloads as truncated serves).
+	block := bytes.Repeat([]byte{0x5A}, 1<<20)
 	peer.blocks[key] = block
 	inner := &trackingInner{ObjectStorage: newFakeInner()}
 	rc := NewRingClient(time.Second, 31, "self-test")
@@ -149,6 +151,34 @@ func TestDecoratorInterceptsFullBlock(t *testing.T) {
 	}
 	if inner.fullGets.Load() != 0 {
 		t.Fatal("inner.Get must not be called when peer serves")
+	}
+}
+
+// A peer serving fewer bytes than the plain-mode key declares is rejected:
+// the decorator must fall back to inner instead of consuming the payload.
+func TestDecoratorRejectsTruncatedServe(t *testing.T) {
+	peer := newFakeSource("none")
+	peerAddr, stop := listenerWithSrc(t, peer, 5*time.Second)
+	defer stop()
+	members := []Member{
+		{UUID: "self-uuid", Addr: "127.0.0.1:1"},
+		{UUID: "peer-uuid", Addr: peerAddr},
+	}
+	key := findKeyFor("peer-uuid", members)
+	if key == "" {
+		t.Fatal("no key maps to peer")
+	}
+	peer.blocks[key] = bytes.Repeat([]byte{0x5A}, 1753088) // short serve vs 1 MiB key
+	inner := &trackingInner{ObjectStorage: newFakeInner()}
+	rc := NewRingClient(time.Second, 31, "self-test")
+	decorated := NewRingStorage(inner, rc, func(string) []Member { return members }, "self-uuid")
+
+	got := readAll(t, mustGet(t, decorated, key))
+	if !bytes.Equal(got, []byte("inner-bytes-"+key)) {
+		t.Fatal("truncated peer serve must fall back to inner bytes")
+	}
+	if inner.fullGets.Load() != 1 {
+		t.Fatalf("want exactly 1 inner full Get after truncation, got %d", inner.fullGets.Load())
 	}
 }
 
@@ -295,9 +325,16 @@ func TestDecoratorExplicitLengthFullBlock(t *testing.T) {
 		{UUID: "self-uuid", Addr: "127.0.0.1:1"},
 		{UUID: "peer-uuid", Addr: peerAddr},
 	}
-	key := findKeyFor("peer-uuid", members)
+	key := ""
+	for i := 0; i < 100000; i++ {
+		k := fmt.Sprintf("1_%d_%d", i, 4<<20)
+		if Owners(k, members, 1)[0].UUID == "peer-uuid" {
+			key = k
+			break
+		}
+	}
 	if key == "" {
-		t.Fatal("no key maps to peer")
+		t.Fatal("no 4 MiB key maps to peer")
 	}
 	const blockSize = 4 << 20
 	block := bytes.Repeat([]byte{0xA7}, blockSize)
