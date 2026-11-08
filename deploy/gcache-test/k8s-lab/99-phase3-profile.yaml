@@ -1,10 +1,12 @@
 # Phase 3 — matched TCP-vs-verbs latency profiling.
 # Server (sextant, rail 172.16.5.56): FOUR listeners on identical datasets —
 #   verbs mem :13930 | verbs NVMe O_DIRECT :13931 | TCP mem :13932 | TCP NVMe :13933
-# Client (chronometer): matched legs — same dataset (4096 keys × 4 MiB), same
-# concurrency, same warm state, full payload verification on every leg.
-# PRIMARY benchmark: 70 independent verified 4 KiB reads against warm remote NVMe
-# (batch-70), complete-batch p50/p95/p99, verbs vs fresh matched TCP, 3 reps each.
+# Run matched sequential legs on the same 4096-key × 4 MiB dataset; every read
+# verifies its payload. Primary inference profile: batch=70 (independent 4 KiB
+# reads per round; qd is irrelevant in batch mode), three reps per transport.
+# Supplementary 8-second QD sweeps at 1/8/32/64 on warm NVMe and RAM.
+# Expected registered footprint = (512 recv + 8 send) × 64 KiB = 32.5 MiB/conn.
+# NCCL-concurrent testing is deliberately not included; it needs live inference.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -12,6 +14,7 @@ metadata:
   namespace: llm-test
 spec:
   backoffLimit: 0
+  activeDeadlineSeconds: 1200
   ttlSecondsAfterFinished: 7200
   template:
     spec:
@@ -33,7 +36,6 @@ spec:
           /var/tmp/lb-bins/latencybench-rdma serve --addr 172.16.5.56:13933 --src file --file /var/tmp/lb-data/bench.bin --blocksize 4194304 --direct 2>&1 &
           echo "phase3 servers up; waiting forever"
           sleep infinity
-          sleep infinity
         volumeMounts:
         - { name: bins, mountPath: /var/tmp/lb-bins, readOnly: true }
         - { name: data, mountPath: /var/tmp/lb-data, readOnly: true }
@@ -53,6 +55,7 @@ metadata:
   namespace: llm-test
 spec:
   backoffLimit: 0
+  activeDeadlineSeconds: 2400
   ttlSecondsAfterFinished: 7200
   template:
     spec:
@@ -78,10 +81,11 @@ spec:
           sleep 10
           COMMON="--keys 4096 --range --verify --len 4096"
           echo "##### warm-up: one verbs + one TCP leg to settle caches (discarded)"
-          timeout 120 $LBR read --backend peer --addr $RAIL:13931 --rdma --rdma-proto verbs $COMMON --qd 64 --secs 5 > /dev/null 2>&1 || true
-          timeout 120 $LBR read --backend peer --addr $RAIL:13933 $COMMON --qd 64 --secs 5 > /dev/null 2>&1 || true
+          timeout 120 $LBR read --backend peer --addr $RAIL:13931 --rdma --rdma-proto verbs $COMMON --qd 1 --secs 5 > /dev/null 2>&1 || true
+          timeout 120 $LBR read --backend peer --addr $RAIL:13933 $COMMON --qd 1 --secs 5 > /dev/null 2>&1 || true
           echo "##### PRIMARY: batch-70 warm remote NVMe, 3 reps each transport"
           for rep in 1 2 3; do
+            # Preserve complete output in the Job log as well as JSON files.
             timeout 200 $LBR read --backend peer --addr $RAIL:13931 --rdma --rdma-proto verbs $COMMON --batch 70 --secs 15 --out $OUT/primary-verbs-r$rep.json 2>&1 | grep -E '===|read|batch|iops|verify' || echo "PRIMARY verbs r$rep FAILED"
             timeout 200 $LBR read --backend peer --addr $RAIL:13933 $COMMON --batch 70 --secs 15 --out $OUT/primary-tcp-r$rep.json 2>&1 | grep -E '===|read|batch|iops|verify' || echo "PRIMARY tcp r$rep FAILED"
           done
