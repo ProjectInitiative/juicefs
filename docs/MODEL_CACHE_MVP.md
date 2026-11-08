@@ -1,6 +1,6 @@
 # model-cache distributed cache MVP: activation record
 
-Status: **two live registry members verified; one real shard SHA-256 verified; remote NVMe hit NOT proven, ownership-aware full-shard warmup NOT performed** (latest bounded recheck 2026-11-08 16:45 UTC). The two named temporary consumers remain Running because no safe read candidate was found. A Ready mount or a checksum is not evidence of a remote NVMe hit.
+Status: **two live registry members verified; a real shard SHA-256 verified; one bounded 4096-byte remote NVMe peer ranged read proven; ownership-aware full-shard warmup NOT performed** (latest validation 2026-11-08 16:54 UTC). The temporary consumers were removed after the bounded peer experiment; the original capstan3 mount remains unaffected.
 
 ## Identity and scope
 
@@ -65,6 +65,20 @@ A single batched read-only PostgreSQL query decoded all 19 chunk rows / 27 slice
 Metrics listeners were safely discovered from filtered Mount Pod logs (chronometer `35479`, sextant `43373`). At baseline both clients showed peer range hits/bytes, remote gets/bytes/errors, and local block-cache hit/miss bytes all 0. This is not a before/after experiment because no read was performed. Both named read-only consumers remain Running by design; no cleanup was attempted. PVC `model-cache` remains Bound to the original PV/UID, and the original capstan3 Mount Pod remains Running. No cache files or backends were changed.
 
 **Result: BLOCKED on finding a Sextant-owned, Sextant-only resident block.** Do not manufacture one by eviction, warmup, or cache mutation. Resume only after a broader authorized read-only search locates such a valid candidate, or report this constraint; do not infer peer service from registry membership or pre-existing cache files.
+
+## Broad shard search and bounded peer proof (2026-11-08 16:47–16:54 UTC)
+
+The existing chronometer and sextant test consumers and their fresh Mount Pods were Running/Ready with zero restarts. A read-only membership query against `jfs_gcache_members` observed contemporaneous `dgx-model-cache` rows (ages 2–5s): chronometer UUID `840e2717-5b40-40da-a6e3-c5e73466f5e6`, endpoint `172.16.8.55:13910`; sextant UUID `5a8bb209-23d3-425a-858e-b204491d839f`, endpoint `172.16.10.56:13910`. The metadata URL was expanded only inside the Mount Pod and not printed.
+
+A bounded path/inode inventory identified all 83 `model-*-of-00083.safetensors` files in the pinned snapshot. One batched read-only SQL query mapped 2,622 `jfs_chunk` rows for all 83 inodes; decoding their slice records produced 43,657 distinct cached-block keys. Rendezvous scoring with the live UUIDs (using `murmur3.StringSum64(uuid + "\x00" + key)`) found 21,749 Sextant-owned keys; a batched raw-cache inventory found 19,690 resident on Sextant, including 12,752 resident on Sextant but absent from Chronometer. This is a broad actual-shard search, not the earlier 153-candidate single-inode search.
+
+Selected one verified candidate in `model-00053-of-00083.safetensors` (inode 155694, JuiceFS chunk 27): `chunks/0/939/939974_7_4194304`. It was 4,194,816 bytes on Sextant NVMe and absent from Chronometer NVMe. Its current rendezvous scores were Sextant `17410100118945538936` versus Chronometer `15536078110457585837`. One Chronometer FUSE read requested exactly 4,096 bytes at file offset `1,841,299,456` (chunk 27 plus block 7); `sha256sum` over the returned bytes was `53668f54476d864fd24cd424ea466b1b8d4070ad7d5953a7c661199a95effb05`. No other model-data read was made.
+
+Before the read, both Mount Pods' peer-range hits/bytes, peer range gets/bytes, peer gets/bytes, local cache hit/miss bytes, and errors were zero. Afterward Chronometer reported `juicefs_blockcache_peer_range_hits=1`, `juicefs_blockcache_peer_range_bytes=4096`, `juicefs_remotecache_range_gets=1`, `juicefs_remotecache_range_bytes=4096`, `juicefs_blockcache_miss_bytes=4096`, with regular peer gets/bytes and errors still zero. Sextant reported one range get / 4,096 range bytes, and no peer-range hit or local block-cache hit/miss; the known owner file remained present and the candidate remained absent on Chronometer after the operation. This counter combination proves the requested bytes were supplied through the peer ranged-read path, rather than an S3 fallback. It does not prove an ongoing or full-shard transfer.
+
+Garage's available per-node `api_s3_request_counter{api_endpoint="GetObject"}` values were sampled on all three nodes immediately before and after: `236805/236805`, `349037/349066`, and `355032/355032`. The increase of 29 on one Garage node shows concurrent S3 activity during the interval; aggregate Garage metrics cannot attribute those requests to this experiment. No request-specific S3 attribution is claimed. No cache eviction, explicit cache write, warmup, metadata/backend change, or additional model read was performed.
+
+After the attempted experiment, only `gcache-ring-mvp-chronometer` and `gcache-ring-mvp-sextant` were deleted. Both reached NotFound; the resulting target-PVC Mount Pod inventory contained only the original Ready, zero-restart capstan3 Mount Pod. `model-cache` remained Bound to the original PV and UID. No project tests were needed for this documentation-only validation update.
 
 ## Rollback
 
