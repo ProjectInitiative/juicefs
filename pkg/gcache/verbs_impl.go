@@ -825,7 +825,7 @@ func newVerbsConn(id *C.struct_rdma_cm_id, sharedPD *C.struct_ibv_pd, isServer b
 	// SGEs point into the single region; wire semantics are unchanged.
 	cnsendRegion := C.size_t(vbSendDepth) * C.size_t(vbMsgSize)
 	cnrecvRegion := C.size_t(vbRecvDepth) * C.size_t(vbMsgSize)
-	cn.send_base = C.vb_mmap(cnrecvRegion)
+	cn.send_base = C.vb_mmap(cnsendRegion)
 	if cn.send_base == nil {
 		C.vb_destroy_conn_impl(cn, destroyID)
 		return nil, fmt.Errorf("verbs: mmap send region")
