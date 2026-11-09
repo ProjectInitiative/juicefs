@@ -116,6 +116,65 @@ func autoC7Advertise(listenAddr string) (string, error) {
 	return strings.Join(addrs, ";"), nil
 }
 
+// autoAdvertise derives a single advertise host:port for hosts without
+// dedicated C7 rails (e.g. bonded management networks). Preference order:
+// 1) the IPv4 of the interface used for the default route (UDP dial trick),
+// 2) the first global IPv4 on any up, non-loopback interface whose name
+// contains "bond", 3) the first global IPv4 on any up non-loopback interface.
+func autoAdvertise(listenAddr string) (string, error) {
+	_, port, err := net.SplitHostPort(listenAddr)
+	if err != nil || port == "" {
+		port = "13910"
+	}
+	// Default-route source address: connect a UDP socket to a public address
+	// (no packets are sent) and read the local endpoint.
+	c, err := net.Dial("udp", "8.8.8.8:53")
+	if err == nil {
+		defer c.Close()
+		if ua, ok := c.LocalAddr().(*net.UDPAddr); ok && ua.IP != nil && !ua.IP.IsLoopback() && ua.IP.To4() != nil {
+			return net.JoinHostPort(ua.IP.String(), port), nil
+		}
+	}
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+	pick := func(match func(string) bool) string {
+		for _, iface := range interfaces {
+			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			if !match(iface.Name) {
+				continue
+			}
+			entries, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, entry := range entries {
+				var ip net.IP
+				switch value := entry.(type) {
+				case *net.IPNet:
+					ip = value.IP
+				case *net.IPAddr:
+					ip = value.IP
+				}
+				if ip4 := ip.To4(); ip4 != nil && ip4.IsGlobalUnicast() {
+					return net.JoinHostPort(ip4.String(), port)
+				}
+			}
+		}
+		return ""
+	}
+	if addr := pick(func(name string) bool { return strings.Contains(name, "bond") }); addr != "" {
+		return addr, nil
+	}
+	if addr := pick(func(string) bool { return true }); addr != "" {
+		return addr, nil
+	}
+	return "", fmt.Errorf("no advertise-able interface address found")
+}
+
 func (m *Manager) self(addr string) Member {
 	w := m.cfg.Weight
 	if w <= 0 {
@@ -199,6 +258,13 @@ func (m *Manager) Start(ctx context.Context) error {
 				return fmt.Errorf("derive C7 advertise addresses: %w", err)
 			}
 			logger.Infof("gcache advertising C7 endpoints %s", addr)
+		} else if addr == "auto" {
+			addr, err = autoAdvertise(m.cfg.ListenAddr)
+			if err != nil {
+				m.cancel()
+				return fmt.Errorf("derive advertise address: %w", err)
+			}
+			logger.Infof("gcache advertising auto endpoint %s", addr)
 		} else if addr == "" {
 			addr = ln.Addr().String()
 		}
