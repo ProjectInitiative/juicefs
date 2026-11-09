@@ -117,29 +117,17 @@ func autoC7Advertise(listenAddr string) (string, error) {
 }
 
 // autoAdvertise derives a single advertise host:port for hosts without
-// dedicated C7 rails (e.g. bonded management networks). Preference order:
-// 1) the IPv4 of the interface used for the default route (UDP dial trick),
-// 2) the first global IPv4 on any up, non-loopback interface whose name
-// contains "bond", 3) the first global IPv4 on any up non-loopback interface.
+// dedicated C7 rails (e.g. bonded k8s networks). Preference order:
+// 1) IPv4 of an interface whose name contains "bond" (capstans carry the
+// fast k8s network on bond0), 2) the default-route source address (UDP dial
+// trick, no packets sent), 3) the first global IPv4 on any up non-loopback
+// interface.
 func autoAdvertise(listenAddr string) (string, error) {
 	_, port, err := net.SplitHostPort(listenAddr)
 	if err != nil || port == "" {
 		port = "13910"
 	}
-	// Default-route source address: connect a UDP socket to a public address
-	// (no packets are sent) and read the local endpoint.
-	c, err := net.Dial("udp", "8.8.8.8:53")
-	if err == nil {
-		defer c.Close()
-		if ua, ok := c.LocalAddr().(*net.UDPAddr); ok && ua.IP != nil && !ua.IP.IsLoopback() && ua.IP.To4() != nil {
-			return net.JoinHostPort(ua.IP.String(), port), nil
-		}
-	}
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return "", err
-	}
-	pick := func(match func(string) bool) string {
+	pick := func(interfaces []net.Interface, match func(string) bool, port string) string {
 		for _, iface := range interfaces {
 			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 				continue
@@ -166,10 +154,24 @@ func autoAdvertise(listenAddr string) (string, error) {
 		}
 		return ""
 	}
-	if addr := pick(func(name string) bool { return strings.Contains(name, "bond") }); addr != "" {
+	// Preference order: 1) IPv4 of an interface whose name contains "bond"
+	// (capstans carry the fast k8s network on bond0), 2) the default-route
+	// source address (UDP dial trick, no packets sent).
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+	if addr := pick(interfaces, func(name string) bool { return strings.Contains(name, "bond") }, port); addr != "" {
 		return addr, nil
 	}
-	if addr := pick(func(string) bool { return true }); addr != "" {
+	c, err := net.Dial("udp", "8.8.8.8:53")
+	if err == nil {
+		defer c.Close()
+		if ua, ok := c.LocalAddr().(*net.UDPAddr); ok && ua.IP != nil && !ua.IP.IsLoopback() && ua.IP.To4() != nil {
+			return net.JoinHostPort(ua.IP.String(), port), nil
+		}
+	}
+	if addr := pick(interfaces, func(string) bool { return true }, port); addr != "" {
 		return addr, nil
 	}
 	return "", fmt.Errorf("no advertise-able interface address found")
