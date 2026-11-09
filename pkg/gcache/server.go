@@ -260,14 +260,13 @@ func serveBlock(ctx context.Context, conn net.Conn, src ServerSource, key string
 	if want := keyOrigSize(key); want > 0 && want <= maxBlockPayload && src.CompressAlgo() == "none" {
 		data = make([]byte, want)
 		if _, err := io.ReadFull(r, data); err != nil {
+			// A short full read IS truncation (ReadAtReader pins eof): the
+			// zero-padded tail must never be served as a complete block.
 			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
-				// Distinguish via the wrapped reader? ReadAtReader already
-				// pins eof; a short full read here IS truncation. Read what
-				// we can and let the length check below produce the error.
-				logger.Warnf("gcache serve %s truncated: read shorter than key size %d", key, want)
-			} else {
-				return sendError(ctx, conn, fmt.Errorf("read cached block: %w", err), timeout)
+				logger.Warnf("gcache serve %s truncated: shorter than key size %d", key, want)
+				return sendError(ctx, conn, fmt.Errorf("served block truncated: want %d", want), timeout)
 			}
+			return sendError(ctx, conn, fmt.Errorf("read cached block: %w", err), timeout)
 		}
 	} else {
 		var rerr error
