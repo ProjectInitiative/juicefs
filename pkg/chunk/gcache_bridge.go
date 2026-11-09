@@ -220,9 +220,11 @@ type ReadAtReader struct {
 	r   ReadCloser
 	key string // "": unkeyed (older callers); logged on unexpected short reads
 	off int64
-	eof int64 // file length once known (-1: unknown); disk cache's ReadAt
+	eof   int64 // file length once known (-1: unknown); disk cache's ReadAt
 	// panics when called at/past EOF (NewOffPage(0)), so after the
 	// first short read we answer EOF ourselves without calling it.
+	total int64 // expected stream length (-1: unknown); a short read ending
+	// exactly at total is the benign final EOF read, not truncation
 }
 
 // NewReadAtReader wraps a chunk ReadCloser for sequential reading.
@@ -231,8 +233,13 @@ func NewReadAtReader(r ReadCloser) *ReadAtReader { return &ReadAtReader{r: r, eo
 // NewKeyedReadAtReader wraps a chunk ReadCloser for sequential reading and
 // attributes unexpected short reads (2026-11-08 serve truncation) to key.
 func NewKeyedReadAtReader(r ReadCloser, key string) *ReadAtReader {
-	return &ReadAtReader{r: r, key: key, eof: -1}
+	return &ReadAtReader{r: r, key: key, eof: -1, total: -1}
 }
+
+// SetTotal records the expected stream length: once a short read reaches
+// exactly total bytes it is the benign final EOF read (io.ReadAll's growing
+// buffer), not a mid-stream truncation, and must not warn (2026-11-09).
+func (a *ReadAtReader) SetTotal(total int64) { a.total = total }
 
 func (a *ReadAtReader) Read(p []byte) (int, error) {
 	if a.eof >= 0 && a.off >= a.eof {
@@ -245,7 +252,7 @@ func (a *ReadAtReader) Read(p []byte) (int, error) {
 		// (err == nil, n < requested) on a plain-mode key is a serve
 		// truncation in disguise: log it loudly with the key so the real
 		// truncation point is visible in mount logs (2026-11-08).
-		if err == nil && n > 0 {
+		if err == nil && n > 0 && (a.total < 0 || a.off < a.total) {
 			logger.Warnf("gcache bridge %s short clean read: off=%d n=%d want=%d", a.key, a.off-int64(n), n, len(p))
 		}
 		a.eof = a.off

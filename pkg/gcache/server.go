@@ -251,29 +251,23 @@ func serveBlock(ctx context.Context, conn net.Conn, src ServerSource, key string
 	}
 	defer r.Close()
 
-	// Size the buffer from the key when known: io.ReadAll's growing buffer
-	// makes its final read always land short on a complete block, which
-	// tripped the ReadAtReader short-read diagnostic on every serve
-	// (2026-11-09). Reading exactly want bytes keeps complete serves silent;
-	// a genuine truncation surfaces as the explicit check below.
-	var data []byte
-	if want := keyOrigSize(key); want > 0 && want <= maxBlockPayload && src.CompressAlgo() == "none" {
-		data = make([]byte, want)
-		if _, err := io.ReadFull(r, data); err != nil {
-			// A short full read IS truncation (ReadAtReader pins eof): the
-			// zero-padded tail must never be served as a complete block.
-			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
-				logger.Warnf("gcache serve %s truncated: shorter than key size %d", key, want)
-				return sendError(ctx, conn, fmt.Errorf("served block truncated: want %d", want), timeout)
-			}
-			return sendError(ctx, conn, fmt.Errorf("read cached block: %w", err), timeout)
+	// Limit to want+1 when the key declares a size: the existing length
+	// check below treats both shorter AND longer serves as poisoned, and a
+	// bounded ReadAll keeps the final EOF read from tripping the
+	// ReadAtReader short-read diagnostic on every complete serve.
+	limit := int64(maxBlockPayload + 1)
+	if want := keyOrigSize(key); want > 0 && src.CompressAlgo() == "none" {
+		limit = want + 1
+		// Structural typing (no chunk import — CONTRACT.md §4): the stream
+		// is a *chunk.ReadAtReader; tell it the expected total so the final
+		// benign EOF read does not trip the short-read diagnostic.
+		if kr, ok := r.(interface{ SetTotal(int64) }); ok {
+			kr.SetTotal(want)
 		}
-	} else {
-		var rerr error
-		data, rerr = io.ReadAll(io.LimitReader(r, maxBlockPayload+1))
-		if rerr != nil {
-			return sendError(ctx, conn, fmt.Errorf("read cached block: %w", rerr), timeout)
-		}
+	}
+	data, err := io.ReadAll(io.LimitReader(r, limit))
+	if err != nil {
+		return sendError(ctx, conn, fmt.Errorf("read cached block: %w", err), timeout)
 	}
 	if len(data) > maxBlockPayload {
 		return sendError(ctx, conn, errors.New("block exceeds payload limit"), timeout)
