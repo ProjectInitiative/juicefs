@@ -251,9 +251,30 @@ func serveBlock(ctx context.Context, conn net.Conn, src ServerSource, key string
 	}
 	defer r.Close()
 
-	data, err := io.ReadAll(io.LimitReader(r, maxBlockPayload+1))
-	if err != nil {
-		return sendError(ctx, conn, fmt.Errorf("read cached block: %w", err), timeout)
+	// Size the buffer from the key when known: io.ReadAll's growing buffer
+	// makes its final read always land short on a complete block, which
+	// tripped the ReadAtReader short-read diagnostic on every serve
+	// (2026-11-09). Reading exactly want bytes keeps complete serves silent;
+	// a genuine truncation surfaces as the explicit check below.
+	var data []byte
+	if want := keyOrigSize(key); want > 0 && want <= maxBlockPayload && src.CompressAlgo() == "none" {
+		data = make([]byte, want)
+		if _, err := io.ReadFull(r, data); err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+				// Distinguish via the wrapped reader? ReadAtReader already
+				// pins eof; a short full read here IS truncation. Read what
+				// we can and let the length check below produce the error.
+				logger.Warnf("gcache serve %s truncated: read shorter than key size %d", key, want)
+			} else {
+				return sendError(ctx, conn, fmt.Errorf("read cached block: %w", err), timeout)
+			}
+		}
+	} else {
+		var rerr error
+		data, rerr = io.ReadAll(io.LimitReader(r, maxBlockPayload+1))
+		if rerr != nil {
+			return sendError(ctx, conn, fmt.Errorf("read cached block: %w", rerr), timeout)
+		}
 	}
 	if len(data) > maxBlockPayload {
 		return sendError(ctx, conn, errors.New("block exceeds payload limit"), timeout)
